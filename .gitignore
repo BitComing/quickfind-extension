@@ -1,0 +1,9 @@
+# Browser automation output
+.playwright-cli/
+output/playwright/
+
+# Local backup of the corrupted repo (can be deleted once verified)
+.git.bak/
+
+# Agent workspace data
+.workbuddy/

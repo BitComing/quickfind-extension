@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuickFind · 选中文字搜索</title>
+    <style>
+      :root { color-scheme: light; font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#19352c; background:#f5f8f6; }
+      * { box-sizing:border-box; }
+      body { min-width:320px; margin:0; background:linear-gradient(135deg,#f5f8f6 0%,#eef5f0 100%); }
+      .page-header { display:flex; align-items:center; justify-content:space-between; max-width:920px; margin:0 auto; padding:28px 28px 18px; }
+      .brand { display:flex; align-items:center; gap:10px; font-size:14px; font-weight:700; letter-spacing:.02em; }
+      .brand-mark { display:grid; place-items:center; width:28px; height:28px; border-radius:9px; color:#f5c56b; background:#19352c; }
+      .brand-mark svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; }
+      .demo-badge { padding:5px 9px; border:1px solid #d7e6dd; border-radius:99px; color:#6e8278; background:rgba(255,255,255,.55); font-size:10px; }
+      .article { max-width:920px; margin:22px auto 80px; padding:0 28px; }
+      .eyebrow { margin:0 0 13px; color:#5e9879; font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; }
+      h1 { max-width:700px; margin:0; color:#19352c; font-family: Georgia, "Times New Roman", serif; font-size:clamp(32px,5vw,54px); font-weight:500; line-height:1.1; letter-spacing:0; }
+      .intro { max-width:560px; margin:18px 0 0; color:#65766e; font-size:15px; line-height:1.8; }
+      .rule { width:100%; height:1px; margin:42px 0 30px; background:#dbe8e0; }
+      .article-grid { display:grid; grid-template-columns:minmax(0,1fr) 220px; gap:54px; align-items:start; }
+      .copy { color:#354e43; font-family: Georgia, "Times New Roman", serif; font-size:18px; line-height:2; }
+      .copy p { margin:0 0 24px; }
+      .aside { padding-top:6px; color:#76877e; font-size:11px; line-height:1.7; }
+      .aside strong { display:block; margin-bottom:10px; color:#19352c; font-size:12px; }
+      .swatches { display:flex; gap:6px; margin-top:16px; }
+      .swatches span { width:24px; height:24px; border-radius:7px; }
+      .swatches span:nth-child(1) { background:#19352c; } .swatches span:nth-child(2) { background:#3e8f6c; } .swatches span:nth-child(3) { background:#f5c56b; } .swatches span:nth-child(4) { background:#00aeec; }
+      @media (max-width:650px) { .page-header { padding:20px 18px 12px; } .article { margin-top:22px; padding:0 18px; } .article-grid { display:block; } .aside { display:none; } .copy { font-size:17px; } }
+    </style>
+  </head>
+  <body>
+    <header class="page-header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span><span>QuickFind</span></div>
+      <span class="demo-badge">INTERACTION PREVIEW</span>
+    </header>
+    <main class="article">
+      <p class="eyebrow">A quieter way to search</p>
+      <h1>让每一次阅读，<br />都能自然地继续。</h1>
+      <p class="intro">选中你正在好奇的词句，QuickFind 会在选区旁边安静地出现。把思路留在原地，把答案带到下一页。</p>
+      <div class="rule"></div>
+      <div class="article-grid">
+        <article class="copy">
+          <p>好的搜索工具不应该打断阅读。它更像书页边缘的一枚书签，在你准备好时伸手可取，又在你继续阅读时退回背景。</p>
+          <p>从一段陌生的概念，到一个想要深入了解的名字，选中文字就足够了。你可以选择最顺手的搜索引擎，让每一次跳转都更接近答案。</p>
+          <p>试着选中这一段文字，看看 QuickFind 如何把搜索入口放在恰好的位置。</p>
+        </article>
+        <aside class="aside"><strong>QuickFind / 01</strong>把常用入口放在选择发生的地方。<div class="swatches" aria-hidden="true"><span></span><span></span><span></span><span></span></div></aside>
+      </div>
+    </main>
+    <script src="content.js"></script>
+  </body>
+</html>
