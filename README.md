@@ -4,13 +4,71 @@
 
 ## 本地安装
 
-1. 打开 Chrome 或 Edge 的扩展管理页（Chrome 地址为 `chrome://extensions`）。
-2. 开启右上角的“开发者模式”。
-3. 点击“加载已解压的扩展程序”，选择本目录。
-4. 打开任意网页，选中一段文字即可使用。
+1. 安装依赖并构建：
+
+   ```
+   npm install
+   npm run build
+   ```
+
+2. 打开 Chrome 或 Edge 的扩展管理页（Chrome 地址为 `chrome://extensions`）。
+3. 开启右上角的“开发者模式”。
+4. 点击“加载已解压的扩展程序”，选择 `.output/chrome-mv3` 目录。
+5. 打开任意网页，选中一段文字即可使用。
 
 点击浏览器工具栏里的 QuickFind 图标，可以在搜索框中输入内容、读取当前页面选中文字、查看搜索历史并切换分组。内置搜索源包括 Google、百度、谷歌学术、DuckDuckGo、360 搜索、搜狗、Google AI Mode、Bing、Yandex、哔哩哔哩、小红书、X、YouTube、知乎、抖音、豆包和 DeepSeek。选项页的侧边栏分别管理常用设置、常驻搜索列表、历史记录和无限大纲笔记；两个搜索列表页面中的搜索源分组共用同一份数据，默认组中的搜索源和自定义组可混排并拖动排序。
 
 无限大纲笔记按 Workflowy 风格设计：Enter 新建同级项目，Shift+Enter 插入换行，Tab/Shift+Tab 调整层级，Ctrl/⌘+Enter 标记完成，空行 Backspace 删除项目，行首 Backspace 合并到上一项目。每个项目都可以收起、拖到另一个项目之前/内部/之后，或进入“专注”视图；工具栏提供搜索计数、撤销/重做、全部展开/收起、JSON 和 Markdown 导入导出。数据保存在当前浏览器的 IndexedDB 中，并兼容旧版本地存储格式。
 
 常驻搜索列表默认支持 Google、百度、谷歌学术、DuckDuckGo、360 搜索、搜狗、Bing、Yandex、知乎、哔哩哔哩和抖音，在对应站点的搜索结果页自动固定在页面顶部居中显示，并显示当前搜索文本；鼠标移开 3 秒后收起为细长把手，悬停即可展开。站点和默认分组展示数量均独立保存。自定义 URL 请填写 `{query}` 的模板。所有更改会自动保存。豆包源会打开新对话并尝试填入内容，不自动发送消息，实际效果取决于豆包当前页面结构和登录状态。
+
+## 工程结构
+
+| 路径 | 说明 |
+| --- | --- |
+| `entrypoints/` | 扩展源码：`popup/`、`options/`、`content/`、`background.ts` |
+| `public/` | 静态资源（图标等），构建时原样拷贝 |
+| `types/` | 补充类型声明 |
+| `legacy/` | 迁移前的根目录平铺产物，仅作回退参照，不参与构建 |
+| `.output/` | 构建产物（忽略提交） |
+
+## 开发命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `npm run dev` | WXT 开发模式，改动自动重载 |
+| `npm run build` | 构建 Chrome MV3 扩展，输出到 `.output/chrome-mv3` |
+| `npm run build:firefox` | 构建 Firefox 扩展 |
+| `npm run compile` | 仅做 TypeScript 类型检查 |
+| `npm run build:raw` | 直接调用 `wxt build`，见下方说明 |
+
+## 构建说明
+
+`npm run build` 执行的是 `build.mjs`，而不是直接调用 `wxt build`。
+
+原因是本机环境下 Vite 写出的 JS / CSS / HTML 产物会在 WXT 收尾汇总之前被移除：
+`writeBundle` 钩子执行时磁盘上 9 个产物全部完好，WXT 统计产物时已全部 `ENOENT`，
+而 `fs` 层的 `rm` / `unlink` / `rmdir` / `rename` 都观测不到对应调用，因此无法从
+WXT 侧规避。
+
+为此 `wxt.config.ts` 中的 `qf-snapshot` 插件在 `writeBundle`（文件内容为最终态、
+且仍在磁盘上的唯一时机）把产物读入内存，由 `build.mjs` 在构建结束后写回，
+并校验 `manifest.json` 引用的每个文件确实存在。两个文件头部都有相应注释。
+
+在不需要这层兜底的环境里，可以直接使用 `npm run build:raw`。
+
+## 迁移状态
+
+项目已从早期「根目录平铺手写文件」迁移到 WXT + TypeScript 工程结构，
+`entrypoints/` 为唯一源码入口。
+
+尚未完成的部分：三个入口文件由早期手写 JavaScript 迁移而来，尚未补齐类型标注，
+文件顶部以 `// @ts-nocheck` 标记：
+
+- `entrypoints/content/index.ts`
+- `entrypoints/options/main.ts`
+- `entrypoints/popup/main.ts`
+
+补全类型后即可删除标记，届时 `npm run compile` 会真正覆盖到这些文件。
+`types/node-lite.d.ts` 是本地最小 Node 类型声明，若日后能安装 `@types/node`，
+可删除该文件并在 `tsconfig.json` 的 `types` 中加入 `"node"`。

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuickFind</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="popup-header">
+        <div class="brand-mark" aria-hidden="true"><span></span></div>
+        <div class="brand-copy"><h1>QuickFind</h1></div>
+        <button id="open-options" class="options-button header-options" type="button" aria-label="搜索源设置" title="搜索源设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z"></path><path d="m19.4 15 .1.1a2 2 0 0 1-2.8 2.8l-.1-.1a2 2 0 0 0-3.4 1.4V19a2 2 0 0 1-4 0v-.1a2 2 0 0 0-3.4-1.4l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A2 2 0 0 0 1.6 12H2a2 2 0 0 1 0-4h-.1a2 2 0 0 0 1.4-3.4l-.1-.1A2 2 0 1 1 6 1.7l.1.1A2 2 0 0 0 9.5.4V0a2 2 0 0 1 4 0v.1a2 2 0 0 0 3.4 1.4l.1-.1a2 2 0 1 1 2.8 2.8l-.1-.1A2 2 0 0 0 21.1 8h.1a2 2 0 0 1 0 4h-.1a2 2 0 0 0-1.7 3Z" transform="translate(0 2)"></path></svg></button>
+      </header>
+      <div class="divider"></div>
+
+      <section class="search-section" aria-label="搜索">
+        <div class="search-controls"><div class="search-row"><span class="search-glyph" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span><input id="query-input" class="query-input" type="text" aria-label="搜索内容" autocomplete="off" placeholder="输入要搜索的内容" /><button id="clear-query" class="square-button clear-query" type="button" aria-label="清空搜索框" title="清空"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div><button id="history-toggle" class="square-button history-toggle" type="button" aria-label="搜索历史" aria-expanded="false" title="搜索历史"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path><path d="M12 7v5l3 2"></path></svg></button></div>
+        <div id="history-list" class="history-list" hidden></div>
+      </section>
+
+      <nav id="group-tabs" class="group-tabs" role="tablist" aria-label="搜索源分组"></nav>
+      <section aria-label="当前分组搜索源"><div id="engine-settings" class="engine-settings"></div></section>
+
+      <footer class="popup-footer"><span class="version">v1.0</span></footer>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "extends": "./.wxt/tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "esModuleInterop": true,
+    "types": ["chrome"]
+  },
+  "exclude": [
+    "node_modules",
+    ".output",
+    ".output2",
+    ".git",
+    ".git.bak",
+    ".playwright-cli",
+    ".workbuddy",
+    "legacy",
+    "output"
+  ]
+}

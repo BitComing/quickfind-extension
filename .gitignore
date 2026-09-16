@@ -7,3 +7,9 @@ output/playwright/
 
 # Agent workspace data
 .workbuddy/
+
+# Build output & dependencies
+node_modules/
+.output/
+.wxt/
+stats.html

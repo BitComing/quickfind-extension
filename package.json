@@ -1,0 +1,24 @@
+{
+  "name": "quickfind",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "选中文字后，在文字末端快速打开常用搜索引擎。",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "node build.mjs",
+    "build:firefox": "node build.mjs -b firefox",
+    "build:raw": "wxt build",
+    "zip": "wxt zip",
+    "compile": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.9",
+    "typescript": "^7.0.2",
+    "wxt": "^0.21.4"
+  },
+  "overrides": {
+    "vite": "^7.0.0"
+  }
+}
