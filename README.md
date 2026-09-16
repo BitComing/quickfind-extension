@@ -27,10 +27,13 @@
 | 路径 | 说明 |
 | --- | --- |
 | `entrypoints/` | 扩展源码：`popup/`、`options/`、`content/`、`background.ts` |
+| `shared/` | 跨入口共享的类型定义（`settings.ts`）。只含类型，编译后不产生运行时产物 |
 | `public/` | 静态资源（图标等），构建时原样拷贝 |
 | `types/` | 补充类型声明 |
+| `scripts/` | 工程脚本：`typecheck.mjs`（类型检查与类型债务度量） |
 | `legacy/` | 迁移前的根目录平铺产物，仅作回退参照，不参与构建 |
 | `.output/` | 构建产物（忽略提交） |
+| `.typecheck-baseline.json` | 类型债务基线，随代码提交，用于阻止债务增加 |
 
 ## 开发命令
 
@@ -40,6 +43,9 @@
 | `npm run build` | 构建 Chrome MV3 扩展，输出到 `.output/chrome-mv3` |
 | `npm run build:firefox` | 构建 Firefox 扩展 |
 | `npm run compile` | 仅做 TypeScript 类型检查 |
+| `npm run typecheck` | 同上，但在结果中标注被 `@ts-nocheck` 屏蔽的文件 |
+| `npm run typecheck:debt` | 额外量出被屏蔽文件的真实错误数（见「类型债务」） |
+| `npm run check` | 提交前门禁：类型债务超过基线即失败 |
 | `npm run build:raw` | 直接调用 `wxt build`，见下方说明 |
 
 ## 构建说明
@@ -57,18 +63,61 @@ WXT 侧规避。
 
 在不需要这层兜底的环境里，可以直接使用 `npm run build:raw`。
 
-## 迁移状态
+## 类型检查
+
+`tsc` 只检查没有被 `// @ts-nocheck` 屏蔽的文件，被屏蔽的文件对它完全静默。
+因此在补完类型标注之前，`npm run compile` 会「干净通过」却什么也没检查。
+`scripts/typecheck.mjs` 用来消除这个盲区：
+
+| 命令 | 作用 |
+| --- | --- |
+| `npm run typecheck` | 运行 tsc，报告未被屏蔽文件的真实结果 |
+| `npm run typecheck:debt` | 额外做一次影子检查：临时移除屏蔽标记后编译，量出每个文件的真实错误数，再原样恢复 |
+| `npm run check` | 提交前门禁。债务超过 `.typecheck-baseline.json` 即退出码 1 |
+| `npm run typecheck:baseline` | 债务减少后刷新基线 |
+
+影子检查会短暂改写源文件，恢复逻辑放在 `finally` 与进程退出钩子里双重兜底，
+恢复后按内容比对确认与原文完全一致；不一致会明确指出文件并以退出码 2 终止。
+基线只允许下降，除此之外不要给它附加别的含义。
+
+## 类型债务与迭代路线
 
 项目已从早期「根目录平铺手写文件」迁移到 WXT + TypeScript 工程结构，
-`entrypoints/` 为唯一源码入口。
+`entrypoints/` 为唯一源码入口。补类型标注分阶段进行，以下为实测数字：
 
-尚未完成的部分：三个入口文件由早期手写 JavaScript 迁移而来，尚未补齐类型标注，
-文件顶部以 `// @ts-nocheck` 标记：
+| 文件 | 行数 | 真实类型错误 | 状态 |
+| --- | --- | --- | --- |
+| `entrypoints/popup/main.ts` | 188 | 0 | 已补全，可作样板 |
+| `entrypoints/options/main.ts` | 1641 | 582 | 待处理 |
+| `entrypoints/content/index.ts` | 2907 | 621 | 待处理 |
+| 合计 | — | **1203** | — |
 
-- `entrypoints/content/index.ts`
-- `entrypoints/options/main.ts`
-- `entrypoints/popup/main.ts`
+错误构成中约 83% 集中在四类：
 
-补全类型后即可删除标记，届时 `npm run compile` 会真正覆盖到这些文件。
-`types/node-lite.d.ts` 是本地最小 Node 类型声明，若日后能安装 `@types/node`，
-可删除该文件并在 `tsconfig.json` 的 `types` 中加入 `"node"`。
+| 错误码 | 数量 | 含义 |
+| --- | --- | --- |
+| TS7006 | 315 | 函数参数为隐式 `any`，补标注即可 |
+| TS2339 | 283 | 在 `Element` 上访问不存在的属性，多为 DOM 查询缺泛型 |
+| TS18047 | 224 | 值可能为 `null` |
+| TS7005 | 183 | 变量为隐式 `any[]` |
+
+建议的推进顺序：
+
+1. 先确认 `shared/settings.ts` 里该文件用到的数据结构，再逐文件补标注；
+   缺什么类型往那里加，不要各自造一套。
+2. 处理顺序按文件从小到大：options → content。每完成一个文件，删掉它的
+   `// @ts-nocheck`，然后跑一次 `npm run typecheck:baseline` 刷新基线。
+3. 补标注时不要顺手改逻辑。类型层面无法证明非空的位置，用 `!` 断言并在注释里
+   写明依据（`entrypoints/popup/main.ts` 就是这么做的），而不是加默认值或提前返回——
+   那会让「补类型」变成「改行为」，两种风险混在一起就说不清是哪一边出的问题。
+
+`entrypoints/popup/main.ts` 可作为样板。它的改动只增标注：改动前后各构建一次，
+产物文件名与体积（含内容哈希）完全一致，可用这个办法复核任何一次纯类型改动。
+
+其余未完成项：
+
+- `types/node-lite.d.ts` 是本地最小 Node 类型声明。若能安装 `@types/node`，
+  可删除该文件并在 `tsconfig.json` 的 `types` 中加入 `"node"`。
+- `entrypoints/popup/main.ts` 中的 `escapeHtml` 没有调用点，属迁移残留，确认后可删。
+- 三个入口仍是迁移前的 IIFE + `'use strict'` 写法，`popup/main.ts` 与 `options/main.ts`
+  里多个函数挤在同一行。可读性拆分放在类型补齐之后单独做。
