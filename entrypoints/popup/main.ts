@@ -14,6 +14,8 @@ import type {
   SearchSource,
   StoredSettings,
 } from '@/shared/settings';
+import { SPECIAL_ACTIONS } from '@/shared/search-actions';
+import { LEGACY_NOTES_STORAGE_KEY, NOTES_STORAGE_KEY, prependNotesLines, splitNotesLines } from '@/shared/notes';
 
 (function () {
   'use strict';
@@ -36,9 +38,6 @@ import type {
     { id: 'douyin', name: '抖音', detail: '抖音搜索', mark: '抖', className: 'douyin', url: 'https://www.douyin.com/search/{query}?type=general' },
     { id: 'doubao', name: '豆包', detail: '打开新对话并填入内容', mark: '豆', className: 'doubao', url: 'https://www.doubao.com/chat/?quickfind={query}' },
     { id: 'deepseek', name: 'DeepSeek', detail: 'AI 对话搜索', mark: 'DS', className: 'deepseek', url: 'https://chat.deepseek.com/?q={query}' }
-  ];
-  const specialActions: SearchSource[] = [
-    { id: 'copy', name: '复制', detail: '复制当前搜索内容', mark: '复', className: 'special-copy', action: 'copy', isSpecial: true }
   ];
   // 传给 chrome.storage.sync.get 的默认值：既是键集合也提供缺省值，因此需要索引签名。
   const defaults: StoredSettings & Record<string, unknown> = { enabled: true, engines: Object.fromEntries(builtins.map((source): [string, boolean] => [source.id, true])), iconOnly: {}, customEngines: [], engineOrder: builtins.map((source) => source.id), sources: [], groups: [], searchHistory: [] };
@@ -70,7 +69,7 @@ import type {
     }
     const sources: SearchSource[] = rawSources.filter((source) => source && source.id && source.name && (source.url || source.buildUrl)).map((source) => ({ ...source, id: String(source.id), className: source.className || (String(source.id).startsWith('custom-') ? 'custom' : String(source.id)) }));
     const sourceMap = new Map<string, SearchSource>(sources.map((source): [string, SearchSource] => [source.id, source]));
-    const actionTokens = new Set(specialActions.map((action) => 'action:' + action.id));
+    const actionTokens = new Set(SPECIAL_ACTIONS.map((action) => 'action:' + action.id));
     const oldDefault = rawGroups.find((group) => group.id === 'default');
     const customGroups: SearchGroup[] = rawGroups.filter((group) => group && group.id && group.id !== 'default')
       .map((group) => ({ id: String(group.id), name: String(group.name || '未命名分组'), items: [], visible: group.visible !== false && group.showInDefault !== false }));
@@ -107,7 +106,7 @@ import type {
         return;
       }
       if (String(id).startsWith('action:')) {
-        const action = specialActions.find((item) => item.id === String(id).slice(7));
+        const action = SPECIAL_ACTIONS.find((item) => item.id === String(id).slice(7));
         if (action) sources.push({ ...action, id: String(id) });
         return;
       }
@@ -132,6 +131,38 @@ import type {
     catch { return false; }
     finally { textarea.remove(); }
   }
+  /**
+   * 特殊功能按钮「笔记」：把搜索框里的内容存到无限大纲笔记第一行。
+   * 笔记的最新状态在页面侧栏手里，优先交给它写；页面没有内容脚本时（浏览器内置页、
+   * 扩展页、PDF 查看器等）直接写存储兜底，两条路径都不会把内容丢掉。
+   */
+  function saveQueryToNotes(): void {
+    const text = queryInput.value.trim();
+    if (!text) return;
+    if (!chrome.tabs?.query) { void prependNoteLocally(text); return; }
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs?.[0];
+      if (!tab?.id) { void prependNoteLocally(text); return; }
+      chrome.tabs.sendMessage(tab.id, { type: 'save-note', text }, (response) => {
+        if (chrome.runtime.lastError || !response?.ok) void prependNoteLocally(text);
+      });
+    });
+  }
+
+  /** 兜底写入：取存储里最新的副本，把内容插到第一行再写回。 */
+  async function prependNoteLocally(text: string): Promise<boolean> {
+    const lines = splitNotesLines(text);
+    if (!lines.length) return false;
+    const stored = await new Promise<Record<string, unknown>>((resolve) => {
+      chrome.storage.local.get([NOTES_STORAGE_KEY, LEGACY_NOTES_STORAGE_KEY], (value) => resolve(value || {}));
+    });
+    // 旧版笔记还没迁移完时不写：那份数组由设置页和侧栏负责搬迁，这里插进去会让它再也看不到。
+    if (stored[LEGACY_NOTES_STORAGE_KEY]) return false;
+    const next = prependNotesLines(stored[NOTES_STORAGE_KEY], lines);
+    if (!next) return false;
+    return new Promise<boolean>((resolve) => chrome.storage.local.set({ [NOTES_STORAGE_KEY]: next }, () => resolve(true)));
+  }
+
   function savePopupCache(value: unknown) { chrome.storage.session?.set({ [POPUP_CACHE_KEY]: value }); }
   function rememberSearch(query: string) { const normalized = query.replace(/\s+/g, ' ').trim(); if (!normalized) return; const history = settings.searchHistory.map((item) => typeof item === 'string' ? { query: item } : item).filter((item) => item && item.query && item.query !== normalized); history.unshift({ query: normalized, timestamp: Date.now() }); settings.searchHistory = history.slice(0, 20); chrome.storage.sync.set({ searchHistory: settings.searchHistory }); savePopupCache(settings); }
   function focusAndSelectQuery() { queryInput.focus({ preventScroll: true }); queryInput.select(); }
@@ -186,7 +217,7 @@ import type {
       });
       groupTabs.append(tab);
     });
-    engineSettings.replaceChildren(); const active = settings.groups.find((group) => group.id === activeGroupId) || settings.groups[0]; getGroupSources(active || { items: [] }).forEach((source) => { const button = document.createElement('button'); button.type = 'button'; button.className = `engine-row${source.isGroup ? ' group-row' : ''}`; button.title = source.isGroup ? `打开${source.name}` : source.isSpecial ? `${source.name}搜索内容` : `使用${source.name}搜索`; const ident = document.createElement('span'); ident.className = 'engine-ident'; const logo = document.createElement('span'); logo.className = `engine-logo ${source.className}`; if (source.iconUrl) { const image = document.createElement('img'); image.src = source.iconUrl; image.alt = ''; image.addEventListener('error', () => { image.remove(); if (!logo.childElementCount) logo.textContent = source.mark || '?'; }); logo.append(image); } if (!logo.childElementCount) logo.textContent = source.mark || '?'; const name = document.createElement('strong'); name.textContent = source.name; ident.append(logo, name); const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); arrow.setAttribute('class', 'go-icon'); arrow.setAttribute('viewBox', '0 0 24 24'); arrow.setAttribute('aria-hidden', 'true'); arrow.innerHTML = '<path d="m9 6 6 6-6 6"></path>'; button.append(ident, arrow); button.addEventListener('click', () => { if (source.isGroup) { activeGroupId = source.groupId!; render(settings); return; } if (source.isSpecial && source.action === 'copy') { void copyTextToClipboard(queryInput.value.trim()); return; } submitSearch(source); }); engineSettings.append(button); });
+    engineSettings.replaceChildren(); const active = settings.groups.find((group) => group.id === activeGroupId) || settings.groups[0]; getGroupSources(active || { items: [] }).forEach((source) => { const button = document.createElement('button'); button.type = 'button'; button.className = `engine-row${source.isGroup ? ' group-row' : ''}`; button.title = source.isGroup ? `打开${source.name}` : source.isSpecial ? String(source.specialTitle || source.name) : `使用${source.name}搜索`; const ident = document.createElement('span'); ident.className = 'engine-ident'; const logo = document.createElement('span'); logo.className = `engine-logo ${source.className}`; if (source.iconUrl) { const image = document.createElement('img'); image.src = source.iconUrl; image.alt = ''; image.addEventListener('error', () => { image.remove(); if (!logo.childElementCount) logo.textContent = source.mark || '?'; }); logo.append(image); } if (!logo.childElementCount) logo.textContent = source.mark || '?'; const name = document.createElement('strong'); name.textContent = source.name; ident.append(logo, name); const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); arrow.setAttribute('class', 'go-icon'); arrow.setAttribute('viewBox', '0 0 24 24'); arrow.setAttribute('aria-hidden', 'true'); arrow.innerHTML = '<path d="m9 6 6 6-6 6"></path>'; button.append(ident, arrow); button.addEventListener('click', () => { if (source.isGroup) { activeGroupId = source.groupId!; render(settings); return; } if (source.isSpecial) { if (source.action === 'copy') void copyTextToClipboard(queryInput.value.trim()); else if (source.action === 'notes') saveQueryToNotes(); return; } submitSearch(source); }); engineSettings.append(button); });
     renderHistory(settings.searchHistory);
   }
   function renderHistory(history: HistoryItem[]) { historyList.replaceChildren(); const entries = history.map((item) => typeof item === 'string' ? { query: item } : item).filter((item) => item && item.query); if (!entries.length) { historyList.innerHTML = '<div class="history-empty">暂无搜索历史</div>'; return; } entries.forEach((item) => { const button = document.createElement('button'); button.type = 'button'; button.className = 'history-item'; button.textContent = item.query; button.title = item.query; button.addEventListener('click', () => { queryInput.value = item.query; syncClearButton(); historyOpen = false; historyToggle.setAttribute('aria-expanded', 'false'); historyList.hidden = true; queryInput.focus(); }); historyList.append(button); }); }

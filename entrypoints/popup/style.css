@@ -82,6 +82,8 @@ h1 { margin:0; font-size:15px; line-height:1.2; letter-spacing:.01em; font-weigh
 .engine-logo.doubao { background:#4f7cff; }
 .engine-logo.deepseek { background:#4d6bfe; font-size:10px; }
 .engine-logo.group { color:#315f4d; background:#dfeee5; font-size:11px; }
+.engine-logo.special-copy { background:#6c8178; font-size:12px; }
+.engine-logo.special-notes { background:#3e8f6c; font-size:12px; }
 .engine-row.group-row { border-style:dashed; background:#f7fbf8; }
 .engine-row.group-row:hover { border-color:#79ad91; background:#eff8f2; }
 .go-icon { width:15px; height:15px; flex:0 0 auto; fill:none; stroke:#8ca198; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }

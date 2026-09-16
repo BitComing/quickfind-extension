@@ -15,18 +15,20 @@
           <div><h1>QuickFind</h1><p>搜索设置</p></div>
         </div>
         <nav class="settings-nav" role="tablist" aria-label="设置分类">
-          <button class="nav-item active" type="button" role="tab" aria-selected="true" data-panel="general"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6.5v5c0 4.6 3.4 7.8 8 9.5 4.6-1.7 8-4.9 8-9.5v-5L12 3Z"></path><path d="m8.5 12 2.2 2.2 4.8-4.8"></path></svg><span>常用设置</span></button>
-          <button class="nav-item" type="button" role="tab" aria-selected="false" data-panel="pinned"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v11H9l-5 4v-15Z"></path><path d="M8 10h8M8 13h5"></path></svg><span>常驻搜索列表</span></button>
+          <button class="nav-item active" type="button" role="tab" aria-selected="true" data-panel="selection"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6M12 4v16M9 20h6"></path></svg><span>选中文字</span></button>
+          <button class="nav-item" type="button" role="tab" aria-selected="false" data-panel="pinned"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="15" rx="2.4"></rect><path d="M3 8.6h18"></path><path d="M7.4 6.3h.01M10 6.3h.01"></path></svg><span>常驻搜索栏</span></button>
+          <button class="nav-item" type="button" role="tab" aria-selected="false" data-panel="sources"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="2"></rect><rect x="13" y="4" width="7" height="7" rx="2"></rect><rect x="4" y="13" width="7" height="7" rx="2"></rect><rect x="13" y="13" width="7" height="7" rx="2"></rect></svg><span>搜索源与分组</span></button>
+          <button class="nav-item" type="button" role="tab" aria-selected="false" data-panel="llm"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H10l-5 4V5Z"></path><path d="M9 9.5h6M9 12.5h4"></path></svg><span>LLM 对话</span></button>
           <button class="nav-item" type="button" role="tab" aria-selected="false" data-panel="history"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path><path d="M12 7v5l3 2"></path></svg><span>历史记录</span></button>
           <button class="nav-item" type="button" role="tab" aria-selected="false" data-panel="notes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h11l3 3v13H5z"></path><path d="M16 4v4h3M8 12h8M8 15h6"></path></svg><span>无限大纲笔记</span></button>
         </nav>
       </aside>
 
       <section class="settings-content">
-        <section class="settings-panel active" data-panel-content="general" role="tabpanel">
-          <header class="content-header"><div><h2>常用设置</h2><p>配置选中文字后搜索按钮中展示的搜索源与分组。</p></div><span id="save-state" class="save-state" role="status"></span></header>
+        <section class="settings-panel active" data-panel-content="selection" role="tabpanel">
+          <header class="content-header"><div><h2>选中文字</h2><p>配置在网页和编辑框中选中文字后，搜索按钮的触发方式与显示时机。</p></div><span id="selection-save-state" class="save-state" role="status"></span></header>
           <section class="setting-block">
-            <h3>普通网页选中文字触发方式</h3>
+            <h3>网页中选中文字</h3>
             <div class="trigger-options">
               <label class="trigger-option"><input type="radio" name="trigger-mode" value="click" checked /><span><strong>点击搜索按钮</strong><small>默认方式</small></span></label>
               <label class="trigger-option"><input type="radio" name="trigger-mode" value="hover" /><span><strong>鼠标移入按钮</strong><small>移入后自动展开</small></span></label>
@@ -35,16 +37,58 @@
             <label class="count-option"><span><strong>选中文字后显示图标延时（毫秒）</strong><small>松开鼠标后再显示搜索图标</small></span><input id="selection-trigger-delay" type="number" min="0" max="2000" step="50" inputmode="numeric" /></label>
           </section>
           <section class="setting-block">
-            <h3>编辑框选中文字触发方式</h3>
+            <h3>编辑框中选中文字</h3>
             <p class="setting-help">仅影响输入框、文本域和可编辑区域中的选中文字。</p>
             <div class="trigger-options editable-trigger-options">
-              <label class="trigger-option"><input type="radio" name="editable-trigger-mode" value="click" checked /><span><strong>点击图标</strong><small>点击后展开搜索列表</small></span></label>
+              <label class="trigger-option"><input type="radio" name="editable-trigger-mode" value="click" /><span><strong>点击图标</strong><small>点击后展开搜索列表</small></span></label>
               <label class="trigger-option"><input type="radio" name="editable-trigger-mode" value="hover" /><span><strong>鼠标移入图标</strong><small>悬停后展开搜索列表</small></span></label>
-              <label class="trigger-option"><input type="radio" name="editable-trigger-mode" value="none" /><span><strong>不显示</strong><small>编辑框选区不显示图标</small></span></label>
+              <label class="trigger-option"><input type="radio" name="editable-trigger-mode" value="none" checked /><span><strong>不显示</strong><small>编辑框选区不显示图标</small></span></label>
             </div>
           </section>
-          <section class="setting-block llm-settings-block">
-            <div class="setting-heading-row"><div><h3>右侧 LLM 对话</h3><p class="setting-help">使用 OpenAI 兼容的 Chat Completions 接口。API Key 仅用于请求，不会注入网页内容。</p></div><label class="compact-toggle"><input id="llm-enabled" type="checkbox" /><span>启用</span></label></div>
+        </section>
+
+        <section class="settings-panel" data-panel-content="pinned" role="tabpanel" hidden>
+          <header class="content-header"><div><h2>常驻搜索栏</h2><p>常驻栏固定在页面顶部居中，显示当前搜索文本。为站点选择已有搜索源或添加自定义站点，搜索源与分组在「搜索源与分组」中编辑。</p></div><span id="pinned-save-state" class="save-state" role="status"></span></header>
+          <div class="site-support" aria-label="常驻列表站点"><span>已启用站点</span><span id="pinned-site-summary" class="site-summary"></span><button id="manage-pinned-sites" class="secondary-button" type="button">管理常驻站点</button></div>
+          <label class="count-option"><span><strong>默认分组直接展示数量</strong><small>其余项目收起到更多菜单</small></span><input id="pinned-default-group-count" type="number" min="1" max="20" step="1" inputmode="numeric" /></label>
+          <label class="count-option"><span><strong>鼠标离开后收起延时（毫秒）</strong><small>默认 1000 毫秒</small></span><input id="pinned-collapse-delay" type="number" min="0" max="60000" step="100" inputmode="numeric" /></label>
+          <label class="toggle-option"><input id="pinned-all-sites" type="checkbox" /><span><strong>所有站点都显示常驻搜索栏</strong><small>没有匹配站点搜索框时使用最近一次搜索内容</small></span></label>
+        </section>
+
+        <section class="settings-panel" data-panel-content="sources" role="tabpanel" hidden>
+          <header class="content-header"><div><h2>搜索源与分组</h2><p>选中文字搜索与常驻搜索栏共用这一份搜索源和分组配置，改这里两个列表都会跟着变。</p></div><span id="sources-save-state" class="save-state" role="status"></span></header>
+          <section class="setting-block">
+            <h3>特殊功能按钮</h3>
+            <p class="setting-help">将特殊功能按钮添加到搜索源分组，或选择“未添加”将其移除。添加后可在下方搜索源列表中拖动调整位置。</p>
+            <div id="special-action-list" class="special-action-list"></div>
+          </section>
+          <section class="source-manager" aria-label="搜索源与分组配置">
+            <div class="manager-heading"><div><h3>分组与顺序</h3><p>拖动默认组中的搜索源、特殊功能按钮或自定义组，调整两个搜索列表中的顺序。</p></div><div class="manager-actions"><div id="batch-actions" class="batch-actions" hidden><span id="batch-count">已选 0 项</span><select id="batch-group" aria-label="批量移动到分组"><option value="">移动到分组</option></select><button id="batch-delete" class="icon-button" type="button" aria-label="删除所选搜索源" title="删除所选搜索源"><svg viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2M19 6l-1 14H6L5 6"></path></svg></button></div><button id="add-group" class="icon-button add-group-button" type="button" aria-label="新建分组" title="新建分组"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg></button></div></div>
+            <div id="group-list" class="group-tabs" role="tablist" aria-label="搜索源分组"></div>
+            <div id="active-group-meta" class="active-group-meta"></div>
+            <div class="source-column-labels" aria-hidden="true"><span>搜索源</span><span></span><span></span><span></span><span>仅图标</span><span>启用</span></div>
+            <div id="source-list" class="source-list"></div>
+            <form id="source-form" class="custom-form">
+              <div class="form-heading"><span id="form-title">添加搜索源</span><button id="cancel-edit" type="button" class="text-button" hidden>取消编辑</button></div>
+              <div class="form-grid">
+                <label><span>名称</span><input id="source-name" type="text" maxlength="24" placeholder="例如：DuckDuckGo" required /></label>
+                <label class="mark-field"><span>图标</span><input id="source-mark" type="text" maxlength="2" placeholder="D" required /></label>
+                <label class="url-field"><span>搜索 URL 模板</span><input id="source-url" type="text" inputmode="url" placeholder="https://duckduckgo.com/?q={query}" required /></label>
+              </div>
+              <p id="form-error" class="form-error" role="alert"></p>
+              <button class="primary-button" type="submit"><span id="submit-label">添加搜索源</span></button>
+            </form>
+          </section>
+        </section>
+
+        <section class="settings-panel" data-panel-content="llm" role="tabpanel" hidden>
+          <header class="content-header"><div><h2>LLM 对话</h2><p>页面右侧「随心问」通过 OpenAI 兼容的 Chat Completions 接口回答。API Key 仅用于请求，不会注入网页内容。</p></div><span id="llm-save-state" class="save-state" role="status"></span></header>
+          <section class="setting-block">
+            <h3>页面右侧面板</h3>
+            <label class="toggle-option"><input id="llm-dock-visible" type="checkbox" /><span><strong>显示「随心问」面板</strong><small>该面板与「无限大纲笔记」同处右侧 dock，关闭后两者都不再出现</small></span></label>
+          </section>
+          <section class="setting-block">
+            <div class="setting-heading-row"><div><h3>接口配置</h3><p class="setting-help">留空时使用下面的默认值。</p></div><label class="compact-toggle"><input id="llm-enabled" type="checkbox" /><span>启用</span></label></div>
             <div class="llm-config-grid">
               <label class="llm-endpoint-field"><span>API 地址</span><input id="llm-endpoint" type="url" inputmode="url" placeholder="https://api.openai.com/v1/chat/completions" /></label>
               <label><span>模型</span><input id="llm-model" type="text" placeholder="gpt-4o-mini" /></label>
@@ -52,19 +96,6 @@
               <label class="llm-prompt-field"><span>系统提示词（可选）</span><textarea id="llm-system-prompt" rows="2" placeholder="例如：请用简洁、准确的中文回答。"></textarea></label>
             </div>
           </section>
-          <section class="setting-block">
-            <h3>特殊功能按钮</h3>
-            <p class="setting-help">将特殊功能按钮添加到搜索源分组，或选择“未添加”将其移除。添加后可在下方搜索源列表中拖动调整位置。</p>
-            <div id="special-action-list" class="special-action-list"></div>
-          </section>
-        </section>
-
-        <section class="settings-panel" data-panel-content="pinned" role="tabpanel" hidden>
-          <header class="content-header"><div><h2>常驻搜索列表</h2><p>可选择已有搜索源对应的站点，也可添加自定义站点。搜索源和分组与常用设置保持一致；常驻栏固定在页面顶部居中，并显示当前搜索文本。</p></div><span id="pinned-save-state" class="save-state" role="status"></span></header>
-          <div class="site-support" aria-label="常驻列表站点"><span>已启用站点</span><span id="pinned-site-summary" class="site-summary"></span><button id="manage-pinned-sites" class="secondary-button" type="button">管理常驻站点</button></div>
-          <label class="count-option"><span><strong>默认分组直接展示数量</strong><small>其余项目收起到更多菜单</small></span><input id="pinned-default-group-count" type="number" min="1" max="20" step="1" inputmode="numeric" /></label>
-          <label class="count-option"><span><strong>鼠标离开后收起延时（毫秒）</strong><small>默认 2000 毫秒</small></span><input id="pinned-collapse-delay" type="number" min="0" max="60000" step="100" inputmode="numeric" /></label>
-          <label class="toggle-option"><input id="pinned-all-sites" type="checkbox" /><span><strong>所有站点都显示常驻搜索栏</strong><small>没有匹配站点搜索框时使用最近一次搜索内容</small></span></label>
         </section>
 
         <section class="settings-panel history-panel" data-panel-content="history" role="tabpanel" hidden>
@@ -100,24 +131,6 @@
           </div>
           <div class="notes-context"><button id="notes-home" class="notes-home" type="button" aria-label="返回根目录" title="返回根目录">根目录</button><span class="notes-context-separator">/</span><div id="notes-breadcrumb" class="notes-breadcrumb" aria-live="polite">根目录</div><span id="notes-search-result" class="notes-search-result" aria-live="polite"></span></div>
           <div id="notes-outline" class="notes-outline" role="tree" aria-label="大纲笔记"></div>
-        </section>
-
-        <section id="source-manager" class="source-manager" aria-label="搜索源与分组配置">
-          <div class="manager-heading"><div><h3 id="manager-title">搜索源分组</h3><p id="manager-help">拖动默认组中的搜索源或自定义组，调整它们在搜索列表中的顺序。</p></div><div class="manager-actions"><div id="batch-actions" class="batch-actions" hidden><span id="batch-count">已选 0 项</span><select id="batch-group" aria-label="批量移动到分组"><option value="">移动到分组</option></select><button id="batch-delete" class="icon-button" type="button" aria-label="删除所选搜索源" title="删除所选搜索源"><svg viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2M19 6l-1 14H6L5 6"></path></svg></button></div><button id="add-group" class="icon-button add-group-button" type="button" aria-label="新建分组" title="新建分组"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg></button></div></div>
-          <div id="group-list" class="group-tabs" role="tablist" aria-label="搜索源分组"></div>
-          <div id="active-group-meta" class="active-group-meta"></div>
-          <div class="source-column-labels" aria-hidden="true"><span>搜索源</span><span></span><span></span><span></span><span>仅图标</span><span>启用</span></div>
-          <div id="source-list" class="source-list"></div>
-          <form id="source-form" class="custom-form">
-            <div class="form-heading"><span id="form-title">添加搜索源</span><button id="cancel-edit" type="button" class="text-button" hidden>取消编辑</button></div>
-            <div class="form-grid">
-              <label><span>名称</span><input id="source-name" type="text" maxlength="24" placeholder="例如：DuckDuckGo" required /></label>
-              <label class="mark-field"><span>图标</span><input id="source-mark" type="text" maxlength="2" placeholder="D" required /></label>
-              <label class="url-field"><span>搜索 URL 模板</span><input id="source-url" type="text" inputmode="url" placeholder="https://duckduckgo.com/?q={query}" required /></label>
-            </div>
-            <p id="form-error" class="form-error" role="alert"></p>
-            <button class="primary-button" type="submit"><span id="submit-label">添加搜索源</span></button>
-          </form>
         </section>
       </section>
     </main>

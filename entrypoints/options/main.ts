@@ -1,5 +1,7 @@
 // @ts-nocheck
 // 由早期手写 JavaScript 迁移而来，尚未补齐类型标注；补全后删除本行。见 README「迁移状态」。
+import { SPECIAL_ACTIONS } from '@/shared/search-actions';
+
 (function () {
   'use strict';
 
@@ -41,9 +43,6 @@
     { id: 'doubao', name: '豆包', detail: '打开新对话并填入内容', mark: '豆', className: 'doubao', url: 'https://www.doubao.com/chat/?quickfind={query}' },
     { id: 'deepseek', name: 'DeepSeek', detail: 'AI 对话搜索', mark: 'DS', className: 'deepseek', url: 'https://chat.deepseek.com/?q={query}' }
   ];
-  const SPECIAL_ACTIONS = [
-    { id: 'copy', name: '复制', detail: '复制当前搜索内容', mark: '复', className: 'special-copy' }
-  ];
   const LEGACY_KEYS = ['engines', 'iconOnly', 'customEngines', 'engineOrder'];
   const CONFIG_VERSION = 5;
   const PINNED_SITES = [
@@ -60,41 +59,66 @@
     { id: 'douyin', name: '抖音', url: 'https://www.douyin.com/search/{query}?type=general', selector: 'input[data-e2e="searchbar-input"], input[placeholder*="搜索"], input[aria-label*="搜索"], input[name="keyword"]' }
   ];
   const PINNED_SITE_CONFIG_VERSION = 3;
+
+  // ── 默认配置 ──────────────────────────────────────────────────────────
+  // 默认值即作者当前在浏览器里使用的一套设置（搜索历史这类个人数据除外）。
+  // 它只在「全新安装」时落地：存储里已有 sources/groups 或旧版 engines/iconOnly 的安装
+  // 一律走版本迁移，不会被这里覆盖。改默认值请连同 content/index.ts 的 DEFAULT_SETTINGS 一起改。
+
+  // 只在列表里显示图标的源，名字交给悬浮提示。
+  const DEFAULT_ICON_ONLY_IDS = ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'bing', 'yandex', 'zhihu'];
+  const DEFAULT_SOURCES = BUILTINS.map((source) => ({ ...source, enabled: true, iconOnly: DEFAULT_ICON_ONLY_IDS.includes(source.id) }));
+  // 默认组先直排 4 个常用源，其余按主题收进 4 个分组。
+  const DEFAULT_GROUPS = [
+    { id: 'default', name: '默认组', items: ['google', 'bing', 'yandex', 'zhihu', 'group:group-other', 'group:group-video', 'group:group-social', 'group:group-ai'], visible: true },
+    { id: 'group-other', name: '其他', items: ['so', 'sogou', 'duckduckgo', 'baidu', 'google-scholar'], visible: true },
+    { id: 'group-video', name: '视频', items: ['bilibili', 'youtube', 'douyin'], visible: true },
+    { id: 'group-social', name: '社媒', items: ['xiaohongshu', 'x'], visible: true },
+    { id: 'group-ai', name: 'ai', items: ['google-ai', 'doubao', 'deepseek'], visible: true }
+  ];
+  // 常驻搜索栏：默认在所有站点出现，展开后 1 秒自动收起。
+  const DEFAULT_PINNED_SEARCH = {
+    sites: PINNED_SITES.map((site) => site.id), customSites: [], defaultGroupCount: 4,
+    collapseDelay: 1000, openInNewTab: false, allSites: true, siteConfigVersion: PINNED_SITE_CONFIG_VERSION
+  };
+
   const NEW_BUILTIN_IDS = ['baidu', 'google-scholar', 'duckduckgo', 'so', 'sogou', 'douyin'];
   const DEFAULTS = {
-    enabled: true, triggerMode: 'click', editableTriggerMode: 'click', defaultGroupCount: 4, selectionTriggerDelay: 200,
+    enabled: true, triggerMode: 'click', editableTriggerMode: 'none', defaultGroupCount: 4, selectionTriggerDelay: 200, llmDockVisible: false,
     engines: Object.fromEntries(BUILTINS.map((source) => [source.id, true])), searchHistory: [],
-    llm: { enabled: true, endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini', apiKey: '', systemPrompt: '' },
-    iconOnly: {}, customEngines: [], engineOrder: BUILTINS.map((source) => source.id), sources: [], groups: []
+    llm: { enabled: false, endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini', apiKey: '', systemPrompt: '' },
+    iconOnly: {}, customEngines: [], engineOrder: BUILTINS.map((source) => source.id), sources: [], groups: [],
+    pinnedSearch: DEFAULT_PINNED_SEARCH
   };
   const MAX_DEFAULT_GROUP_COUNT = 20;
 
   let settings;
-  let activePanel = 'general';
-  const activeGroupId = { general: 'default', pinned: 'default' };
+  let activePanel = 'selection';
+  // 搜索源与分组已是独立的一页，manager 的选中态不再按面板区分；
+  // 拖拽与编辑的归属统一记在这个常量上。
+  const MANAGER_PANEL = 'sources';
+  let managerGroupId = 'default';
   let editing = null;
   let draggedItem = null;
   let iconEditorSourceId = null;
   let pinnedSiteEditingId = null;
   const iconNodeCache = new Map();
-  const selectedSourceIds = { general: new Set(), pinned: new Set() };
+  const selectedSourceIds = new Set();
   const selectedHistoryIndexes = new Set();
 
   const navItems = Array.from(document.querySelectorAll('.nav-item'));
   const panels = Array.from(document.querySelectorAll('.settings-panel'));
-  const sourceManager = document.querySelector('#source-manager');
-  const managerTitle = document.querySelector('#manager-title');
-  const managerHelp = document.querySelector('#manager-help');
   const defaultGroupCountInput = document.querySelector('#default-group-count');
   const pinnedDefaultGroupCountInput = document.querySelector('#pinned-default-group-count');
   const pinnedCollapseDelayInput = document.querySelector('#pinned-collapse-delay');
   const pinnedAllSitesInput = document.querySelector('#pinned-all-sites');
   const selectionTriggerDelayInput = document.querySelector('#selection-trigger-delay');
-  const llmEnabledInput = document.querySelector('#llm-enabled');
-  const llmEndpointInput = document.querySelector('#llm-endpoint');
-  const llmModelInput = document.querySelector('#llm-model');
-  const llmApiKeyInput = document.querySelector('#llm-api-key');
-  const llmSystemPromptInput = document.querySelector('#llm-system-prompt');
+  const llmEnabledInput = document.querySelector<HTMLInputElement>('#llm-enabled');
+  const llmDockVisibleInput = document.querySelector<HTMLInputElement>('#llm-dock-visible');
+  const llmEndpointInput = document.querySelector<HTMLInputElement>('#llm-endpoint');
+  const llmModelInput = document.querySelector<HTMLInputElement>('#llm-model');
+  const llmApiKeyInput = document.querySelector<HTMLInputElement>('#llm-api-key');
+  const llmSystemPromptInput = document.querySelector<HTMLTextAreaElement>('#llm-system-prompt');
   const sourceList = document.querySelector('#source-list');
   const groupList = document.querySelector('#group-list');
   const activeGroupMeta = document.querySelector('#active-group-meta');
@@ -107,7 +131,7 @@
   const submitLabel = document.querySelector('#submit-label');
   const cancelEdit = document.querySelector('#cancel-edit');
   const addGroupButton = document.querySelector('#add-group');
-  const saveStates = { general: document.querySelector('#save-state'), pinned: document.querySelector('#pinned-save-state'), history: document.querySelector('#history-save-state'), notes: document.querySelector('#notes-save-state') };
+  const saveStates = { selection: document.querySelector('#selection-save-state'), pinned: document.querySelector('#pinned-save-state'), sources: document.querySelector('#sources-save-state'), llm: document.querySelector('#llm-save-state'), history: document.querySelector('#history-save-state'), notes: document.querySelector('#notes-save-state') };
   const triggerInputs = Array.from(document.querySelectorAll('input[name="trigger-mode"]'));
   const editableTriggerInputs = Array.from(document.querySelectorAll('input[name="editable-trigger-mode"]'));
   const iconEditor = document.querySelector('#icon-editor');
@@ -364,6 +388,17 @@
     return normalized;
   }
 
+  // 全新安装（存储里既没有 sources/groups，也没有旧版 engines/iconOnly 痕迹）直接落在默认
+  // 配置上。已有配置一律走版本迁移：旧版安装的 engines/iconOnly/customEngines 只能靠
+  // copyBuiltins 的回落路径读出来，而那条路径要求 sources 为空，所以默认值不能塞进 DEFAULTS，
+  // 否则会把旧安装的源开关冲掉。
+  function defaultConfigSeed(stored: any) {
+    const storedGroups: any[] = Array.isArray(stored.groups) ? stored.groups : [];
+    const hasConfiguredList = Array.isArray(stored.sources) && (stored.sources.length > 0 || storedGroups.some((group) => group?.id === 'default'));
+    const hasLegacyConfig = LEGACY_KEYS.some((key) => Object.prototype.hasOwnProperty.call(stored, key));
+    return hasConfiguredList || hasLegacyConfig ? {} : { sources: DEFAULT_SOURCES, groups: DEFAULT_GROUPS };
+  }
+
   function normalizeSettings(stored) {
     const needsBuiltinMigration = Number(stored.sourceConfigVersion) < CONFIG_VERSION;
     const general = needsBuiltinMigration
@@ -385,11 +420,11 @@
         ...customSites.map((site) => site.id)
       ])];
     const pinnedDefaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(pinnedRaw.defaultGroupCount ?? 4) || 4)));
-    const rawCollapseDelay = Number(pinnedRaw.collapseDelay ?? 2000);
-    const pinnedCollapseDelay = Number.isFinite(rawCollapseDelay) ? Math.max(0, Math.min(60000, Math.round(rawCollapseDelay))) : 2000;
+    const rawCollapseDelay = Number(pinnedRaw.collapseDelay ?? DEFAULT_PINNED_SEARCH.collapseDelay);
+    const pinnedCollapseDelay = Number.isFinite(rawCollapseDelay) ? Math.max(0, Math.min(60000, Math.round(rawCollapseDelay))) : DEFAULT_PINNED_SEARCH.collapseDelay;
     const pinned = { sites, customSites, defaultGroupCount: pinnedDefaultGroupCount, collapseDelay: pinnedCollapseDelay, openInNewTab: pinnedRaw.openInNewTab === true, allSites: pinnedRaw.allSites === true, siteConfigVersion: PINNED_SITE_CONFIG_VERSION };
     const count = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(stored.defaultGroupCount ?? stored.defaultVisibleCount ?? 4) || 4)));
-    const editableTriggerMode = ['click', 'hover', 'none'].includes(stored.editableTriggerMode) ? stored.editableTriggerMode : 'click';
+    const editableTriggerMode = ['click', 'hover', 'none'].includes(stored.editableTriggerMode) ? stored.editableTriggerMode : DEFAULTS.editableTriggerMode;
     const selectionTriggerDelay = Math.max(0, Math.min(2000, Math.round(Number(stored.selectionTriggerDelay ?? 200) || 0)));
     const rawLlm = stored.llm && typeof stored.llm === 'object' ? stored.llm : {};
     const llm = {
@@ -399,27 +434,28 @@
       apiKey: String(rawLlm.apiKey || ''),
       systemPrompt: String(rawLlm.systemPrompt || '').trim()
     };
-    return { enabled: stored.enabled !== false, triggerMode: stored.triggerMode === 'hover' ? 'hover' : 'click', editableTriggerMode, defaultGroupCount: count, selectionTriggerDelay, general, pinned, llm, searchHistory: normalizeSearchHistory(stored.searchHistory) };
+    return { enabled: stored.enabled !== false, triggerMode: stored.triggerMode === 'hover' ? 'hover' : 'click', editableTriggerMode, defaultGroupCount: count, selectionTriggerDelay, llmDockVisible: stored.llmDockVisible !== false, general, pinned, llm, searchHistory: normalizeSearchHistory(stored.searchHistory) };
   }
 
-  // Both settings pages edit the same search-source data. The pinned panel only
-  // owns its display and site-matching preferences.
+  // 两个搜索列表编辑的是同一份搜索源数据，这里统一称它为 config()。
   function config() { return settings.general; }
-  function activeGroup() { return config().groups.find((group) => group.id === activeGroupId[activePanel]) || config().groups[0]; }
+  function activeGroup() { return config().groups.find((group) => group.id === managerGroupId) || config().groups[0]; }
   function sourceById(id) { return config().sources.find((source) => source.id === id); }
   function groupById(id) { return config().groups.find((group) => group.id === id); }
 
   function showSaved(panel) {
     const status = saveStates[panel || activePanel];
+    if (!status) return;
     status.textContent = '已保存';
     window.setTimeout(() => { if (status.textContent === '已保存') status.textContent = ''; }, 1200);
   }
 
-  function saveGeneral(statusPanel = 'general') {
+  function saveGeneral(statusPanel = 'selection') {
     chrome.storage.sync.set({
       enabled: settings.enabled, triggerMode: settings.triggerMode, defaultGroupCount: settings.defaultGroupCount,
       editableTriggerMode: settings.editableTriggerMode,
       selectionTriggerDelay: settings.selectionTriggerDelay,
+      llmDockVisible: settings.llmDockVisible,
       llm: settings.llm,
       sources: settings.general.sources, groups: settings.general.groups, sourceConfigVersion: CONFIG_VERSION
     }, () => showSaved(statusPanel));
@@ -1015,7 +1051,7 @@
   function addDragBehavior(row, item) {
     row.draggable = true;
     row.addEventListener('dragstart', (event) => {
-      const selected = item.type === 'source' ? selectedSourceIds[item.panel] : null;
+      const selected = item.type === 'source' ? selectedSourceIds : null;
       const ids = selected?.has(item.id) ? Array.from(selected) : [item.id];
       draggedItem = { ...item, ids };
       row.classList.add('dragging'); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', ids.join(','));
@@ -1025,7 +1061,7 @@
       document.querySelectorAll('.drag-before,.drag-after,.dragging').forEach((element) => element.classList.remove('drag-before', 'drag-after', 'dragging'));
     });
     row.addEventListener('dragover', (event) => {
-      if (!draggedItem || draggedItem.panel !== activePanel || (draggedItem.ids || [draggedItem.id]).includes(item.id)) return;
+      if (!draggedItem || draggedItem.panel !== MANAGER_PANEL || (draggedItem.ids || [draggedItem.id]).includes(item.id)) return;
       event.preventDefault();
       const after = event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
       row.classList.toggle('drag-before', !after); row.classList.toggle('drag-after', after);
@@ -1033,7 +1069,7 @@
     row.addEventListener('dragleave', () => row.classList.remove('drag-before', 'drag-after'));
     row.addEventListener('drop', (event) => {
       event.preventDefault(); row.classList.remove('drag-before', 'drag-after');
-      if (!draggedItem || draggedItem.panel !== activePanel || (draggedItem.ids || [draggedItem.id]).includes(item.id)) return;
+      if (!draggedItem || draggedItem.panel !== MANAGER_PANEL || (draggedItem.ids || [draggedItem.id]).includes(item.id)) return;
       reorderActiveItem(draggedItem.ids || draggedItem.id, item.id, event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2);
     });
   }
@@ -1041,14 +1077,14 @@
   function createSourceRow(source) {
     const row = document.createElement('div');
     row.className = 'source-row'; row.dataset.sourceId = source.id;
-    addDragBehavior(row, { panel: activePanel, id: source.id, type: 'source' });
+    addDragBehavior(row, { panel: MANAGER_PANEL, id: source.id, type: 'source' });
     const handle = document.createElement('span');
     handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = '拖动排序，或拖到分组标签中移动'; handle.setAttribute('aria-hidden', 'true');
     const select = document.createElement('label');
     select.className = 'source-select'; select.title = '选择搜索源';
     const selectInput = document.createElement('input');
-    selectInput.type = 'checkbox'; selectInput.checked = selectedSourceIds[activePanel].has(source.id); selectInput.setAttribute('aria-label', '选择' + source.name);
-    selectInput.addEventListener('change', () => { if (selectInput.checked) selectedSourceIds[activePanel].add(source.id); else selectedSourceIds[activePanel].delete(source.id); renderBatchActions(); });
+    selectInput.type = 'checkbox'; selectInput.checked = selectedSourceIds.has(source.id); selectInput.setAttribute('aria-label', '选择' + source.name);
+    selectInput.addEventListener('change', () => { if (selectInput.checked) selectedSourceIds.add(source.id); else selectedSourceIds.delete(source.id); renderBatchActions(); });
     select.append(selectInput);
     const meta = document.createElement('div');
     meta.className = 'source-meta';
@@ -1082,15 +1118,15 @@
     const row = document.createElement('div');
     const token = specialActionToken(action.id);
     row.className = 'source-row special-action-row'; row.dataset.actionId = action.id;
-    addDragBehavior(row, { panel: activePanel, id: token, type: 'action' });
+    addDragBehavior(row, { panel: MANAGER_PANEL, id: token, type: 'action' });
     const handle = document.createElement('span');
     handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = '拖动调整位置，或拖到分组标签中移动'; handle.setAttribute('aria-hidden', 'true');
     const logo = document.createElement('span');
-    logo.className = 'source-logo ' + action.className; logo.textContent = action.mark;
+    logo.className = 'source-logo ' + action.className; logo.textContent = String(action.mark || '');
     const meta = document.createElement('div');
     meta.className = 'source-meta';
     const name = document.createElement('strong'); name.textContent = action.name;
-    const detail = document.createElement('small'); detail.textContent = action.detail;
+    const detail = document.createElement('small'); detail.textContent = String(action.detail || '');
     meta.append(name, detail);
     const actions = document.createElement('div');
     actions.className = 'source-actions';
@@ -1103,12 +1139,12 @@
     const token = 'group:' + group.id;
     const row = document.createElement('div');
     row.className = 'source-row derived-group-row'; row.dataset.groupId = group.id;
-    addDragBehavior(row, { panel: activePanel, id: token, type: 'group' });
+    addDragBehavior(row, { panel: MANAGER_PANEL, id: token, type: 'group' });
     const handle = document.createElement('span');
     handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = '拖动排序'; handle.setAttribute('aria-hidden', 'true');
     const open = document.createElement('button');
     open.type = 'button'; open.className = 'source-logo source-logo-button group'; open.title = '打开' + group.name; open.textContent = '组';
-    open.addEventListener('click', () => { activeGroupId[activePanel] = group.id; renderManager(); });
+    open.addEventListener('click', () => { managerGroupId = group.id; renderManager(); });
     const meta = document.createElement('button');
     meta.type = 'button'; meta.className = 'source-meta group-meta-button'; meta.title = '打开' + group.name;
     const groupName = document.createElement('strong');
@@ -1116,7 +1152,7 @@
     const groupDetail = document.createElement('small');
     groupDetail.textContent = group.items.length + ' 个搜索源';
     meta.append(groupName, groupDetail);
-    meta.addEventListener('click', () => { activeGroupId[activePanel] = group.id; renderManager(); });
+    meta.addEventListener('click', () => { managerGroupId = group.id; renderManager(); });
     const actions = document.createElement('div');
     actions.className = 'source-actions';
     actions.append(iconButton('edit', '重命名分组', () => renameGroup(group)), iconButton('remove', '删除分组', () => removeGroup(group.id)));
@@ -1138,14 +1174,14 @@
     groupList.replaceChildren();
     config().groups.forEach((group) => {
       const tab = document.createElement('button');
-      tab.type = 'button'; tab.className = 'group-tab' + (group.id === activeGroupId[activePanel] ? ' active' : '');
-      tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(group.id === activeGroupId[activePanel])); tab.textContent = group.name;
+      tab.type = 'button'; tab.className = 'group-tab' + (group.id === managerGroupId ? ' active' : '');
+      tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(group.id === managerGroupId)); tab.textContent = group.name;
       tab.draggable = group.id !== 'default';
       tab.title = group.id === 'default' ? '默认组，可拖入搜索源或特殊功能按钮' : '打开' + group.name + '，可将搜索源或特殊功能按钮拖到此处，也可拖动标签调整分组顺序';
-      tab.addEventListener('click', () => { activeGroupId[activePanel] = group.id; resetForm(); renderManager(); });
+      tab.addEventListener('click', () => { managerGroupId = group.id; resetForm(); renderManager(); });
       tab.addEventListener('dragstart', (event) => {
         if (group.id === 'default') return;
-        draggedItem = { panel: activePanel, id: group.id, type: 'group-tab' };
+        draggedItem = { panel: MANAGER_PANEL, id: group.id, type: 'group-tab' };
         tab.classList.add('dragging');
         event.dataTransfer.effectAllowed = 'move';
         event.dataTransfer.setData('text/plain', 'group:' + group.id);
@@ -1155,7 +1191,7 @@
         document.querySelectorAll('.group-tab.drag-before,.group-tab.drag-after,.group-tab.dragging').forEach((element) => element.classList.remove('drag-before', 'drag-after', 'dragging'));
       });
       tab.addEventListener('dragover', (event) => {
-        if (!draggedItem || draggedItem.panel !== activePanel) return;
+        if (!draggedItem || draggedItem.panel !== MANAGER_PANEL) return;
         if (draggedItem.type === 'group-tab') {
           if (group.id === 'default' || draggedItem.id === group.id) return;
           event.preventDefault();
@@ -1168,7 +1204,7 @@
       });
       tab.addEventListener('dragleave', () => tab.classList.remove('drop-target', 'drag-before', 'drag-after'));
       tab.addEventListener('drop', (event) => {
-        if (!draggedItem || draggedItem.panel !== activePanel) return;
+        if (!draggedItem || draggedItem.panel !== MANAGER_PANEL) return;
         event.preventDefault();
         const after = event.clientX > tab.getBoundingClientRect().left + tab.offsetWidth / 2;
         const item = draggedItem;
@@ -1213,11 +1249,11 @@
       const row = document.createElement('div');
       row.className = 'special-action-config';
       const logo = document.createElement('span');
-      logo.className = 'source-logo ' + action.className; logo.textContent = action.mark;
+      logo.className = 'source-logo ' + action.className; logo.textContent = String(action.mark || '');
       const meta = document.createElement('div');
       meta.className = 'special-action-meta';
       const name = document.createElement('strong'); name.textContent = action.name;
-      const detail = document.createElement('small'); detail.textContent = action.detail;
+      const detail = document.createElement('small'); detail.textContent = String(action.detail || '');
       meta.append(name, detail);
       const select = document.createElement('select');
       select.setAttribute('aria-label', action.name + '按钮所在分组');
@@ -1238,7 +1274,7 @@
     const token = specialActionToken(actionId);
     config().groups.forEach((group) => { group.items = group.items.filter((item) => item !== token); });
     if (groupId) groupById(groupId)?.items.push(token);
-    saveGeneral();
+    saveGeneral('sources');
     renderManager();
   }
 
@@ -1247,11 +1283,6 @@
   }
 
   function renderManager() {
-    const isPinned = activePanel === 'pinned';
-    managerTitle.textContent = '搜索源分组';
-    managerHelp.textContent = isPinned
-      ? '与常用设置共用同一份搜索源和分组配置，调整会同步到两个搜索列表。'
-      : '拖动默认组中的搜索源、特殊功能按钮或自定义组，调整两个搜索列表中的顺序。';
     renderGroups(); renderSources();
     renderSpecialActions();
     renderPinnedSiteOptions();
@@ -1261,7 +1292,7 @@
 
   function renderBatchActions() {
     if (!batchActions || !settings) return;
-    const selected = selectedSourceIds[activePanel];
+    const selected = selectedSourceIds;
     const valid = new Set(config().sources.map((source) => source.id));
     Array.from(selected).forEach((id) => { if (!valid.has(id)) selected.delete(id); });
     batchActions.hidden = selected.size === 0;
@@ -1309,7 +1340,7 @@
     if (!target || !validIds.length) return;
     config().groups.forEach((group) => { group.items = group.items.filter((item) => !validIds.includes(item)); });
     validIds.forEach((id) => target.items.push(id));
-    validIds.forEach((id) => selectedSourceIds[activePanel].delete(id));
+    validIds.forEach((id) => selectedSourceIds.delete(id));
     saveCurrent(); renderManager();
   }
 
@@ -1323,7 +1354,7 @@
     const id = 'group-' + Date.now();
     config().groups.push({ id, name: name.trim(), items: [], visible: true });
     groupById('default').items.push('group:' + id);
-    activeGroupId[activePanel] = id; saveCurrent(); renderManager();
+    managerGroupId = id; saveCurrent(); renderManager();
   }
   function renameGroup(group) {
     const name = window.prompt('分组名称', group.name);
@@ -1338,18 +1369,18 @@
     if (tokenIndex >= 0) defaultGroup.items.splice(tokenIndex, 1, ...group.items);
     else defaultGroup.items.push(...group.items);
     settings.general.groups = config().groups.filter((item) => item.id !== groupId);
-    activeGroupId[activePanel] = 'default'; saveCurrent(); renderManager();
+    managerGroupId = 'default'; saveCurrent(); renderManager();
   }
   function removeSource(id) {
     settings.general.sources = config().sources.filter((source) => source.id !== id);
     config().groups.forEach((group) => { group.items = group.items.filter((item) => item !== id); });
     iconNodeCache.delete(id);
     if (editing?.id === id && editing.panel === activePanel) resetForm();
-    selectedSourceIds[activePanel].delete(id);
+    selectedSourceIds.delete(id);
     saveCurrent(); renderManager();
   }
   function startEdit(source) {
-    editing = { panel: activePanel, id: source.id };
+    editing = { panel: MANAGER_PANEL, id: source.id };
     nameInput.value = source.name; markInput.value = source.mark; urlInput.value = source.url;
     formTitle.textContent = '编辑搜索源'; submitLabel.textContent = '保存修改'; cancelEdit.hidden = false; nameInput.focus();
   }
@@ -1426,10 +1457,9 @@
       const selected = panel.dataset.panelContent === activePanel;
       panel.classList.toggle('active', selected); panel.hidden = !selected;
     });
-    sourceManager.hidden = !['general', 'pinned'].includes(activePanel);
     if (activePanel === 'history') renderHistory();
     else if (activePanel === 'notes') renderNotes();
-    else renderManager();
+    else if (activePanel === 'sources' || activePanel === 'pinned') renderManager();
   }));
   form.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -1440,7 +1470,7 @@
       const parsed = new URL(url.replace(/\{query\}/gi, 'quickfind'));
       if (!/^https?:$/.test(parsed.protocol)) throw new Error();
     } catch { errorEl.textContent = '请输入有效的 http 或 https 搜索 URL。'; return; }
-    const source = editing?.panel === activePanel ? sourceById(editing.id) : null;
+    const source = editing?.panel === MANAGER_PANEL ? sourceById(editing.id) : null;
     if (source) Object.assign(source, { name, mark, url, detail: url });
     else {
       const id = 'custom-' + Date.now();
@@ -1489,13 +1519,13 @@
   pinnedSiteDialog?.addEventListener('cancel', resetPinnedSiteForm);
   cancelPinnedSiteEdit?.addEventListener('click', resetPinnedSiteForm);
   batchDelete?.addEventListener('click', () => {
-    const selected = selectedSourceIds[activePanel];
+    const selected = selectedSourceIds;
     if (!selected.size) return;
     const ids = new Set(selected);
     settings.general.sources = config().sources.filter((source) => !ids.has(source.id));
     config().groups.forEach((group) => { group.items = group.items.filter((item) => !ids.has(item)); });
     selected.clear();
-    if (editing && editing.panel === activePanel && ids.has(editing.id)) resetForm();
+    if (editing && editing.panel === MANAGER_PANEL && ids.has(editing.id)) resetForm();
     saveCurrent(); renderManager();
   });
   selectAllHistory?.addEventListener('click', () => {
@@ -1508,7 +1538,7 @@
   });
   batchGroup?.addEventListener('change', () => {
     if (!batchGroup.value) return;
-    moveSourceToGroup(Array.from(selectedSourceIds[activePanel]), batchGroup.value);
+    moveSourceToGroup(Array.from(selectedSourceIds), batchGroup.value);
     batchGroup.value = '';
   });
   deleteSelectedHistory?.addEventListener('click', () => {
@@ -1529,7 +1559,7 @@
   addGroupButton.addEventListener('click', addGroup);
   defaultGroupCountInput.addEventListener('change', () => {
     settings.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(defaultGroupCountInput.value) || 4));
-    defaultGroupCountInput.value = settings.defaultGroupCount; saveGeneral();
+    defaultGroupCountInput.value = settings.defaultGroupCount; saveGeneral('selection');
   });
   pinnedDefaultGroupCountInput.addEventListener('change', () => {
     settings.pinned.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(pinnedDefaultGroupCountInput.value) || 4));
@@ -1545,16 +1575,20 @@
   });
   selectionTriggerDelayInput?.addEventListener('change', () => {
     settings.selectionTriggerDelay = Math.max(0, Math.min(2000, Number(selectionTriggerDelayInput.value) || 0));
-    selectionTriggerDelayInput.value = settings.selectionTriggerDelay; saveGeneral();
+    selectionTriggerDelayInput.value = settings.selectionTriggerDelay; saveGeneral('selection');
   });
   triggerInputs.forEach((input) => input.addEventListener('change', () => {
     if (!input.checked) return;
-    settings.triggerMode = input.value; saveGeneral();
+    settings.triggerMode = input.value; saveGeneral('selection');
   }));
   editableTriggerInputs.forEach((input) => input.addEventListener('change', () => {
     if (!input.checked) return;
-    settings.editableTriggerMode = input.value; saveGeneral();
+    settings.editableTriggerMode = input.value; saveGeneral('selection');
   }));
+  llmDockVisibleInput?.addEventListener('change', () => {
+    settings.llmDockVisible = llmDockVisibleInput.checked;
+    saveGeneral('llm');
+  });
   function saveLlmConfig() {
     if (!settings) return;
     settings.llm = {
@@ -1566,7 +1600,7 @@
     };
     if (!settings.llm.endpoint) settings.llm.endpoint = DEFAULTS.llm.endpoint;
     if (!settings.llm.model) settings.llm.model = DEFAULTS.llm.model;
-    saveGeneral();
+    saveGeneral('llm');
   }
   [llmEnabledInput, llmEndpointInput, llmModelInput, llmApiKeyInput, llmSystemPromptInput].filter(Boolean).forEach((input) => {
     input.addEventListener('change', saveLlmConfig);
@@ -1613,13 +1647,14 @@
   });
 
   chrome.storage.sync.get(null, (stored) => {
-    settings = normalizeSettings({ ...DEFAULTS, ...stored });
+    settings = normalizeSettings({ ...DEFAULTS, ...defaultConfigSeed(stored), ...stored });
     defaultGroupCountInput.value = settings.defaultGroupCount;
     pinnedDefaultGroupCountInput.value = settings.pinned.defaultGroupCount;
     if (pinnedCollapseDelayInput) pinnedCollapseDelayInput.value = settings.pinned.collapseDelay;
     if (pinnedAllSitesInput) pinnedAllSitesInput.checked = settings.pinned.allSites === true;
     if (selectionTriggerDelayInput) selectionTriggerDelayInput.value = settings.selectionTriggerDelay;
     if (llmEnabledInput) llmEnabledInput.checked = settings.llm.enabled !== false;
+    if (llmDockVisibleInput) llmDockVisibleInput.checked = settings.llmDockVisible !== false;
     if (llmEndpointInput) llmEndpointInput.value = settings.llm.endpoint;
     if (llmModelInput) llmModelInput.value = settings.llm.model;
     if (llmApiKeyInput) llmApiKeyInput.value = settings.llm.apiKey;
@@ -1632,6 +1667,7 @@
     if (stored.sourceConfigVersion !== CONFIG_VERSION || !stored.pinnedSearch || Number(stored.pinnedSearch?.siteConfigVersion) !== PINNED_SITE_CONFIG_VERSION || hasLegacy || hasDeprecatedPinnedContent) {
       chrome.storage.sync.set({
         enabled: settings.enabled, triggerMode: settings.triggerMode, editableTriggerMode: settings.editableTriggerMode, defaultGroupCount: settings.defaultGroupCount, selectionTriggerDelay: settings.selectionTriggerDelay, llm: settings.llm,
+        llmDockVisible: settings.llmDockVisible,
         sources: settings.general.sources, groups: settings.general.groups, pinnedSearch: settings.pinned, sourceConfigVersion: CONFIG_VERSION
       }, () => { if (hasLegacy) chrome.storage.sync.remove(LEGACY_KEYS); });
     }

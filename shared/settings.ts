@@ -34,9 +34,12 @@ export interface SearchSource {
   /** 该条目代表一个分组入口，点击后切换到 groupId 指定的分组。 */
   isGroup?: boolean;
   groupId?: string;
-  /** 特殊动作条目（当前只有「复制」）。 */
+  /** 该条目是一个特殊功能按钮，点击后做 action 指定的事，不走搜索。 */
   isSpecial?: boolean;
+  /** 特殊功能按钮的动作标识，取值见 shared/search-actions.ts。 */
   action?: string;
+  /** 特殊功能按钮的悬浮提示，动作各不相同，不能用「XX搜索」拼。 */
+  specialTitle?: string;
 }
 
 /** 分组。items 是有序的条目引用：源 id、`group:<id>` 或 `action:<id>`。 */
@@ -89,6 +92,8 @@ export interface StoredSettings {
   sourceConfigVersion?: number;
   /** 默认分组中条目的排列顺序。 */
   engineOrder?: unknown[];
+  /** 页面右侧「随心问」面板是否显示，缺省为显示。 */
+  llmDockVisible?: boolean;
   sources?: SearchSource[];
   groups?: RawGroup[];
   searchHistory?: HistoryItem[];

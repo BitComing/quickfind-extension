@@ -1,44 +1,13 @@
 // @ts-nocheck
 // 由早期手写 JavaScript 迁移而来，尚未补齐类型标注；补全后删除本行。见 README「迁移状态」。
+import { SPECIAL_ACTIONS } from '@/shared/search-actions';
+
 export default defineContentScript({
   matches: ['<all_urls>'],
   runAt: 'document_idle',
   main() {
   'use strict';
 
-  const DEFAULT_SETTINGS = {
-    enabled: true,
-    engines: {
-      google: true,
-      baidu: true,
-      'google-scholar': true,
-      duckduckgo: true,
-      so: true,
-      sogou: true,
-      bing: true,
-      yandex: true,
-      'google-ai': true,
-      bilibili: true,
-      xiaohongshu: true,
-      x: true,
-      youtube: true,
-      zhihu: true,
-      douyin: true,
-      doubao: true,
-      deepseek: true
-    },
-    iconOnly: {},
-    customEngines: [],
-    engineOrder: ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'sogou', 'bing', 'yandex', 'google-ai', 'bilibili', 'xiaohongshu', 'x', 'youtube', 'zhihu', 'douyin', 'doubao', 'deepseek'],
-    sources: [],
-    groups: [],
-    searchHistory: [],
-    llm: { enabled: true, endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini', apiKey: '', systemPrompt: '' },
-    triggerMode: 'click',
-    editableTriggerMode: 'click',
-    defaultGroupCount: 4,
-    selectionTriggerDelay: 200
-  };
   const MAX_DEFAULT_GROUP_COUNT = 20;
 
   const PINNED_SITES = [
@@ -180,9 +149,64 @@ export default defineContentScript({
       buildUrl: (query) => `https://chat.deepseek.com/?q=${encodeURIComponent(query)}`
     }
   ];
-  const SPECIAL_ACTIONS = [
-    { id: 'copy', name: '复制', className: 'special-copy', mark: '复', action: 'copy', isSpecial: true }
+
+  // ── 默认配置 ──────────────────────────────────────────────────────────
+  // 默认值即作者当前在浏览器里使用的一套设置（搜索历史这类个人数据除外）。
+  // 两侧都要写：选项页负责把它落库，这里负责「还没打开过选项页」时的取值。
+  // 改默认值请连同 options/main.ts 的 DEFAULTS 一起改。
+
+  // 只在列表里显示图标的源，名字交给悬浮提示。
+  const DEFAULT_ICON_ONLY_IDS = ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'bing', 'yandex', 'zhihu'];
+  const DEFAULT_SOURCES = ENGINES.map((engine) => ({ ...engine, enabled: true, iconOnly: DEFAULT_ICON_ONLY_IDS.includes(engine.id) }));
+  // 默认组先直排 4 个常用源，其余按主题收进 4 个分组。
+  const DEFAULT_GROUPS = [
+    { id: 'default', name: '默认组', items: ['google', 'bing', 'yandex', 'zhihu', 'group:group-other', 'group:group-video', 'group:group-social', 'group:group-ai'], visible: true },
+    { id: 'group-other', name: '其他', items: ['so', 'sogou', 'duckduckgo', 'baidu', 'google-scholar'], visible: true },
+    { id: 'group-video', name: '视频', items: ['bilibili', 'youtube', 'douyin'], visible: true },
+    { id: 'group-social', name: '社媒', items: ['xiaohongshu', 'x'], visible: true },
+    { id: 'group-ai', name: 'ai', items: ['google-ai', 'doubao', 'deepseek'], visible: true }
   ];
+  // 常驻搜索栏：默认在所有站点出现，展开后 1 秒自动收起。
+  const DEFAULT_PINNED_SEARCH = {
+    sites: DEFAULT_PINNED_SITE_IDS, customSites: [], defaultGroupCount: 4,
+    collapseDelay: 1000, openInNewTab: false, allSites: true, siteConfigVersion: PINNED_SITE_CONFIG_VERSION
+  };
+
+  const DEFAULT_SETTINGS = {
+    enabled: true,
+    engines: {
+      google: true,
+      baidu: true,
+      'google-scholar': true,
+      duckduckgo: true,
+      so: true,
+      sogou: true,
+      bing: true,
+      yandex: true,
+      'google-ai': true,
+      bilibili: true,
+      xiaohongshu: true,
+      x: true,
+      youtube: true,
+      zhihu: true,
+      douyin: true,
+      doubao: true,
+      deepseek: true
+    },
+    iconOnly: {},
+    customEngines: [],
+    engineOrder: ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'sogou', 'bing', 'yandex', 'google-ai', 'bilibili', 'xiaohongshu', 'x', 'youtube', 'zhihu', 'douyin', 'doubao', 'deepseek'],
+    sources: DEFAULT_SOURCES,
+    groups: DEFAULT_GROUPS,
+    pinnedSearch: DEFAULT_PINNED_SEARCH,
+    searchHistory: [],
+    llm: { enabled: false, endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini', apiKey: '', systemPrompt: '' },
+    triggerMode: 'click',
+    editableTriggerMode: 'none',
+    defaultGroupCount: 4,
+    selectionTriggerDelay: 200,
+    llmDockVisible: false
+  };
 
   let settings = cloneSettings(DEFAULT_SETTINGS);
   let selectedText = '';
@@ -208,6 +232,8 @@ export default defineContentScript({
   let pinnedMountTimer = null;
   let pinnedMountedSiteId = null;
   let pinnedMountedPageKey = '';
+  // 由页面选区自动填入常驻搜索框的值，用于把它和「上一次搜索」的兜底值区分开。
+  let pinnedSelectionQuery = '';
   let contextAnchor = null;
   let selectionPointer = null;
   let selectionPointerPending = false;
@@ -323,10 +349,12 @@ export default defineContentScript({
       .doubao .engine-mark { color:#fff; background:#4f7cff; }
       .deepseek .engine-mark { color:#fff; background:#4d6bfe; font-size:9px; }
       .special-copy .engine-mark { color:#fff; background:#6c8178; }
+      .special-notes .engine-mark { color:#fff; background:#3e8f6c; }
       .custom .engine-mark { color:#587269; background:#e6efe9; }
       .more-engine .engine-mark { color:#587269; background:#e6efe9; font-size:13px; }
       .group .engine-mark { color:#315f4d; background:#dfeee5; font-size:12px; }
       .llm-dock { position:fixed; inset:0; z-index:2147483646; width:100vw; height:100vh; pointer-events:none; font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#203b31; }
+      .llm-dock[hidden] { display:none; }
       .llm-rail { position:fixed; top:50%; right:0; display:flex; align-items:center; justify-content:center; width:14px; height:20vh; min-height:96px; max-height:176px; padding:0; border:0; border-left:1px solid #e4eee8; border-radius:9px 0 0 9px; transform:translateY(-50%); color:#6a8978; background:#fff; box-shadow:-4px 0 14px rgba(24,61,44,.08); cursor:pointer; pointer-events:auto; transition:width .22s ease, color .18s ease, box-shadow .22s ease; }
       .llm-rail::before { content:""; width:3px; height:44px; border-radius:99px; background:currentColor; opacity:.55; transition:height .18s ease,opacity .18s ease; }
       .llm-rail:hover,.llm-dock.is-open .llm-rail { width:16px; color:#2f795b; box-shadow:-6px 0 18px rgba(24,61,44,.13); }
@@ -573,23 +601,24 @@ export default defineContentScript({
       iconOnly: { ...(source.iconOnly || {}) },
       customEngines: Array.isArray(source.customEngines) ? source.customEngines : [],
       engineOrder: Array.isArray(source.engineOrder) ? source.engineOrder : DEFAULT_SETTINGS.engineOrder,
-      sources: Array.isArray(source.sources) ? source.sources : [],
-      groups: Array.isArray(source.groups) ? source.groups : [],
+      sources: Array.isArray(source.sources) ? source.sources : DEFAULT_SETTINGS.sources,
+      groups: Array.isArray(source.groups) ? source.groups : DEFAULT_SETTINGS.groups,
       sourceConfigVersion: Number(source.sourceConfigVersion) || 0,
-      pinnedSearch: source.pinnedSearch && typeof source.pinnedSearch === 'object' ? source.pinnedSearch : {},
+      pinnedSearch: source.pinnedSearch && typeof source.pinnedSearch === 'object' ? source.pinnedSearch : DEFAULT_SETTINGS.pinnedSearch,
       searchHistory: Array.isArray(source.searchHistory) ? source.searchHistory : [],
       llm: normalizeLlmConfig(source.llm),
       triggerMode: source.triggerMode === 'hover' ? 'hover' : 'click',
-      editableTriggerMode: ['click', 'hover', 'none'].includes(source.editableTriggerMode) ? source.editableTriggerMode : 'click',
+      editableTriggerMode: ['click', 'hover', 'none'].includes(source.editableTriggerMode) ? source.editableTriggerMode : DEFAULT_SETTINGS.editableTriggerMode,
       defaultGroupCount: Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(source.defaultGroupCount ?? source.defaultVisibleCount ?? 4) || 4))),
-      selectionTriggerDelay: Math.max(0, Math.min(2000, Math.round(Number(source.selectionTriggerDelay ?? 200) || 0)))
+      selectionTriggerDelay: Math.max(0, Math.min(2000, Math.round(Number(source.selectionTriggerDelay ?? 200) || 0))),
+      llmDockVisible: typeof source.llmDockVisible === 'boolean' ? source.llmDockVisible : DEFAULT_SETTINGS.llmDockVisible
     };
   }
 
   function normalizeLlmConfig(value) {
     const source = value && typeof value === 'object' ? value : {};
     return {
-      enabled: source.enabled !== false,
+      enabled: typeof source.enabled === 'boolean' ? source.enabled : DEFAULT_SETTINGS.llm.enabled,
       endpoint: String(source.endpoint || source.baseUrl || DEFAULT_SETTINGS.llm.endpoint).trim(),
       model: String(source.model || DEFAULT_SETTINGS.llm.model).trim(),
       apiKey: String(source.apiKey || source.key || ''),
@@ -728,8 +757,17 @@ export default defineContentScript({
     input.style.overflowY = (input.scrollHeight || 0) > maxHeight ? 'auto' : 'hidden';
   }
 
+  /** 右侧「随心问」面板的显示开关（选项页可配置）。隐藏时顺手收起，避免留下半开状态。 */
+  function setLlmDockVisible(visible) {
+    const next = visible !== false;
+    settings.llmDockVisible = next;
+    if (llmDock) llmDock.hidden = !next;
+    if (!next) setLlmDockOpen(false);
+  }
+
   function setLlmDockOpen(open) {
     if (!llmDock) return;
+    if (open && settings.llmDockVisible === false) return;
     if (llmCloseTimer) window.clearTimeout(llmCloseTimer);
     llmCloseTimer = null;
     const nextOpen = Boolean(open);
@@ -932,6 +970,8 @@ export default defineContentScript({
   const NOTES_HISTORY_LIMIT = 100;
   let notesState = createEmptyNotes();
   let notesLoaded = false;
+  /** 首次读盘的进度：null 表示还没开始读，写完才 resolve。往笔记里写东西前先等它。 */
+  let notesLoadPromise: Promise<void> | null = null;
   let notesSaveTimer = null;
   let notesSearchTimer = null;
   let notesActiveId = null;
@@ -1002,7 +1042,7 @@ export default defineContentScript({
   function cloneNotesState(state = notesState) { return JSON.parse(JSON.stringify(state)); }
   function notesStateSignature(state = notesState) { return JSON.stringify({ rootId: state.rootId, nodes: state.nodes }); }
 
-  function readNotesStorage() {
+  function readNotesStorage(): Promise<{ current: any; legacy: any }> {
     if (typeof chrome !== 'undefined' && chrome.storage?.local?.get) {
       return new Promise((resolve) => chrome.storage.local.get([NOTES_KEY, NOTES_LEGACY_KEY], (stored) => resolve({ current: stored?.[NOTES_KEY] || null, legacy: stored?.[NOTES_LEGACY_KEY] || null })));
     }
@@ -1052,10 +1092,10 @@ export default defineContentScript({
     return state;
   }
 
-  function loadOutlineNotes() {
-    if (notesLoaded) { renderNotes(); return; }
+  function loadOutlineNotes(): Promise<void> {
+    if (notesLoadPromise) { renderNotes(); return notesLoadPromise; }
     notesLoaded = true;
-    void readNotesStorage().then(({ current, legacy }) => {
+    notesLoadPromise = readNotesStorage().then(({ current, legacy }): void => {
       let state = current ? normalizeNotes(current) : null;
       let migrated = false;
       if (!state && Array.isArray(legacy) && legacy.length) {
@@ -1067,6 +1107,15 @@ export default defineContentScript({
       renderNotes();
       syncOutlineInsertButton();
     });
+    return notesLoadPromise;
+  }
+
+  /**
+   * 等首次读盘落地。侧栏停在「随心问」时笔记还没读过，此时直接写入会把还没读出来的
+   * 旧内容当成空笔记覆盖掉——凡是往笔记里写东西的入口都要先走这里。
+   */
+  function whenNotesReady(): Promise<void> {
+    return notesLoadPromise || loadOutlineNotes();
   }
 
   // 与设置页（及其他标签页侧栏）通过 chrome.storage.local 双向同步。
@@ -1422,33 +1471,57 @@ export default defineContentScript({
     outlineInsertSelection.title = hasText ? '把页面上选中的文字加入笔记' : '先在页面上选中一段文字';
   }
 
-  function insertSelectionIntoNotes() {
-    if (!notesLoaded) return;
-    const raw = String(selectedText || '').trim();
-    if (!raw) return;
-    const lines = raw.split(/\n+/).map((line) => line.trim()).filter(Boolean).slice(0, 60);
-    if (!lines.length) return;
-    const parent = noteById(notesZoomRootId) || noteById('root');
-    let anchor = notesActiveId && noteById(notesActiveId) ? notesActiveId : null;
+  /**
+   * 把一段文字按行写进大纲笔记，返回是否写入。
+   * atTop 为真时落在当前层级的第一行（特殊功能按钮「笔记」用），否则跟随插入点
+   * （侧栏「插入」按钮原来的行为）。调用前先等 whenNotesReady()。
+   */
+  function appendTextToOutlineNotes(raw: unknown, atTop: boolean): boolean {
+    if (!notesLoaded) return false;
+    const text = String(raw ?? '').trim();
+    if (!text) return false;
+    const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean).slice(0, 60);
+    if (!lines.length) return false;
+    const scopeRoot = noteById(notesZoomRootId) || noteById('root');
+    if (!scopeRoot) return false;
     const before = cloneNotesState();
     const now = Date.now();
-    let firstId = '';
-    lines.forEach((line) => {
-      const node = { id: noteId(), parentId: parent.id, children: [], text: line, collapsed: false, completed: false, createdAt: now, updatedAt: now };
-      notesState.nodes[node.id] = node;
-      if (anchor) {
-        const anchorNode = noteById(anchor);
-        const anchorParent = anchorNode ? noteById(anchorNode.parentId) || parent : parent;
-        node.parentId = anchorParent.id;
-        anchorParent.children.splice(anchorParent.children.indexOf(anchor) + 1, 0, node.id);
-      } else parent.children.push(node.id);
-      anchor = node.id;
-      if (!firstId) firstId = node.id;
-    });
-    notesActiveId = firstId;
+    const created = lines.map((line) => ({ id: noteId(), parentId: String(scopeRoot.id), children: [] as string[], text: line, collapsed: false, completed: false, createdAt: now, updatedAt: now }));
+    // notesState.nodes 的类型是按空状态推断出来的，按 id 写入需要一层显式视图。
+    const nodes: Record<string, (typeof created)[number]> = notesState.nodes;
+    created.forEach((node) => { nodes[node.id] = node; });
+    const ids = created.map((node) => node.id);
+    const anchor = atTop ? null : (notesActiveId && noteById(notesActiveId) ? notesActiveId : null);
+    const parent = anchor ? noteById(anchor.parentId) || scopeRoot : scopeRoot;
+    created.forEach((node) => { node.parentId = String(parent.id); });
+    if (anchor) parent.children.splice(parent.children.indexOf(anchor) + 1, 0, ...ids);
+    else if (atTop) parent.children.unshift(...ids);
+    else parent.children.push(...ids);
+    parent.collapsed = false;
+    notesActiveId = ids[0];
     pushNotesHistory(before);
     scheduleNotesSave();
-    renderNotes(firstId);
+    renderNotes(ids[0]);
+    return true;
+  }
+
+  function insertSelectionIntoNotes() {
+    void whenNotesReady().then(() => { appendTextToOutlineNotes(selectedText, false); });
+  }
+
+  /** 特殊功能按钮「笔记」：把内容存到笔记第一行，并把结果显示出来。返回值只表示已受理。 */
+  function saveTextToOutlineNotes(raw: unknown): boolean {
+    const text = String(raw ?? '').trim();
+    if (!text) return false;
+    void whenNotesReady().then(() => { if (appendTextToOutlineNotes(text, true)) showOutlineNotes(); });
+    return true;
+  }
+
+  /** 存完之后把结果摆到眼前：切到大纲页并展开侧栏；选项页把侧栏整个关掉时不打扰。 */
+  function showOutlineNotes(): void {
+    if (!llmDock || (llmDock as HTMLElement).hidden) return;
+    if (llmActiveTab !== 'outline') setLlmTab('outline');
+    setLlmDockOpen(true);
   }
 
   function setLlmTab(tab, options = {}) {
@@ -1557,6 +1630,7 @@ export default defineContentScript({
     if (!storageAvailable()) return;
     chrome.storage.sync.get(null, (stored) => {
       settings = cloneSettings(stored);
+      setLlmDockVisible(settings.llmDockVisible);
       trigger.classList.toggle('disabled', !settings.enabled);
       syncLlmConfigStatus();
       loadLlmConversations();
@@ -1586,13 +1660,14 @@ export default defineContentScript({
         settings.llm = normalizeLlmConfig(changes.llm.newValue);
         syncLlmConfigStatus();
       }
+      if (changes.llmDockVisible) setLlmDockVisible(changes.llmDockVisible.newValue !== false);
       if (changes.triggerMode) {
         settings.triggerMode = changes.triggerMode.newValue === 'hover' ? 'hover' : 'click';
         if (getSelectionTriggerMode() !== 'hover') cancelTriggerHoverOpen();
         else if (trigger.classList.contains('visible')) scheduleTriggerHoverOpen();
       }
       if (changes.editableTriggerMode) {
-        settings.editableTriggerMode = ['click', 'hover', 'none'].includes(changes.editableTriggerMode.newValue) ? changes.editableTriggerMode.newValue : 'click';
+        settings.editableTriggerMode = ['click', 'hover', 'none'].includes(changes.editableTriggerMode.newValue) ? changes.editableTriggerMode.newValue : DEFAULT_SETTINGS.editableTriggerMode;
         if (settings.editableTriggerMode === 'none' && selectedInput) hideAll();
         else if (getSelectionTriggerMode() !== 'hover') cancelTriggerHoverOpen();
         else if (trigger.classList.contains('visible')) scheduleTriggerHoverOpen();
@@ -1817,6 +1892,11 @@ export default defineContentScript({
     try { textarea.select(); return document.execCommand('copy'); }
     catch { return false; }
     finally { textarea.remove(); }
+  }
+
+  /** 特殊功能按钮的悬浮提示按动作给出，缺省回落到名字——只有「复制」时它才等于「XX搜索内容」。 */
+  function getSpecialActionTitle(entry: { specialTitle?: string; name?: string }): string {
+    return String(entry?.specialTitle || entry?.name || '');
   }
 
   function getSearchUrl(engine, query) {
@@ -2131,6 +2211,7 @@ export default defineContentScript({
         .mark{display:grid;place-items:center;width:17px;height:17px;overflow:hidden;border-radius:4px;color:#fff;background:#6c8b7b;font:700 10px/1 Arial,sans-serif}.mark img{width:100%;height:100%;object-fit:cover}
         .google .mark{background:#4285f4}.baidu .mark{background:#2932e1}.google-scholar .mark{background:#5f6368;font-size:9px}.duckduckgo .mark{background:#de5833}.so .mark{background:#19a15f;font-size:9px}.sogou .mark{background:#ff5a34}.bing .mark{background:#1185e0}.yandex .mark{background:#ef3b3b}.google-ai .mark{background:#6b5ce7}.bilibili .mark{background:#00aeec}.xiaohongshu .mark{background:#ef4d62}.x .mark{background:#111}.youtube .mark{background:#f21f26}.zhihu .mark{background:#1777e6}.douyin .mark{background:#161823}.doubao .mark{background:#4f7cff}.deepseek .mark{background:#4d6bfe}.group .mark{color:#315f4d;background:#dfeee5}
         .special-copy .mark{color:#fff;background:#6c8178}
+        .special-notes .mark{color:#fff;background:#3e8f6c}
         .name{max-width:94px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .collapse-button{display:flex;align-items:center;justify-content:center;width:100%;height:14px;margin-top:2px;padding:0;border:0;border-bottom:1px solid #e6eee9;color:#789087;background:transparent;cursor:pointer}
         .collapse-button:hover{color:#2f795b;background:#f4faf6}.collapse-button:focus-visible{outline:2px solid #3e8f6c;outline-offset:1px}
@@ -2251,15 +2332,28 @@ export default defineContentScript({
     return pinnedQueryComposing || Boolean(pinnedQuery && pinnedHost?.shadowRoot?.activeElement === pinnedQuery);
   }
 
+  // 历史记录里的最近一次搜索：拿不到页面搜索框和 URL 查询时，常驻栏用它兜底显示。
+  function getPinnedHistoryQuery() {
+    const history = Array.isArray(settings?.searchHistory) ? settings.searchHistory : [];
+    return String(history.map((item) => typeof item === 'string' ? item : item?.query).find(Boolean) || '');
+  }
+
+  // site 的形状见 getPinnedSite()，本文件补齐类型标注时统一收敛到 shared/settings.ts。
+  function pinnedSiteInputFor(site: any) {
+    return site?.selectorConfigured === false ? null : site ? findVisibleInput(site.selector) : null;
+  }
+
   function syncPinnedQuery(site) {
     const pinnedQuery = getPinnedQueryInput();
     if (!pinnedQuery || pinnedHost?.shadowRoot?.activeElement === pinnedQuery) return;
-    const siteInput = site?.selectorConfigured === false ? null : site ? findVisibleInput(site.selector) : null;
-    const history = Array.isArray(settings?.searchHistory) ? settings.searchHistory : [];
-    const lastSearch = history.map((item) => typeof item === 'string' ? item : item?.query).find(Boolean) || '';
+    const siteInput = pinnedSiteInputFor(site);
     const urlQuery = getPinnedQueryFromUrl(site);
-    const fallback = urlQuery || lastSearch;
-    pinnedQuery.value = siteInput?.value || fallback || '';
+    const realQuery = String(siteInput?.value || '').trim() || urlQuery;
+    // 选区自动填入的值要留住：页面本身没有查询内容时，重渲染（展开更多、路由变化）
+    // 会把它当成空值，用「上一次搜索」覆盖回去。
+    if (!realQuery && pinnedSelectionQuery && pinnedQuery.value.trim() === pinnedSelectionQuery) return;
+    if (!realQuery) pinnedSelectionQuery = '';
+    pinnedQuery.value = siteInput?.value || urlQuery || getPinnedHistoryQuery() || '';
   }
 
   function getPinnedQueryFromUrl(site) {
@@ -2294,12 +2388,32 @@ export default defineContentScript({
     return site?.selectorConfigured === false ? '' : findVisibleInput(site.selector)?.value.trim() || '';
   }
 
+  // 常驻搜索框本来没有内容时，把页面上新选中的文字填进去：选中的文字本身就是想搜的内容。
+  // 只认「空」和「上一次搜索」的兜底填充这两种情况，页面搜索框里的值、URL 里的查询参数
+  // 以及用户自己的输入都不覆盖；写入的值交给 syncPinnedQuery 保护，直到页面出现真实查询。
+  function applySelectionToPinnedQuery() {
+    const pinnedQuery = getPinnedQueryInput();
+    if (!pinnedQuery || !settings?.enabled) return;
+    if (isEditingPinnedQuery()) return;
+    const selection = window.getSelection();
+    const text = selection && !selection.isCollapsed ? selection.toString().replace(/\s+/g, ' ').trim() : '';
+    if (!text || text.length > 5000) return;
+    const site = getPinnedSite();
+    if (!site) return;
+    if (String(pinnedSiteInputFor(site)?.value || '').trim() || getPinnedQueryFromUrl(site)) return;
+    const current = pinnedQuery.value.trim();
+    if (current && current !== getPinnedHistoryQuery()) return;
+    if (current === text) return;
+    pinnedSelectionQuery = text;
+    pinnedQuery.value = text;
+  }
+
   function createPinnedButton(entry, site, allowIconOnly = true) {
     const button = document.createElement('button');
     button.type = 'button';
     const iconOnly = allowIconOnly && !entry.isGroup && (entry.iconOnly === true || getPinnedConfig().iconOnly?.[entry.id] === true);
     button.className = 'entry ' + entry.className + (iconOnly ? ' icon-only' : '');
-    button.title = entry.isGroup ? '展开' + entry.name : entry.isSpecial ? `${entry.name}搜索内容` : '使用' + entry.name + '搜索';
+    button.title = entry.isGroup ? '展开' + entry.name : entry.isSpecial ? getSpecialActionTitle(entry) : '使用' + entry.name + '搜索';
     if (entry.isGroup) {
       button.dataset.groupId = entry.groupId;
       button.setAttribute('aria-expanded', String(pinnedExpandedGroupId === entry.groupId));
@@ -2328,6 +2442,7 @@ export default defineContentScript({
       if (!query) return getPinnedQueryInput()?.focus() || input?.focus();
       if (entry.isSpecial) {
         if (entry.action === 'copy') void copyTextToClipboard(query);
+        else if (entry.action === 'notes') saveTextToOutlineNotes(query);
         return;
       }
       rememberSearch(query);
@@ -2398,7 +2513,7 @@ export default defineContentScript({
     clearPinnedCollapseTimer({ resetDeadline: false });
     if (!pinnedHost || pinnedBarCollapsed || pinnedCollapsePaused || isEditingPinnedQuery()) return;
     const configuredDelay = Number(getPinnedConfig().collapseDelay);
-    const delay = Number.isFinite(configuredDelay) ? Math.max(0, Math.min(60000, configuredDelay)) : 2000;
+    const delay = Number.isFinite(configuredDelay) ? Math.max(0, Math.min(60000, configuredDelay)) : DEFAULT_PINNED_SEARCH.collapseDelay;
     if (restart || !pinnedCollapseDeadline) pinnedCollapseDeadline = Date.now() + delay;
     const remaining = Math.max(0, pinnedCollapseDeadline - Date.now());
     pinnedCollapseTimer = window.setTimeout(() => {
@@ -2432,7 +2547,6 @@ export default defineContentScript({
   function setPinnedBarCollapsed(collapsed, site) {
     clearPinnedCollapseTimer();
     if (!pinnedHost) return;
-    const wasCollapsed = pinnedBarCollapsed;
     pinnedBarCollapsed = collapsed;
     if (collapsed) {
       pinnedExpandedGroupId = null;
@@ -2443,11 +2557,10 @@ export default defineContentScript({
     const revealHandle = pinnedHost.shadowRoot?.querySelector('.reveal-handle');
     if (revealHandle) revealHandle.setAttribute('aria-expanded', String(!collapsed));
     positionPinnedBar(site);
-    if (wasCollapsed && !collapsed) {
-      const pinnedQuery = pinnedHost.shadowRoot?.querySelector('.pinned-query');
-      pinnedQuery?.focus({ preventScroll: true });
-      pinnedQuery?.select();
-    }
+    // 展开常驻栏不碰焦点：划过或点开常驻栏多半只是想把列表露出来，光标落进输入框会把焦点
+    // 从页面原本正在操作的元素上拽走，还会让栏被判定成「正在编辑」而不再自动收起。
+    // 框里已有内容（选区自动填入、上一次搜索的兜底值）也不聚焦——要直接回车搜索，
+    // 点一下框就行，不需要替用户决定。
   }
 
   function positionPinnedBar(site) {
@@ -2489,6 +2602,7 @@ export default defineContentScript({
         pinnedCollapsePaused = false;
         pinnedMoreExpanded = false;
         pinnedExpandedGroupId = null;
+        pinnedSelectionQuery = '';
       }
     }
     const host = ensurePinnedHost();
@@ -2532,7 +2646,7 @@ export default defineContentScript({
       const iconOnly = allowIconOnly && (engine.iconOnly === true || settings.iconOnly[engine.id] === true);
       button.className = `engine ${engine.className}${iconOnly ? ' icon-only' : ''}`;
       button.dataset.engine = engine.id;
-      button.title = engine.isSpecial ? `${engine.name}搜索内容` : `使用${engine.name}搜索`;
+      button.title = engine.isSpecial ? getSpecialActionTitle(engine) : `使用${engine.name}搜索`;
       const name = document.createElement('span');
       name.className = 'engine-name';
       name.textContent = engine.name;
@@ -2560,6 +2674,7 @@ export default defineContentScript({
         if (!selectedText) return;
         if (engine.isSpecial) {
           if (engine.action === 'copy') void copyTextToClipboard(selectedText);
+          else if (engine.action === 'notes') saveTextToOutlineNotes(selectedText);
           hideAll();
           return;
         }
@@ -2650,13 +2765,21 @@ export default defineContentScript({
     panel.classList.add('visible');
     requestAnimationFrame(() => {
       queryInput.focus({ preventScroll: true });
-      queryInput.select();
+      placeCaretAtEnd(queryInput);
       restoreSelectedRange();
     });
   }
 
   function getSelectionTriggerMode() {
     return selectedInput ? settings.editableTriggerMode : settings.triggerMode;
+  }
+
+  // 面板打开时只把焦点交给搜索框，不再整段选中：整段选中会让下一次输入直接覆盖原有内容，
+  // 而用户往往只是想接着改。把光标落到末尾，与浏览器聚焦时的默认落点保持一致。
+  function placeCaretAtEnd(input) {
+    if (!input || typeof input.setSelectionRange !== 'function') return;
+    const end = String(input.value || '').length;
+    try { input.setSelectionRange(end, end); } catch { /* input may be detached */ }
   }
 
   function restoreSelectedRange() {
@@ -2706,7 +2829,7 @@ export default defineContentScript({
     resizeQueryInput();
     renderEngines();
     panel.classList.add('visible');
-    requestAnimationFrame(() => { positionPanel(); queryInput.focus({ preventScroll: true }); queryInput.select(); restoreSelectedRange(); });
+    requestAnimationFrame(() => { positionPanel(); queryInput.focus({ preventScroll: true }); placeCaretAtEnd(queryInput); restoreSelectedRange(); });
     contextMenuState = null;
   }
 
@@ -2760,6 +2883,11 @@ export default defineContentScript({
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message?.type === 'get-selection') {
         sendResponse({ text: getInputSelection()?.text || window.getSelection()?.toString().replace(/\s+/g, ' ').trim() || '' });
+        return;
+      }
+      // 弹窗里的「笔记」按钮把内容交给页面侧栏写入：笔记的最新状态在它手上。
+      if (message?.type === 'save-note') {
+        sendResponse({ ok: saveTextToOutlineNotes(message.text) });
         return;
       }
       if (message?.type === 'open-context-search') openContextSearch(message);
@@ -2818,6 +2946,7 @@ export default defineContentScript({
     if (eventInsideOverlay(event)) return;
     selectionPointer = { x: event.clientX, y: event.clientY };
     selectionPointerPending = true;
+    applySelectionToPinnedQuery();
     scheduleSelectionDisplay();
   }, true);
   document.addEventListener('touchend', (event) => {
@@ -2825,6 +2954,7 @@ export default defineContentScript({
     const point = event.changedTouches?.[0];
     selectionPointer = point ? { x: point.clientX, y: point.clientY } : null;
     selectionPointerPending = Boolean(point);
+    applySelectionToPinnedQuery();
     scheduleSelectionDisplay();
   }, true);
   let contextMenuState = null;
@@ -2842,6 +2972,12 @@ export default defineContentScript({
     if (panelOpen) return;
     if (mouseButtonDown) return;
     scheduleSelectionDisplay();
+  });
+  // 键盘选区（Shift+方向键、Ctrl/⌘+A）不经过 mouseup，单独接一条；鼠标拖选期间
+  // selectionchange 会连续触发，所以用 mouseButtonDown 挡掉，等 mouseup 再处理。
+  document.addEventListener('selectionchange', () => {
+    if (mouseButtonDown) return;
+    applySelectionToPinnedQuery();
   });
   document.addEventListener('mousedown', (event) => {
     mouseButtonDown = true;
