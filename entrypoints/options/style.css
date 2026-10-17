@@ -17,7 +17,9 @@ h1 { font-size:18px; line-height:1.2; } .brand p { margin-top:4px; color:#71817b
 .settings-panel { padding-bottom:25px; border-bottom:1px solid #dce8df; }
 .content-header { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; }
 h2 { font-size:18px; font-weight:730; } .content-header p { max-width:580px; margin-top:7px; color:#75867d; font-size:12px; line-height:1.55; }
-.save-state { flex:0 0 auto; min-height:17px; padding-top:3px; color:#2f795b; font-size:11px; }
+.save-state { flex:0 0 auto; min-height:17px; max-width:360px; padding-top:3px; color:#2f795b; font-size:11px; text-align:right; }
+/* 保存失败要显眼且带原因，所以它不参与「1.2 秒后自动清空」。 */
+.save-state.is-error { color:#bd5d4f; }
 .setting-block { margin-top:22px; } h3 { color:#29483b; font-size:13px; font-weight:720; }
 .setting-help { margin-top:6px; color:#899990; font-size:10px; line-height:1.5; }
 .setting-heading-row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
@@ -79,8 +81,11 @@ h2 { font-size:18px; font-weight:730; } .content-header p { max-width:580px; mar
 .note-toggle:disabled { visibility:hidden; cursor:default; }
 .note-toggle svg { width:12px; height:12px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; transition:transform .12s ease; }
 .note-toggle.collapsed svg { transform:rotate(-90deg); }
-.note-bullet { display:grid; place-items:center; width:18px; height:28px; flex:0 0 auto; color:#6c8978; font-size:14px; line-height:1; }
-.note-bullet::before { content:""; width:5px; height:5px; border-radius:50%; background:currentColor; }
+.note-bullet { display:grid; place-items:center; width:20px; height:28px; flex:0 0 auto; padding:0; border:0; border-radius:4px; color:#6c8978; background:transparent; cursor:pointer; touch-action:none; -webkit-user-select:none; user-select:none; }
+.note-bullet::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; transition:width .12s ease,height .12s ease,background .12s ease,box-shadow .12s ease; }
+.note-bullet:hover::before { width:11px; height:11px; background:#fff; box-shadow:inset 0 0 0 2px #78ae90; }
+.note-bullet.is-armed::before { width:13px; height:13px; background:#edf8f0; box-shadow:inset 0 0 0 2px #3e8f6c; }
+.note-bullet:focus-visible { outline:2px solid #3e8f6c; outline-offset:1px; }
 .note-complete { display:grid; place-items:center; width:22px; height:28px; flex:0 0 auto; padding:0; border:0; border-radius:4px; color:#90a098; background:transparent; cursor:pointer; }
 .note-complete:hover { color:#2f795b; background:#e1eee5; }
 .note-complete svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
@@ -88,14 +93,8 @@ h2 { font-size:18px; font-weight:730; } .content-header p { max-width:580px; mar
 .note-row.completed .note-complete svg { fill:#3e8f6c; stroke:#3e8f6c; }
 .note-row.completed .note-input { color:#82958a; text-decoration:line-through; text-decoration-thickness:1px; }
 .note-input { min-width:0; flex:1; min-height:28px; padding:5px 6px; resize:none; overflow:hidden; border:1px solid transparent; border-radius:4px; outline:none; color:#29483b; background:transparent; font:inherit; font-size:12px; line-height:18px; }
-.note-input:focus { border-color:#8cc09e; background:#fff; box-shadow:0 0 0 2px rgba(62,143,108,.09); }
-.note-input::placeholder { color:#a0aea6; }
-.note-drag { display:grid; place-items:center; width:18px; height:28px; flex:0 0 auto; color:#b0bdb5; font-size:14px; cursor:grab; user-select:none; opacity:0; }
-.note-row:hover .note-drag,.note-row:focus-within .note-drag { opacity:1; }
-.note-zoom { display:grid; place-items:center; width:24px; height:28px; flex:0 0 auto; padding:0; border:0; border-radius:4px; color:#9aa9a1; background:transparent; cursor:pointer; opacity:0; }
-.note-row:hover .note-zoom,.note-row:focus-within .note-zoom { opacity:1; }
-.note-zoom:hover { color:#315f4d; background:#e1eee5; }
-.note-zoom svg { width:13px; height:13px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.note-drag-ghost { position:fixed; z-index:40; max-width:320px; padding:4px 10px; overflow:hidden; border-radius:5px; color:#29483b; background:#fff; box-shadow:0 12px 28px rgba(20,53,40,.18),0 2px 5px rgba(20,53,40,.08); font-size:12px; line-height:18px; white-space:nowrap; text-overflow:ellipsis; pointer-events:none; }
+.notes-outline.is-dragging { -webkit-user-select:none; user-select:none; cursor:grabbing; }
 .note-row.dragging { opacity:.45; }
 .note-row.drag-target-before { box-shadow:inset 0 2px 0 #78ae90; background:#edf8f0; }
 .note-row.drag-target-inside { box-shadow:inset 0 0 0 1px #78ae90; background:#edf8f0; }
