@@ -15,7 +15,8 @@
     "typecheck": "node scripts/typecheck.mjs",
     "typecheck:debt": "node scripts/typecheck.mjs --debt",
     "typecheck:baseline": "node scripts/typecheck.mjs --update-baseline",
-    "check": "node scripts/typecheck.mjs --debt --fail-on-regression"
+    "check": "node scripts/typecheck.mjs --debt --fail-on-regression",
+    "test:e2e": "node tests/run.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.2.9",

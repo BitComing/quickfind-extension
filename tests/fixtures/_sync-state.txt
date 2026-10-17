@@ -1,0 +1,35 @@
+KEY(17) "defaultGroupCount"
+VAL(1) 4
+
+KEY(19) "editableTriggerMode"
+VAL(6) "none"
+
+KEY(7) "enabled"
+VAL(4) true
+
+KEY(6) "groups"
+VAL(596) [{"id":"default","items":["google","bing","yandex","zhihu","group:group-1789573729075","group:group-1789573733324","group:group-1789573770674","group:group-1789573786425"],"name":"默认组","visible":true},{"id":"group-1789573733324","items":["bilibili","youtube","douyin"],"name":"视频","visible":true},{"id":"group-1789573770674","items":["xiaohongshu","x"],"name":"社媒","visible":true},{"id":"group-1789573786425","items":["google-ai","doubao","deepseek"],"name":"ai","visible":true},{"id":"group-1789573729075","items":["so","sogou","duckduckgo","baidu","google-scholar"],"name":"其他","visible":true}]
+
+KEY(3) "llm"
+VAL(125) {"apiKey":"","enabled":false,"endpoint":"https://api.openai.com/v1/chat/completions","model":"gpt-4o-mini","systemPrompt":""}
+
+KEY(12) "pinnedSearch"
+VAL(234) {"allSites":true,"collapseDelay":1000,"customSites":[],"defaultGroupCount":4,"openInNewTab":false,"siteConfigVersion":3,"sites":["google","baidu","google-scholar","duckduckgo","so","sogou","bing","yandex","zhihu","bilibili","douyin"]}
+
+KEY(21) "selectionTriggerDelay"
+VAL(3) 200
+
+KEY(19) "sourceConfigVersion"
+VAL(1) 5
+
+KEY(7) "sources"
+VAL(3056) [{"className":"google","detail":"Google Search","enabled":true,"iconOnly":true,"iconUrl":"","id":"google","mark":"G","name":"谷歌","url":"https://www.google.com/search?q={query}"},{"className":"baidu","detail":"百度搜索","enabled":true,"iconOnly":true,"iconUrl":"","id":"baidu","mark":"百","name":"百度","url":"https://www.baidu.com/s?wd={query}"},{"className":"google-scholar","detail":"Google Scholar","enabled":true,"iconOnly":true,"iconUrl":"","id":"google-scholar","mark":"GS","name":"谷歌学术","url":"https://scholar.google.com/scholar?q={query}"},{"className":"duckduckgo","detail":"Privacy Search","enabled":true,"iconOnly":true,"iconUrl":"","id":"duckduckgo","mark":"D","name":"DuckDuckGo","url":"https://duckduckgo.com/?q={query}"},{"className":"so","detail":"360 Search","enabled":true,"iconOnly":true,"iconUrl":"","id":"so","mark":"36","name":"360 搜索","url":"https://www.so.com/s?q={query}"},{"className":"sogou","detail":"搜狗搜索","enabled":true,"iconOnly":false,"iconUrl":"","id":"sogou","mark":"搜","name":"搜狗","url":"https://www.sogou.com/web?query={query}"},{"className":"bing","detail":"Microsoft Search","enabled":true,"iconOnly":true,"iconUrl":"","id":"bing","mark":"b","name":"Bing","url":"https://www.bing.com/search?q={query}"},{"className":"yandex","detail":"Search","enabled":true,"iconOnly":true,"iconUrl":"","id":"yandex","mark":"Я","name":"Yandex","url":"https://yandex.com/search/?text={query}"},{"className":"google-ai","detail":"Google AI Mode","enabled":true,"iconOnly":false,"iconUrl":"","id":"google-ai","mark":"AI","name":"Google AI Mode","url":"https://www.google.com/search?q={query}&udm=50"},{"className":"bilibili","detail":"视频搜索","enabled":true,"iconOnly":false,"iconUrl":"","id":"bilibili","mark":"B","name":"哔哩哔哩","url":"https://search.bilibili.com/all?keyword={query}"},{"className":"xiaohongshu","detail":"内容搜索","enabled":true,"iconOnly":false,"iconUrl":"","id":"xiaohongshu","mark":"红","name":"小红书","url":"https://www.xiaohongshu.com/search_result?keyword={query}"},{"className":"x","detail":"X Search","enabled":true,"iconOnly":false,"iconUrl":"","id":"x","mark":"X","name":"X","url":"https://x.com/search?q={query}"},{"className":"youtube","detail":"视频搜索","enabled":true,"iconOnly":false,"iconUrl":"","id":"youtube","mark":"▶","name":"YouTube","url":"https://www.youtube.com/results?search_query={query}"},{"className":"zhihu","detail":"知乎搜索","enabled":true,"iconOnly":true,"iconUrl":"","id":"zhihu","mark":"知","name":"知乎","url":"https://www.zhihu.com/search?type=content&q={query}"},{"className":"douyin","detail":"抖音搜索","enabled":true,"iconOnly":false,"iconUrl":"","id":"douyin","mark":"抖","name":"抖音","url":"https://www.douyin.com/search/{query}?type=general"},{"className":"doubao","detail":"打开新对话并填入内容","enabled":true,"iconOnly":false,"iconUrl":"","id":"doubao","mark":"豆","name":"豆包","url":"https://www.doubao.com/chat/?quickfind={query}"},{"className":"deepseek","detail":"AI 对话搜索","enabled":true,"iconOnly":false,"iconUrl":"","id":"deepseek","mark":"DS","name":"DeepSeek","url":"https://chat.deepseek.com/?q={query}"}]
+
+KEY(11) "triggerMode"
+VAL(7) "click"
+
+KEY(14) "llmDockVisible"
+VAL(5) false
+
+KEY(13) "searchHistory"
+VAL(49) [{"query":"绿电炼铝","timestamp":1.789573890056e+12}]
