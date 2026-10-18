@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # npm ci 而不是 install：lockfile 已提交，用它保证可复现。
+      - name: 安装依赖
+        run: npm ci
+
+      # lint（零争议规则） + 类型债务门禁（超过基线即失败）。
+      # 这两个都不需要构建产物，先跑，失败就不必浪费后面的构建时间。
+      - name: Lint 与类型债务门禁
+        run: npm run check
+
+      - name: 构建扩展
+        run: npm run build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-mv3
+          path: .output/chrome-mv3
+          if-no-files-found: error
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      # playwright 不在 devDependencies 里（本机用的是项目外那份），CI 上单独装。
+      # 装完必须下载浏览器，否则 launchPersistentContext 找不到可执行文件。
+      - name: 安装 playwright 与 Chromium
+        run: |
+          npm i --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: 构建扩展
+        run: npm run build
+
+      # 用例默认无头（QF_HEADED 未设置）。产物目录由 helpers.cjs 从仓库根推导，
+      # 所以只需在仓库根执行。
+      - name: 端到端回归
+        run: npm run test:e2e
+
+      - name: 失败时上传截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: output/playwright/*.png
+          if-no-files-found: ignore

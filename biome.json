@@ -1,0 +1,62 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+  "files": {
+    "includes": [
+      "entrypoints/**/*.ts",
+      "shared/**/*.ts",
+      "types/**/*.ts",
+      "tests/**/*.cjs",
+      "tests/**/*.mjs",
+      "scripts/**/*.mjs"
+    ]
+  },
+  "formatter": { "enabled": false },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "correctness": {
+        "noUnusedVariables": "error",
+        "noUnusedImports": "error",
+        "noUnreachable": "error",
+        "noUnusedFunctionParameters": "off"
+      },
+      "suspicious": {
+        "noDoubleEquals": "error",
+        "noFallthroughSwitchClause": "error",
+        "noExplicitAny": "off",
+        "noAssignInExpressions": "off",
+        "noPrototypeBuiltins": "off",
+        "noRedundantUseStrict": "off",
+        "useIterableCallbackReturn": "off",
+        "noImplicitAnyLet": "off"
+      },
+      "style": {
+        "useConst": "error",
+        "useTemplate": "off",
+        "useNodejsImportProtocol": "off",
+        "noNonNullAssertion": "off",
+        "useNamingConvention": "off"
+      },
+      "complexity": {
+        "useOptionalChain": "off",
+        "useArrowFunction": "off",
+        "noForEach": "off"
+      },
+      "a11y": {
+        "useButtonType": "off",
+        "noLabelWithoutControl": "off",
+        "useKeyWithClickEvents": "off",
+        "noSvgWithoutTitle": "off",
+        "useValidAnchor": "off"
+      }
+    }
+  },
+  "javascript": { "globals": ["chrome", "defineContentScript", "defineBackground"] },
+  "overrides": [
+    {
+      "includes": ["entrypoints/**"],
+      "linter": { "rules": { "correctness": { "noUnusedVariables": "off" } } }
+    }
+  ]
+}

@@ -60,7 +60,6 @@ export default defineContentScript({
   let expanded = false;
   let expandedGroupId = null;
   let panelManuallyMoved = false;
-  let panelDragTimer = null;
   let panelDragState = null;
   let pinnedHost = null;
   let pinnedExpandedGroupId = null;
@@ -82,6 +81,8 @@ export default defineContentScript({
   let mouseButtonDown = false;
   let selectionShowTimer = null;
   const LLM_CONVERSATIONS_KEY = 'quickfind-llm-conversations';
+  /** LLM 请求超时上限，与 background 侧保持一致（那边也有同名常量，改一处要改两处）。 */
+  const LLM_TIMEOUT_MS = 60000;
   let llmConversations = [];
   let llmActiveConversation = null;
   let llmCloseTimer = null;
@@ -128,7 +129,7 @@ export default defineContentScript({
       .quickfind-trigger.disabled { color:#a6b0aa; }
       .quickfind-trigger:hover { opacity: 1; color:#19352c; background:transparent; }
       .quickfind-trigger[aria-expanded="true"] { visibility:hidden; opacity:0; pointer-events:none; transform:translateX(-4px) scale(.94); }
-      .quickfind-trigger:focus-visible, .engine:focus-visible, .panel-close:focus-visible { outline: 2px solid #3a8c6a; outline-offset: 2px; }
+      .quickfind-trigger:focus-visible, .engine:focus-visible { outline: 2px solid #3a8c6a; outline-offset: 2px; }
       .quickfind-trigger svg { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
       .quickfind-panel {
         width: max-content;
@@ -162,8 +163,6 @@ export default defineContentScript({
       .query-expand:hover, .query-expand[aria-expanded="true"] { color:#2f795b; background:#edf7f0; }
       .query-expand:focus-visible { outline:2px solid #3a8c6a; outline-offset:2px; }
       .query-expand svg { width:13px; height:13px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-      .panel-close { display:none; }
-      .panel-close svg { width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; stroke-linecap:round; }
       .engine-list { display:flex; align-items:center; flex-wrap:nowrap; gap:4px; width:max-content; max-width:100%; overflow-x:auto; }
       .hidden-engine-list { display:flex; flex-direction:column; align-items:stretch; gap:4px; width:100%; min-width:180px; margin-top:5px; padding-top:5px; border-top:1px solid #e5eee8; }
       .hidden-engine-list[hidden] { display:none; }
@@ -779,14 +778,22 @@ export default defineContentScript({
   function requestLlmViaFetch(config, messages) {
     const headers = { 'Content-Type': 'application/json' };
     if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-    return fetch(resolveLlmEndpoint(config.endpoint), { method: 'POST', headers, body: JSON.stringify({ model: config.model, messages, temperature: 0.7, stream: false }) }).then(async (response) => {
+    // 与 background 侧同样加超时：这条路径在 chrome.runtime 不可用时才走，但同样可能挂起，
+    // 挂起时 llmRequestInFlight 不会复位，会话就卡死在「正在思考…」。
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    return fetch(resolveLlmEndpoint(config.endpoint), { method: 'POST', headers, body: JSON.stringify({ model: config.model, messages, temperature: 0.7, stream: false }), signal: controller.signal }).then(async (response) => {
       let payload = null;
       try { payload = await response.json(); } catch { /* retain status-based error */ }
       if (!response.ok) throw new Error(payload?.error?.message || payload?.message || `请求失败（${response.status}）`);
       const content = payload?.choices?.[0]?.message?.content;
       if (typeof content !== 'string' || !content.trim()) throw new Error('接口返回了空回复。');
       return content.trim();
-    });
+    }).catch((error) => {
+      // AbortError 的原生文案（"signal is aborted without reason"）对用户没有意义。
+      if (error?.name === 'AbortError') throw new Error(`请求超时（超过 ${Math.round(LLM_TIMEOUT_MS / 1000)} 秒未响应）。`);
+      throw error;
+    }).finally(() => window.clearTimeout(timer));
   }
 
   function requestLlmResponse(conversation) {
@@ -962,6 +969,11 @@ export default defineContentScript({
     if (!notesLoaded || notesSaveTimer) return; // 有未保存的本地编辑时跳过，避免覆盖正在输入的内容
     const incoming = changes[NOTES_KEY].newValue;
     if (!incoming || typeof incoming !== 'object') return;
+    // 先按 updatedAt 认领「这次变动是不是我自己写出去的」。
+    // 自己写的同时也会收到 onChanged，若不短路就要白跑一遍 normalizeNotes（全量遍历+重建树）
+    // 再 JSON.stringify 比对签名——节点越多、开的标签页越多，这份浪费越大。
+    // writeNotesStorage 里 updatedAt 每次取 Date.now()，单调递增，所以相等即同一份。
+    if (Number(incoming.updatedAt) === Number(notesState.updatedAt)) return;
     const next = normalizeNotes(incoming);
     if (notesStateSignature(next) === notesStateSignature()) return;
     notesState = next;
@@ -2791,8 +2803,6 @@ export default defineContentScript({
   function finishPanelDrag(event) {
     if (event && panelDragState && panelDragState.pointerId === event.pointerId && panelDragHandle.hasPointerCapture(event.pointerId)) panelDragHandle.releasePointerCapture(event.pointerId);
     if (panelDragState?.frame) cancelAnimationFrame(panelDragState.frame);
-    if (panelDragTimer) window.clearTimeout(panelDragTimer);
-    panelDragTimer = null;
     panelDragState = null;
     panel.classList.remove('dragging');
   }

@@ -1,4 +1,4 @@
-# Browser automation output
+# Browser automation output（仅忽略截图等临时产物；回归用例在 tests/ 入库）
 .playwright-cli/
 output/playwright/
 

@@ -35,6 +35,9 @@
 | `public/` | 静态资源（图标等），构建时原样拷贝 |
 | `types/` | 补充类型声明 |
 | `scripts/` | 工程脚本：`typecheck.mjs`（类型检查与类型债务度量） |
+| `tests/` | 端到端回归用例与 `helpers.cjs`（加载真实构建产物跑浏览器） |
+| `biome.json` | Lint 配置。只开零争议规则（未使用变量/导入、`==`、`useConst` 等），见「工程门禁」 |
+| `.github/workflows/ci.yml` | CI：lint + 类型债务 → 构建 → 端到端回归 |
 | `legacy/` | 迁移前的根目录平铺产物，仅作回退参照，不参与构建 |
 | `.output/` | 构建产物（忽略提交） |
 | `.typecheck-baseline.json` | 类型债务基线，随代码提交，用于阻止债务增加 |
@@ -49,8 +52,38 @@
 | `npm run compile` | 仅做 TypeScript 类型检查 |
 | `npm run typecheck` | 同上，但在结果中标注被 `@ts-nocheck` 屏蔽的文件 |
 | `npm run typecheck:debt` | 额外量出被屏蔽文件的真实错误数（见「类型债务」） |
-| `npm run check` | 提交前门禁：类型债务超过基线即失败 |
+| `npm run check` | 提交前门禁：`biome lint` + 类型债务不得超过基线 |
+| `npm run lint` / `lint:fix` | 只跑 Lint / 跑 Lint 并自动修可修项 |
+| `npm run test:e2e` | 端到端回归（**需先 `npm run build`**，测的是真实产物） |
 | `npm run build:raw` | 直接调用 `wxt build`，见下方说明 |
+
+## 端到端回归
+
+用例在 `tests/`，加载 `.output/chrome-mv3` 真实产物跑 Chromium，覆盖类型检查与 Lint
+都看不见的行为：浮层堆叠与 top layer 进出、常驻栏缓存失效、大纲拖拽与模型层边界、
+笔记跨标签页同步、LLM 请求超时。
+
+```
+npm run build && npm run test:e2e          # 全部
+npm run test:e2e -- top-layer              # 只跑文件名含该串的
+QF_HEADED=1 npm run test:e2e               # 显示窗口（默认无头）
+```
+
+依赖只用到 playwright，且**不写死路径**：`tests/helpers.cjs` 依次尝试项目依赖、
+`QF_PW` 环境变量、`~/node_modules/playwright`，Chromium 用 playwright 自带的
+（`QF_CHROME` 可覆盖）。所以换机或 CI 上装好 playwright 即可直接跑。
+
+## 工程门禁
+
+`npm run check` 一次覆盖两件事，CI 里先跑它、过了才构建与跑 e2e：
+
+1. **Lint**（`biome.json`）：只开零争议规则——未使用变量/导入、`==`、`useConst`、
+   `noUnreachable`、交换机贯穿。这些规则命中的都是「一定是笔误」的形态，不是风格偏好，
+   因此不需要在改动里夹带格式化噪声。`entrypoints/**` 关掉 `noUnusedVariables`
+   （迁移期仍有历史遗留），`noUnusedImports` 保持开启。
+2. **类型债务**：超过 `.typecheck-baseline.json` 即失败，基线只允许下降。
+
+需要改代码风格时再逐条开规则，不要在启用 Lint 的同一次改动里重排全文件。
 
 ## 构建说明
 
@@ -122,6 +155,7 @@ WXT 侧规避。
 
 - `types/node-lite.d.ts` 是本地最小 Node 类型声明。若能安装 `@types/node`，
   可删除该文件并在 `tsconfig.json` 的 `types` 中加入 `"node"`。
-- `entrypoints/popup/main.ts` 中的 `escapeHtml` 没有调用点，属迁移残留，确认后可删。
 - 三个入口仍是迁移前的 IIFE + `'use strict'` 写法，`popup/main.ts` 与 `options/main.ts`
-  里多个函数挤在同一行。可读性拆分放在类型补齐之后单独做。
+  里多个函数曾挤在同一行（超长行已按语句边界拆过一轮，还剩 37 处，多是
+  `renderNotes` 里单行构建 DOM + 模板字符串）。
+- 可读性拆分（IIFE、单行挤多个函数）放在类型补齐之后单独做，两件事不要混在一次改动里。

@@ -10,7 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
-const { resolvePlaywright, ROOT, EXT, resolveChrome } = require('./helpers.cjs');
+const { resolvePlaywright, EXT, resolveChrome } = require('./helpers.cjs');
 const { chromium } = resolvePlaywright();
 const CHROME = resolveChrome(chromium);
 

@@ -589,8 +589,12 @@ import {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local' || !changes['quickfind-notes'] || !notesLoaded) return;
       if (notesSaveTimer) return; // local edits pending; last writer wins
-      const incoming = changes['quickfind-notes'].newValue;
+      const incoming = changes['quickfind-notes'].newValue as { updatedAt?: unknown } | null | undefined;
       if (!incoming || typeof incoming !== 'object') return;
+      // 自己写出去的变动会以 onChanged 的形式回来。先按 updatedAt 认出来直接返回，
+      // 省掉一次全量 normalizeNotes（遍历+重建树）与一次 JSON.stringify 签名比对。
+      // persistNotes 每次都把 updatedAt 刷成 Date.now()，单调递增，相等即同一份。
+      if (Number(incoming.updatedAt) === Number(notesState.updatedAt)) return;
       const next = normalizeNotes(incoming);
       if (notesStateSignature(next) === notesStateSignature()) return;
       notesState = next;

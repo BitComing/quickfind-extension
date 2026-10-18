@@ -248,8 +248,6 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => { const tab = tabs?.[0];
   if (!tab?.id) return focusAndSelectQuery(); chrome.tabs.sendMessage(tab.id, { type: 'get-selection' }, (response) => { if (queryEditedSinceOpen) return;
   if (!chrome.runtime.lastError && response?.text) { queryInput.value = response.text; syncClearButton(); } focusAndSelectQuery(); }); }); }
-  function escapeHtml(value: unknown) { const escapes: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' };
-  return String(value).replace(/[&<>'"]/g, (char) => escapes[char]!); }
 
   queryInput.addEventListener('input', () => { queryEditedSinceOpen = true; syncClearButton(); });
   queryInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter' || event.isComposing) return;

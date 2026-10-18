@@ -1,17 +1,17 @@
 {
   "note": "由 scripts/typecheck.mjs --update-baseline 生成。数字代表各文件真实类型错误数，只应下降。",
-  "generatedAt": "2026-10-17T15:03:21.715Z",
-  "total": 1067,
+  "generatedAt": "2026-10-17T15:55:55.214Z",
+  "total": 1065,
   "files": {
-    "entrypoints/content/index.ts": 565,
+    "entrypoints/content/index.ts": 563,
     "entrypoints/options/main.ts": 502
   },
   "byCode": {
     "TS7006": 279,
     "TS18047": 256,
     "TS2339": 237,
-    "TS7005": 177,
-    "TS7034": 44,
+    "TS7005": 176,
+    "TS7034": 43,
     "TS2345": 26,
     "TS2322": 10,
     "TS18046": 10,

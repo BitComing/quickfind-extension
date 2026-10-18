@@ -15,10 +15,13 @@
     "typecheck": "node scripts/typecheck.mjs",
     "typecheck:debt": "node scripts/typecheck.mjs --debt",
     "typecheck:baseline": "node scripts/typecheck.mjs --update-baseline",
-    "check": "node scripts/typecheck.mjs --debt --fail-on-regression",
-    "test:e2e": "node tests/run.mjs"
+    "check": "biome lint . && node scripts/typecheck.mjs --debt --fail-on-regression",
+    "test:e2e": "node tests/run.mjs",
+    "lint": "biome lint .",
+    "lint:fix": "biome lint --write ."
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
     "@types/chrome": "^0.2.9",
     "typescript": "^7.0.2",
     "wxt": "^0.21.4"
