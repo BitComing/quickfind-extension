@@ -227,7 +227,8 @@ async function dockState(page) {
       listRowDetail: document.querySelector('#source-list .source-row[data-action-id="notes"] .source-meta small') ? document.querySelector('#source-list .source-row[data-action-id="notes"] .source-meta small').textContent : null
     };
   });
-  check('配置区里两枚按钮（复制 / 笔记）', optionUi.count === 2 && optionUi.names.includes('笔记'), JSON.stringify(optionUi.names));
+  // 断言的是「复制/笔记两枚都在」，不是「只有两枚」——后续新增动作不应让这条用例变红。
+  check('配置区里含「复制」「笔记」两枚按钮', optionUi.names.includes('复制') && optionUi.names.includes('笔记'), JSON.stringify(optionUi.names));
   check('笔记行说明文案正确', optionUi.noteDetail === '存到无限大纲笔记第一行', String(optionUi.noteDetail));
   check('分组下拉已选中默认组', optionUi.noteGroup === 'default', String(optionUi.noteGroup));
   check('下拉里有「未添加」和分组可选', optionUi.options.includes('未添加') && optionUi.options.includes('默认组'), JSON.stringify(optionUi.options));

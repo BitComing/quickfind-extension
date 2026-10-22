@@ -18,6 +18,7 @@ import { SPECIAL_ACTIONS } from '@/shared/search-actions';
 import { LEGACY_NOTES_STORAGE_KEY, NOTES_STORAGE_KEY, prependNotesLines, splitNotesLines } from '@/shared/notes';
 import { BUILTIN_SOURCES, backfillBuiltinSources } from '@/shared/builtins';
 import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
+import { decodeQueryText } from '@/shared/query-text';
 
 (function () {
   'use strict';
@@ -39,6 +40,7 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
   const groupTabs = document.querySelector<HTMLElement>('#group-tabs')!;
   const engineSettings = document.querySelector<HTMLDivElement>('#engine-settings')!;
   const openOptions = document.querySelector<HTMLButtonElement>('#open-options')!;
+  const aiToggle = document.querySelector<HTMLButtonElement>('#ai-toggle')!;
   // 由 render() 首次赋值。所有读取都发生在渲染之后的交互或异步回调中。
   let settings!: QuickFindSettings;
   let activeGroupId = 'default';
@@ -136,10 +138,45 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs?.[0];
       if (!tab?.id) { void prependNoteLocally(text); return; }
-      chrome.tabs.sendMessage(tab.id, { type: 'save-note', text }, (response) => {
+      chrome.tabs.sendMessage(tab.id, { type: 'save-note', text }, { frameId: 0 }, (response) => {
         if (chrome.runtime.lastError || !response?.ok) void prependNoteLocally(text);
       });
     });
+  }
+
+  const AI_PANEL_UNSUPPORTED = '当前页面无法显示对话窗口，请在普通网页上使用。';
+
+  /**
+   * 把当前页面的 AI 对话交出去，由页面侧在网页中弹出一个对话窗口。
+   *
+   * `text` 是**显式传入**的，不再默认取搜索框内容：头部按钮要的是空白对话，
+   * 而「问 ai」按钮行要的是拿搜索内容去提问——两处语义不同，由调用方各自决定，
+   * 避免「默认带上搜索框」这种隐式行为让其中一个入口变成另一个。
+   * 空字符串时页面侧只开窗口、不发送（见 content/index.ts 的 askAiFromAction）。
+   */
+  function openAiOnPage(text: string): void {
+    if (!chrome.tabs?.query) { showPopupNotice(AI_PANEL_UNSUPPORTED); return; }
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs?.[0];
+      if (!tab?.id) { showPopupNotice(AI_PANEL_UNSUPPORTED); return; }
+      // frameId: 0 —— 对话窗口是整页级 UI，只由顶层框架承载。
+      chrome.tabs.sendMessage(tab.id, { type: 'ask-ai', text }, { frameId: 0 }, (response) => {
+        if (chrome.runtime.lastError || !response?.ok) { showPopupNotice(AI_PANEL_UNSUPPORTED); return; }
+        // 对话已经在页面上打开，弹窗的使命结束。
+        window.close();
+      });
+    });
+  }
+
+  /** 弹窗里的临时提示条：用完即撤，不占位、不写存储。 */
+  let popupNoticeTimer: number | null = null;
+  function showPopupNotice(message: string): void {
+    const notice = document.getElementById('popup-notice');
+    if (!notice) return;
+    notice.textContent = message;
+    notice.hidden = false;
+    if (popupNoticeTimer) window.clearTimeout(popupNoticeTimer);
+    popupNoticeTimer = window.setTimeout(() => { notice.hidden = true; popupNoticeTimer = null; }, 3200);
   }
 
   /** 兜底写入：取存储里最新的副本，把内容插到第一行再写回。 */
@@ -157,14 +194,16 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
   }
 
   function savePopupCache(value: unknown) { chrome.storage.session?.set({ [POPUP_CACHE_KEY]: value }); }
-  function rememberSearch(query: string) { const normalized = query.replace(/\s+/g, ' ').trim(); if (!normalized) return; const history = settings.searchHistory.map((item) => typeof item === 'string' ? { query: item } : item).filter((item) => item && item.query && item.query !== normalized); history.unshift({ query: normalized, timestamp: Date.now() }); settings.searchHistory = history.slice(0, 20); chrome.storage.sync.set({ searchHistory: settings.searchHistory }); savePopupCache(settings); }
+  function rememberSearch(query: string) { const normalized = decodeQueryText(query).replace(/\s+/g, ' ').trim(); if (!normalized) return; const history = settings.searchHistory.map((item) => typeof item === 'string' ? { query: item } : item).filter((item) => item && item.query && item.query !== normalized); history.unshift({ query: normalized, timestamp: Date.now() }); settings.searchHistory = history.slice(0, 20); chrome.storage.sync.set({ searchHistory: settings.searchHistory }); savePopupCache(settings); }
   function focusAndSelectQuery() { queryInput.focus({ preventScroll: true }); queryInput.select(); }
   function submitSearch(source: SearchSource) { if (!settings.enabled) return focusAndSelectQuery();
   const query = queryInput.value.trim(); if (!query) return focusAndSelectQuery();
   rememberSearch(query); const url = getSearchUrl(source, query);
-  const restoreFocus = () => window.setTimeout(focusAndSelectQuery, 0);
-  if (chrome.tabs?.create) { chrome.tabs.create({ url, active: false }, () => { void chrome.runtime.lastError;
-  restoreFocus(); }); return; } window.open(url, '_blank', 'noopener,noreferrer'); restoreFocus(); }
+  // active:true——新标签必须自动切过去。此前是 active:false：结果在后台打开，
+  // 弹窗一关用户还停在原来那一页，观感就是「点了搜索没反应」。
+  // 新标签被激活后弹窗会自动关闭，所以这里不再需要把焦点抢回输入框。
+  if (chrome.tabs?.create) { chrome.tabs.create({ url, active: true }, () => { void chrome.runtime.lastError; }); return; }
+  window.open(url, '_blank', 'noopener,noreferrer'); }
   function reorderGroups(sourceId: string, targetId: string, after: boolean) {
     if (sourceId === 'default' || targetId === 'default' || sourceId === targetId) return;
     const sourceIndex = settings.groups.findIndex((group) => group.id === sourceId);
@@ -232,7 +271,8 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
     arrow.setAttribute('aria-hidden', 'true'); arrow.innerHTML = '<path d="m9 6 6 6-6 6"></path>';
     button.append(ident, arrow); button.addEventListener('click', () => { if (source.isGroup) { activeGroupId = source.groupId!;
     render(settings); return; } if (source.isSpecial) { if (source.action === 'copy') void copyTextToClipboard(queryInput.value.trim());
-    else if (source.action === 'notes') saveQueryToNotes(); return; } submitSearch(source); }); engineSettings.append(button); });
+    else if (source.action === 'notes') saveQueryToNotes();
+    else if (source.action === 'ask-ai') openAiOnPage(queryInput.value.trim()); return; } submitSearch(source); }); engineSettings.append(button); });
     renderHistory(settings.searchHistory);
   }
   function renderHistory(history: HistoryItem[]) { historyList.replaceChildren();
@@ -246,7 +286,7 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
   function syncClearButton() { clearQuery.classList.toggle('is-empty', !queryInput.value); }
   function requestSelection() { focusAndSelectQuery(); if (!chrome.tabs?.query) return;
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => { const tab = tabs?.[0];
-  if (!tab?.id) return focusAndSelectQuery(); chrome.tabs.sendMessage(tab.id, { type: 'get-selection' }, (response) => { if (queryEditedSinceOpen) return;
+  if (!tab?.id) return focusAndSelectQuery(); chrome.tabs.sendMessage(tab.id, { type: 'get-selection' }, { frameId: 0 }, (response) => { if (queryEditedSinceOpen) return;
   if (!chrome.runtime.lastError && response?.text) { queryInput.value = response.text; syncClearButton(); } focusAndSelectQuery(); }); }); }
 
   queryInput.addEventListener('input', () => { queryEditedSinceOpen = true; syncClearButton(); });
@@ -264,6 +304,11 @@ import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
   function loadPopupSettings() { if (!chrome.storage.session) { chrome.storage.sync.get(defaults, (stored) => { savePopupCache(stored);
   initialize(stored); }); return; } chrome.storage.session.get(POPUP_CACHE_KEY, (cached) => { const stored = cached[POPUP_CACHE_KEY];
   if (stored && typeof stored === 'object') return initialize(stored); chrome.storage.sync.get(defaults, (fresh) => { savePopupCache(fresh); initialize(fresh); }); }); }
+
+  // 头部「AI 对话」按钮：开一个**空白**对话，不默认把搜索框内容发出去——
+  // 按钮的语义是「打开 AI 聊天」，发送什么由用户在窗口里自己决定。
+  aiToggle.addEventListener('click', () => openAiOnPage(''));
+
   focusAndSelectQuery();
   loadPopupSettings();
 })();

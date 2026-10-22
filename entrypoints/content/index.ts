@@ -43,6 +43,36 @@ export default defineContentScript({
   const IS_SUBFRAME = window.top !== window.self;
 
   /**
+   * 一个对话窗口的运行时形状。
+   *
+   * 每个窗口自带会话、在飞标志与视图状态——这些**不能**放成模块级的单例：
+   * 多窗口并存时，共享一份状态会让两个窗口互相改写标题、清空对方的输入框。
+   * 只有「会话列表」与「配置」是全局的。
+   */
+  interface LlmChatWindow {
+    root: HTMLElement;
+    conversation: any;
+    /** 几何记忆的键：会话 id（新对话落库前是个临时 draft 键）。 */
+    geometryKey: string;
+    requestInFlight: boolean;
+    /** 当前视图：chat 显示对话流，history 显示会话列表。 */
+    state: 'chat' | 'history';
+    pinned: boolean;
+    scroll: Element | null;
+    historyList: Element | null;
+    historyCount: Element | null;
+    input: HTMLTextAreaElement | null;
+    compose: HTMLElement | null;
+    title: Element | null;
+    subtitle: Element | null;
+    back: HTMLElement | null;
+    /** 独立的「历史会话」入口；与 back 分工：它进历史，back 退回来。 */
+    historyButton: HTMLElement | null;
+    pin: HTMLElement | null;
+    jump: HTMLElement | null;
+  }
+
+  /**
    * 页面 shadow DOM 内选区的取回结果。
    *
    * 单独起一个名字是必要的：`found` 是个「闭包内被赋值、闭包外被读取」的变量，
@@ -110,11 +140,30 @@ export default defineContentScript({
   /** LLM 请求超时上限，与 background 侧保持一致（那边也有同名常量，改一处要改两处）。 */
   const LLM_TIMEOUT_MS = 60000;
   let llmConversations = [];
-  let llmActiveConversation = null;
+  // 已打开的对话窗口。一个窗口对应一段会话（conversationId 为 null 表示「还没落库的新对话」）。
+  // 允许多个并存，且每个窗口各自持有自己的请求在飞标志与渲染状态——共享一份状态会让
+  // 两个窗口互相改写标题、清空对方输入框。
+  const llmChatWindows: LlmChatWindow[] = [];
+  // 新建窗口时用来错开位置的计数器，避免多个窗口叠在同一点。
+  let llmWindowCascade = 0;
+  // 窗口几何（位置/大小/置顶）的唯一存储键，随会话 id 记，跨刷新恢复。
+  const LLM_WINDOW_GEOMETRY_KEY = 'quickfind-llm-window-geometry';
+  /**
+   * 与会话无关的「上次用过的尺寸」记忆键，存在同一张几何表里。
+   *
+   * 为什么需要它：几何按会话 id 记账，而「问 ai」每次都开一段**新对话**（draft-<时间戳>-<随机>），
+   * 键每次都不同——用户拖好的大小永远命不中，新窗口一律回落到硬编码的 420×560，
+   * 表现就是「尺寸记不住」。这里额外记一份全局尺寸，新窗口没有会话记忆时继承它。
+   * 只记宽高、不记位置：位置按会话错开摆放是有意的（见 defaultLlmWindowRect）。
+   */
+  const LLM_WINDOW_SIZE_KEY = '__lastSize__';
   let llmCloseTimer = null;
   let llmDockOpen = false;
+  // 用户主动点开过侧栏。区分「点击打开」与旧的「划过自动打开」：
+  // 前者是明确意图，鼠标离开右边缘也不该被自动收起；后者已移除。
+  // 关闭按钮、选项页关掉面板、切换页面都会清掉它。
+  let llmDockPinnedOpen = false;
   let llmHistorySignature = '';
-  let llmRequestInFlight = false;
   let triggerHoverTimer = null;
   const TRIGGER_HOVER_OPEN_DELAY = 100;
 
@@ -233,12 +282,17 @@ export default defineContentScript({
       .deepseek .engine-mark { color:#fff; background:#4d6bfe; font-size:9px; }
       .special-copy .engine-mark { color:#fff; background:#6c8178; }
       .special-notes .engine-mark { color:#fff; background:#3e8f6c; }
+      .special-ask-ai .engine-mark { color:#f5c56b; background:#19352c; font-size:9px; }
       .custom .engine-mark { color:#587269; background:#e6efe9; }
       .more-engine .engine-mark { color:#587269; background:#e6efe9; font-size:13px; }
       .group .engine-mark { color:#315f4d; background:#dfeee5; font-size:12px; }
       .llm-dock { position:fixed; inset:0; z-index:2147483646;
       width:100vw; height:100vh; pointer-events:none; font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#203b31; }
       .llm-dock[hidden] { display:none; }
+      /* 「问 ai」弹出的对话层独立于右侧栏：选项页关掉「随心问」面板时，宿主仍要能承载
+         对话面板，只是不显示滑杆与侧栏。宿主显隐由 syncLlmDockHostVisibility 统一决定。 */
+      .llm-dock.is-chat-only .llm-rail,
+      .llm-dock.is-chat-only .llm-sidebar { display:none; }
       .llm-rail { position:fixed; top:50%; right:0; display:flex;
       align-items:center; justify-content:center; width:14px;
       height:20vh; min-height:96px; max-height:176px; padding:0;
@@ -274,11 +328,28 @@ export default defineContentScript({
       .llm-history-heading { display:flex; align-items:center; justify-content:space-between; padding:5px 3px 9px; color:#506d5d; font-size:11px; font-weight:700; }
       .llm-history-count { color:#9aaa9f; font-size:10px; font-weight:500; }
       .llm-history-list { display:flex; flex-direction:column; gap:8px; }
-      .llm-history-card { display:block; width:100%; min-height:78px;
-      padding:12px 13px; border:1px solid #e0ece4; border-radius:8px;
+      /* 卡片是 div 而不是 button：里面要放删除按钮，而 button 不能嵌套 button
+         （浏览器会把它拆开，删除按钮就点不到）。交互语义用 role/tabindex 补。 */
+      .llm-history-card { display:flex; align-items:flex-start; gap:4px; width:100%; min-height:78px;
+      padding:12px 9px 12px 13px; border:1px solid #e0ece4; border-radius:8px;
       color:#29483b; background:#fbfdfb; text-align:left; cursor:pointer; transition:border-color .14s ease,background .14s ease,box-shadow .14s ease,transform .14s ease; }
       .llm-history-card:hover { border-color:#9cc5aa; background:#f7fcf8; box-shadow:0 6px 16px rgba(42,88,68,.08); transform:translateY(-1px); }
-      .llm-history-card:focus-visible,.llm-send:focus-visible,.llm-chat-close:focus-visible,.llm-chat-back:focus-visible,.llm-rail:focus-visible,.llm-sidebar-close:focus-visible { outline:2px solid #3e8f6c; outline-offset:2px; }
+      .llm-history-card:focus-visible { outline:2px solid #3e8f6c; outline-offset:2px; }
+      .llm-card-body { min-width:0; flex:1; }
+      /* 删除按钮默认收敛，指针进入卡片或按钮获得键盘焦点时才显形：
+         常驻显示会让整列卡片看起来像一堆危险操作。
+         ⚠️ opacity:0 的元素**照样接收指针事件**——不关掉 pointer-events 的话，
+         点卡片右上角会落到这个看不见的按钮上（表现为「点卡片没打开对话，反而在问要不要删」）。
+         pointer-events 不影响键盘可达性，Tab 仍能聚焦到它。 */
+      .llm-card-delete { display:grid; place-items:center; width:24px; height:24px; flex:0 0 auto; padding:0;
+      border:0; border-radius:6px; color:#a8b6ae; background:transparent; cursor:pointer; opacity:0; pointer-events:none; transition:opacity .14s ease,color .14s ease,background .14s ease; }
+      .llm-history-card:hover .llm-card-delete,.llm-card-delete:focus-visible { opacity:1; pointer-events:auto; }
+      .llm-card-delete:hover { color:#b65c4f; background:#fff0ed; }
+      .llm-card-delete svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+      /* 两步确认：第一下只「上膛」，再点一下才真删。不可逆的删除不该一次点击就完成，
+         而在 shadow DOM 里弹原生 confirm 会被部分页面拦掉，所以用按钮自身表达。 */
+      .llm-card-delete.is-armed { width:auto; padding:0 7px; opacity:1; color:#fff; background:#b65c4f; font-size:9px; font-weight:700; white-space:nowrap; }
+      .llm-card-delete.is-armed:hover { background:#9d4a3f; }
       .llm-card-title { display:block; overflow:hidden; color:#264d3b; font-size:12px; font-weight:680; line-height:1.45; text-overflow:ellipsis; white-space:nowrap; }
       .llm-card-preview { display:-webkit-box; margin-top:6px; overflow:hidden; color:#82958a; font-size:10px; line-height:1.5; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
       .llm-card-meta { display:flex; align-items:center; justify-content:space-between; margin-top:8px; color:#a0aea5; font-size:9px; }
@@ -300,6 +371,7 @@ export default defineContentScript({
       .llm-send:hover { background:#25654b; }
       .llm-send:disabled { opacity:.45; cursor:not-allowed; }
       .llm-send svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+      .llm-send:focus-visible,.llm-chat-close:focus-visible,.llm-chat-back:focus-visible,.llm-chat-pin:focus-visible,.llm-chat-history-btn:focus-visible,.llm-card-delete:focus-visible,.llm-rail:focus-visible,.llm-sidebar-close:focus-visible { outline:2px solid #3e8f6c; outline-offset:2px; }
       .llm-tabbar { display:flex; gap:3px; flex:0 0 auto; margin:0 15px 8px; padding:3px; border-radius:10px; background:#f0f6f2; }
       .llm-tab { display:flex; flex:1; align-items:center; justify-content:center;
       min-width:0; min-height:29px; padding:0 8px; overflow:hidden;
@@ -363,28 +435,91 @@ export default defineContentScript({
       max-width:240px; padding:2px 7px; overflow:hidden; border-radius:6px;
       color:#2c4b3d; background:#fff; box-shadow:0 8px 22px rgba(17,43,31,.2),0 1px 3px rgba(17,43,31,.1);
       font:12px/1.6 Inter,ui-sans-serif,sans-serif; white-space:nowrap; text-overflow:ellipsis; pointer-events:none; }
-      .llm-chat-layer { position:fixed; inset:0; z-index:3; pointer-events:auto; }
+      /* 对话窗口容器：只做定位与层叠，**不加蒙版**——页面照常可见可点，窗口之间也不互相遮挡视角。
+         容器本身不接收指针事件，事件由各个窗口自己的矩形接住，这样空处能直接穿透给页面。 */
+      .llm-chat-layer { position:fixed; inset:0; z-index:3; pointer-events:none; }
       .llm-chat-layer[hidden] { display:none; }
-      .llm-backdrop { position:absolute; inset:0; background:rgba(22,43,33,.26); backdrop-filter:blur(1px); -webkit-backdrop-filter:blur(1px); }
-      .llm-chat-dialog { position:absolute; top:16px; right:16px;
-      bottom:16px; display:flex; flex-direction:column; width:min(420px,calc(100vw - 32px));
+      .llm-chat-dialog { position:absolute; display:flex; flex-direction:column;
+      width:420px; height:min(560px,calc(100vh - 32px)); min-width:280px; min-height:240px;
       overflow:hidden; border:1px solid #d8e7dd; border-radius:10px;
-      background:#fff; box-shadow:0 24px 65px rgba(17,43,31,.28),0 3px 10px rgba(17,43,31,.12); animation:quickfind-llm-rise .22s cubic-bezier(.2,.8,.2,1); }
-      .llm-chat-head { display:flex; align-items:center; gap:8px; min-height:61px; padding:11px 13px; border-bottom:1px solid #e7efe9; }
-      .llm-chat-back,.llm-chat-close { display:grid; place-items:center; width:28px; height:28px; padding:0; border:0; border-radius:6px; color:#789086; background:transparent; cursor:pointer; }
-      .llm-chat-back:hover,.llm-chat-close:hover { color:#19352c; background:#edf5ef; }
-      .llm-chat-icon { display:grid; place-items:center; width:29px; height:29px; border-radius:8px; color:#f5c56b; background:#19352c; }
-      .llm-chat-head-copy { min-width:0; }
+      background:#fff; box-shadow:0 24px 65px rgba(17,43,31,.28),0 3px 10px rgba(17,43,31,.12);
+      pointer-events:auto; }
+      /* 入场动画是**一次性**的：只在建窗口时挂 .is-entering，animationend 后摘掉。
+         千万别把它写在 .llm-chat-dialog 的基础规则上——那样它在整个生命周期里都挂着，
+         每次增删别的类（如拖动时的 is-dragging）都会让浏览器把动画**从头重放一遍**：
+         opacity 归 0 + translateY(8px)，表现为「每次拖完窗口都闪一下、跳一下」。 */
+      .llm-chat-dialog.is-entering { animation:quickfind-llm-rise .22s cubic-bezier(.2,.8,.2,1); }
+      /* 置顶窗口：抬到同层其它窗口之上，并用描边把「已置顶」画出来。 */
+      .llm-chat-dialog.is-pinned { z-index:5; border-color:#9cc5aa; box-shadow:0 26px 70px rgba(17,43,31,.34),0 0 0 2px rgba(62,143,108,.28); }
+      .llm-chat-dialog.is-dragging { transition:none; }
+      .llm-chat-dialog.is-resizing { transition:none; }
+      .llm-chat-head { display:flex; align-items:center; gap:8px; min-height:61px; padding:11px 13px; border-bottom:1px solid #e7efe9;
+      cursor:grab; touch-action:none; -webkit-user-select:none; user-select:none; }
+      .llm-chat-dialog.is-dragging .llm-chat-head { cursor:grabbing; }
+      /* 头部按钮统一外观。返回键只在历史视图里出现（用 [hidden] 收起），
+         所以它不再兼作「查看历史」的入口——历史是独立的 .llm-chat-history-btn。 */
+      .llm-chat-back,.llm-chat-close,.llm-chat-pin,.llm-chat-history-btn { display:grid; place-items:center; width:28px; height:28px; padding:0; border:0; border-radius:6px; color:#789086; background:transparent; cursor:pointer; }
+      .llm-chat-back[hidden],.llm-chat-history-btn[hidden] { display:none; }
+      /* 头部按钮里的 svg 必须给尺寸与描边：不给的话 svg 用自身默认的 300×150 横铺，
+         被 28×28 的按钮裁掉一角，图标就成了一条看不清的糊线。 */
+      .llm-chat-back svg,.llm-chat-close svg,.llm-chat-pin svg,.llm-chat-history-btn svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+      .llm-chat-back:hover,.llm-chat-close:hover,.llm-chat-pin:hover,.llm-chat-history-btn:hover { color:#19352c; background:#edf5ef; }
+      .llm-chat-history-btn.is-active { color:#2f795b; background:#e6f4ec; }
+      .llm-chat-pin.is-active { color:#2f795b; background:#e6f4ec; }
+      .llm-chat-head-copy { min-width:0; flex:1; }
+      .llm-chat-head-copy[title] { cursor:grab; }
+      .llm-chat-dialog.is-dragging .llm-chat-head-copy[title] { cursor:grabbing; }
+      .llm-chat-icon { display:grid; place-items:center; width:29px; height:29px; border-radius:8px; color:#f5c56b; background:#19352c; flex:0 0 auto; }
       .llm-chat-title { overflow:hidden; color:#234837; font-size:12px; font-weight:720; text-overflow:ellipsis; white-space:nowrap; }
       .llm-chat-subtitle { margin-top:3px; color:#8a9c92; font-size:9px; }
-      .llm-chat-close { margin-left:auto; }
+      /* 缩小/放大：右下角抓手。 */
+      .llm-chat-resize { position:absolute; right:0; bottom:0; width:16px; height:16px; cursor:nwse-resize; touch-action:none; }
+      .llm-chat-resize::before { content:""; position:absolute; right:3px; bottom:3px; width:7px; height:7px;
+      border-right:2px solid #b6c9bd; border-bottom:2px solid #b6c9bd; border-radius:0 0 2px 0; }
+      .llm-chat-scroll .llm-md > :first-child { margin-top:0; }
+      .llm-chat-scroll .llm-md > :last-child { margin-bottom:0; }
+      .llm-chat-scroll .llm-md p { margin:0 0 8px; }
+      .llm-chat-scroll .llm-md h1,.llm-chat-scroll .llm-md h2,.llm-chat-scroll .llm-md h3,
+      .llm-chat-scroll .llm-md h4,.llm-chat-scroll .llm-md h5,.llm-chat-scroll .llm-md h6 { margin:12px 0 6px; color:#1f4232; font-weight:720; line-height:1.35; }
+      .llm-chat-scroll .llm-md h1 { font-size:16px; } .llm-chat-scroll .llm-md h2 { font-size:15px; }
+      .llm-chat-scroll .llm-md h3 { font-size:13px; } .llm-chat-scroll .llm-md h4,
+      .llm-chat-scroll .llm-md h5,.llm-chat-scroll .llm-md h6 { font-size:12px; }
+      .llm-chat-scroll .llm-md ul,.llm-chat-scroll .llm-md ol { margin:0 0 8px; padding-left:19px; }
+      .llm-chat-scroll .llm-md li { margin:3px 0; }
+      .llm-chat-scroll .llm-md code { padding:1px 4px; border-radius:4px; background:#eef4f0; font:11px/1.5 "SFMono-Regular",Consolas,"Liberation Mono",monospace; }
+      .llm-chat-scroll .llm-md pre { margin:0 0 8px; padding:9px 11px; overflow-x:auto; border:1px solid #e2ece6;
+      border-radius:7px; background:#f6faf7; }
+      .llm-chat-scroll .llm-md pre code { padding:0; background:transparent; white-space:pre; }
+      .llm-chat-scroll .llm-md blockquote { margin:0 0 8px; padding:2px 0 2px 10px; border-left:3px solid #cfe0d6; color:#5c7468; }
+      .llm-chat-scroll .llm-md a { color:#2f795b; text-decoration:underline; text-underline-offset:2px; }
+      .llm-chat-scroll .llm-md hr { margin:10px 0; border:0; border-top:1px solid #e2ece6; }
+      .llm-chat-scroll .llm-md strong { color:#1f4232; font-weight:720; }
+      /* 「回到底部」：新回复到达时若用户正往上翻，不强行拽走视线。 */
+      .llm-chat-jump { position:absolute; right:16px; bottom:110px; display:grid; place-items:center; width:30px; height:30px;
+      padding:0; border:1px solid #cfe0d6; border-radius:50%; color:#2f795b; background:#fff; cursor:pointer;
+      box-shadow:0 6px 16px rgba(24,61,44,.16); pointer-events:auto; }
+      .llm-chat-jump[hidden] { display:none; }
+      .llm-chat-jump:hover { background:#f2faf4; }
+      .llm-chat-jump svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
       .llm-chat-scroll { display:flex; flex:1; flex-direction:column; gap:14px; padding:18px 15px; overflow-y:auto; background:#fcfefc; scrollbar-width:thin; scrollbar-color:#cadbd0 transparent; }
+      /* 类选择器上的 display 会压过 UA 的 [hidden]{display:none}（作者样式恒胜 UA 样式），
+         不显式兜底的话 hidden 形同虚设——切到历史视图时对话流会与列表同时显示。 */
+      .llm-chat-scroll[hidden],.llm-chat-compose[hidden] { display:none; }
+      /* 窗口内的历史视图：与对话流互斥显示，复用同一片区域。 */
+      .llm-chat-history { flex:1; min-height:0; padding:10px 12px 14px; overflow-y:auto; background:#fcfefc; scrollbar-width:thin; scrollbar-color:#cadbd0 transparent; }
+      .llm-chat-history[hidden] { display:none; }
+      .llm-chat-history-head { display:flex; align-items:center; justify-content:space-between; padding:4px 3px 9px; color:#506d5d; font-size:11px; font-weight:700; }
+      .llm-chat-history-count { color:#9aaa9f; font-size:10px; font-weight:500; }
+      .llm-chat-history-list { display:flex; flex-direction:column; gap:8px; }
+      .llm-chat-history-empty { display:flex; align-items:center; justify-content:center; min-height:200px; padding:20px; color:#91a199; text-align:center; font-size:10px; line-height:1.6; }
       .llm-message { display:flex; flex-direction:column; max-width:88%; gap:5px; }
       .llm-message.user { align-self:flex-end; align-items:flex-end; }
       .llm-message.assistant { align-self:flex-start; align-items:flex-start; }
       .llm-message-label { color:#91a198; font-size:9px; font-weight:650; }
       .llm-message-bubble { padding:10px 12px; border:1px solid #e0ebe4;
       border-radius:9px; color:#385448; background:#fff; font-size:12px; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
+      /* 助手气泡里是渲染后的 Markdown，块级元素自带间距，外层不再整体 pre-wrap。 */
+      .llm-message.assistant .llm-message-bubble { white-space:normal; }
       .llm-message.user .llm-message-bubble { border-color:#d3e9da; color:#244e39; background:#eaf7ee; border-bottom-right-radius:3px; }
       .llm-message.assistant .llm-message-bubble { border-bottom-left-radius:3px; }
       .llm-message.pending .llm-message-bubble { color:#82958a; }
@@ -400,8 +535,9 @@ export default defineContentScript({
       @keyframes quickfind-llm-dot { 0%,80%,100%{opacity:.35;transform:translateY(0)}40%{opacity:1;transform:translateY(-2px)} }
       @media (prefers-reduced-motion: reduce) { .quickfind-trigger, .quickfind-panel, .engine, .llm-rail,.llm-sidebar,.llm-history-card,.llm-chat-dialog { transition:none;
       animation:none; } .llm-status-dot.busy,.llm-typing i { animation:none; } }
+      /* 窄屏下窗口不再留边距——它本来就可拖可缩，不强行吸附到整屏。 */
       @media (max-width:600px) { .llm-sidebar { width:calc(100vw - 12px);
-      } .llm-chat-dialog { top:8px;right:8px;bottom:8px;width:calc(100vw - 16px); } .llm-history-wrap { padding-left:12px;padding-right:12px; } }
+      } .llm-chat-dialog { width:calc(100vw - 16px); } .llm-history-wrap { padding-left:12px;padding-right:12px; } }
     </style>
     <button class="quickfind-trigger" type="button" aria-label="使用搜索引擎搜索选中文字" aria-expanded="false" title="搜索选中文字">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
@@ -449,14 +585,18 @@ export default defineContentScript({
           <div class="outline-scroll"><div class="outline-list" role="tree" aria-label="大纲笔记"></div></div>
         </div>
       </aside>
-      <div class="llm-chat-layer" hidden>
-        <div class="llm-backdrop"></div>
-        <section class="llm-chat-dialog" role="dialog" aria-modal="true" aria-label="LLM 对话">
-          <header class="llm-chat-head"><button class="llm-chat-back" type="button" aria-label="返回聊天历史" title="返回聊天历史"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"></path></svg></button><span class="llm-chat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6.5 12 3l7 3.5v7L12 17l-7-3.5Z"></path><path d="m8.5 8.5 3.5 1.8 3.5-1.8M12 10.3V17"></path></svg></span><div class="llm-chat-head-copy"><div class="llm-chat-title">新对话</div><div class="llm-chat-subtitle">LLM 助手</div></div><button class="llm-chat-close" type="button" aria-label="关闭对话" title="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></header>
+      <!-- 无蒙版：容器只负责定位与层叠，窗口由 createLlmChatWindow 动态挂进来，可同时开多个。 -->
+      <div class="llm-chat-layer" hidden></div>
+      <template class="llm-chat-window-template">
+        <section class="llm-chat-dialog" role="dialog" aria-label="LLM 对话">
+          <header class="llm-chat-head"><button class="llm-chat-back" type="button" aria-label="返回对话" title="返回对话" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"></path></svg></button><span class="llm-chat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6.5 12 3l7 3.5v7L12 17l-7-3.5Z"></path><path d="m8.5 8.5 3.5 1.8 3.5-1.8M12 10.3V17"></path></svg></span><div class="llm-chat-head-copy"><div class="llm-chat-title">新对话</div><div class="llm-chat-subtitle">LLM 助手</div></div><button class="llm-chat-history-btn" type="button" aria-label="查看历史会话" title="历史会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path><path d="M12 7v5l3 2"></path></svg></button><button class="llm-chat-pin" type="button" aria-label="置顶窗口" aria-pressed="false" title="置顶窗口"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6l-1 6 3.5 3.5H5.5L9 10Z"></path><path d="M12 13.5V20"></path></svg></button><button class="llm-chat-close" type="button" aria-label="关闭对话" title="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></header>
           <div class="llm-chat-scroll" aria-live="polite"></div>
+          <div class="llm-chat-history" hidden><div class="llm-chat-history-head"><span>最近对话</span><span class="llm-chat-history-count"></span></div><div class="llm-chat-history-list"></div></div>
+          <button class="llm-chat-jump" type="button" aria-label="回到底部" title="回到底部" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"></path></svg></button>
           <form class="llm-chat-compose" novalidate><div class="llm-chat-footer-note">回答由你配置的模型生成</div><div class="llm-compose-box"><textarea class="llm-chat-input" rows="1" aria-label="继续提问" placeholder="继续追问…"></textarea><div class="llm-compose-bottom"><span class="llm-compose-hint">Enter 发送 · Shift+Enter 换行</span><button class="llm-send" type="submit" aria-label="发送消息" title="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8-3-8Z"></path><path d="M7 12h13"></path></svg></button></div></div></form>
+          <div class="llm-chat-resize" role="separator" aria-label="调整窗口大小" title="拖动调整大小"></div>
         </section>
-      </div>
+      </template>
     </div>
   `;
 
@@ -482,15 +622,7 @@ export default defineContentScript({
   const llmSidebarCompose = shadow.querySelector('.llm-compose');
   const llmSidebarInput = shadow.querySelector('.llm-sidebar-input');
   const llmChatLayer = shadow.querySelector('.llm-chat-layer');
-  const llmChatBackdrop = shadow.querySelector('.llm-backdrop');
-  const llmChatDialog = shadow.querySelector('.llm-chat-dialog');
-  const llmChatBack = shadow.querySelector('.llm-chat-back');
-  const llmChatClose = shadow.querySelector('.llm-chat-close');
-  const llmChatTitle = shadow.querySelector('.llm-chat-title');
-  const llmChatSubtitle = shadow.querySelector('.llm-chat-subtitle');
-  const llmChatScroll = shadow.querySelector('.llm-chat-scroll');
-  const llmChatCompose = shadow.querySelector('.llm-chat-compose');
-  const llmChatInput = shadow.querySelector('.llm-chat-input');
+  const llmChatWindowTemplate = shadow.querySelector('.llm-chat-window-template') as HTMLTemplateElement | null;
   const llmTabbar = shadow.querySelector('.llm-tabbar');
   const llmTitle = shadow.querySelector('.llm-title');
   const outlineSearchInput = shadow.querySelector('.outline-search-input');
@@ -628,6 +760,99 @@ export default defineContentScript({
     return text.length > limit ? `${text.slice(0, limit)}…` : text;
   }
 
+  /**
+   * 删掉一段会话。
+   *
+   * 存储里去掉之后，正开着这段会话的窗口也要一起关掉——否则窗口里留下的是一份
+   * 已经不在列表里的会话，用户再发一条消息又会把它写回去，「删了又回来」。
+   * 几何记忆也一并清掉，不然下次开一段新会话若撞上同一个 id 会继承旧位置。
+   */
+  function deleteLlmConversation(conversationId: any) {
+    const id = String(conversationId || '');
+    if (!id) return;
+    // 用带类型的局部视图操作会话列表：模块级的 llmConversations 是隐式 any，
+    // 每引用一次就记一个类型错误（见 README 的记账口径），所以只碰一次。
+    const list: any[] = llmConversations;
+    const at = list.findIndex((item: any) => String(item?.id) === id);
+    if (at < 0) return;
+    list.splice(at, 1);
+    // 历史列表靠内容指纹跳过无变化的重建，删除后必须让它重算。
+    llmHistorySignature = '';
+    // 先关窗口（closeLlmChatWindow 会把当前几何写回存储），再删几何记忆——
+    // 顺序反了的话，关窗口那一步会把刚删掉的条目又写回来。
+    llmChatWindows.slice().forEach((win) => { if (String(win.conversation?.id) === id) closeLlmChatWindow(win); });
+    const table = readLlmWindowGeometry();
+    if (table[id]) { delete table[id]; persistLlmWindowGeometry(); }
+    writeLlmConversations();
+    renderLlmHistory();
+    llmChatWindows.forEach((win) => { if (win.state === 'history') renderLlmChatHistory(win); });
+  }
+
+  /**
+   * 建一张历史会话卡片，侧栏与窗口内的历史视图共用。
+   *
+   * 卡片本体是 div[role=button] 而不是 button：里面要放删除按钮，而 button 不能嵌套
+   * button——浏览器会把内层拆到外面，删除按钮就点不到了。键盘语义用 keydown 手写。
+   */
+  function createLlmHistoryCard(conversation: any, onOpen: () => void) {
+    const card = document.createElement('div');
+    card.className = 'llm-history-card';
+    card.dataset.conversationId = conversation.id;
+    card.setAttribute('role', 'button');
+    card.tabIndex = 0;
+    const body = document.createElement('div');
+    body.className = 'llm-card-body';
+    const title = document.createElement('strong');
+    title.className = 'llm-card-title';
+    title.textContent = shortenLlmText(firstMessage(conversation, 'user'), 72) || '未命名对话';
+    const preview = document.createElement('span');
+    preview.className = 'llm-card-preview';
+    preview.textContent = shortenLlmText(markdownToPlainText(firstMessage(conversation, 'assistant')), 118) || '等待 LLM 回复…';
+    const meta = document.createElement('span');
+    meta.className = 'llm-card-meta';
+    const count = conversation.messages.filter((message) => message.role === 'user').length;
+    meta.textContent = `${formatLlmTime(conversation.updatedAt)}  ·  ${count} 次提问`;
+    body.append(title, preview, meta);
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'llm-card-delete';
+    const DELETE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"></path></svg>';
+    del.innerHTML = DELETE_ICON;
+    del.setAttribute('aria-label', '删除这段对话');
+    del.setAttribute('title', '删除这段对话');
+    // 删除走两步：第一下只「上膛」并换成「确认删除」，再点一下才真删。
+    // 点击不能让卡片收到（否则会顺手打开这段对话），所以这里都要拦住传播。
+    let armed = false;
+    const disarm = () => {
+      armed = false;
+      del.classList.remove('is-armed');
+      del.innerHTML = DELETE_ICON;
+      del.setAttribute('aria-label', '删除这段对话');
+      del.setAttribute('title', '删除这段对话');
+    };
+    del.addEventListener('click', (event) => {
+      event.stopPropagation();
+      if (!armed) {
+        armed = true;
+        del.classList.add('is-armed');
+        del.textContent = '确认删除';
+        del.setAttribute('aria-label', '确认删除这段对话');
+        return;
+      }
+      deleteLlmConversation(conversation.id);
+    });
+    // 指针离开卡片就撤掉「已上膛」：避免用户改主意后又无意点到。
+    del.addEventListener('pointerleave', () => { if (armed) disarm(); });
+    del.addEventListener('keydown', (event) => { if (event.key === 'Escape' && armed) { event.stopPropagation(); disarm(); } });
+    card.append(body, del);
+    card.addEventListener('click', () => onOpen());
+    card.addEventListener('keydown', (event) => {
+      if (event.target !== card) return;
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpen(); }
+    });
+    return card;
+  }
+
   function renderLlmHistory() {
     if (!llmHistoryList) return;
     const conversations = llmConversations.slice().sort((a, b) => b.updatedAt - a.updatedAt);
@@ -640,23 +865,7 @@ export default defineContentScript({
     if (llmHistoryCount) llmHistoryCount.textContent = conversations.length ? `${conversations.length} 条` : '';
     if (llmHistoryEmpty) llmHistoryEmpty.hidden = conversations.length > 0;
     conversations.forEach((conversation) => {
-      const card = document.createElement('button');
-      card.type = 'button';
-      card.className = 'llm-history-card';
-      card.dataset.conversationId = conversation.id;
-      const title = document.createElement('strong');
-      title.className = 'llm-card-title';
-      title.textContent = shortenLlmText(firstMessage(conversation, 'user'), 72) || '未命名对话';
-      const preview = document.createElement('span');
-      preview.className = 'llm-card-preview';
-      preview.textContent = shortenLlmText(firstMessage(conversation, 'assistant'), 118) || '等待 LLM 回复…';
-      const meta = document.createElement('span');
-      meta.className = 'llm-card-meta';
-      const count = conversation.messages.filter((message) => message.role === 'user').length;
-      meta.textContent = `${formatLlmTime(conversation.updatedAt)}  ·  ${count} 次提问`;
-      card.append(title, preview, meta);
-      card.addEventListener('click', () => openLlmConversation(conversation));
-      llmHistoryList.append(card);
+      llmHistoryList.append(createLlmHistoryCard(conversation, () => openLlmConversation(conversation)));
     });
   }
 
@@ -668,20 +877,68 @@ export default defineContentScript({
     input.style.overflowY = (input.scrollHeight || 0) > maxHeight ? 'auto' : 'hidden';
   }
 
-  /** 右侧「随心问」面板的显示开关（选项页可配置）。隐藏时顺手收起，避免留下半开状态。 */
-  function setLlmDockVisible(visible) {
-    const next = visible !== false;
-    settings.llmDockVisible = next;
-    if (llmDock) llmDock.hidden = !next;
-    if (!next) setLlmDockOpen(false);
+  /**
+   * 宿主显隐的唯一出口。
+   *
+   * 「问 ai」的对话层与右侧栏共用同一个宿主：选项页关掉「随心问」面板时，侧栏与滑杆不该出现，
+   * 但对话面板仍要能显示。所以宿主是否可见 = 侧栏可用 **或** 对话层正开着，
+   * 两者都不成立时才把整层隐藏。chat-only 类负责压掉滑杆与侧栏。
+   */
+  function syncLlmDockHostVisibility() {
+    // 用带类型的局部视图读 DOM：模块级的 querySelector 结果是 Element，
+    // 直接读 .hidden 每引用一次就记一个类型错误（见 README 的记账口径）。
+    const dock = llmDock as HTMLElement | null;
+    if (!dock) return;
+    const sidebarAvailable = settings.llmDockVisible !== false;
+    const chatOpen = llmChatWindows.length > 0;
+    dock.classList.toggle('is-chat-only', !sidebarAvailable);
+    dock.hidden = !(sidebarAvailable || chatOpen);
   }
 
-  function setLlmDockOpen(open) {
+  /** 还占着宿主的浮层：右侧栏或任一对话窗口。收起路径用它判断能否把宿主撤出 top layer。 */
+  function llmOverlayInUse(): boolean {
+    return llmDockOpen || llmChatWindows.length > 0;
+  }
+
+  /**
+   * 没有任何浮层再用主宿主时，把它撤出 top layer。
+   *
+   * 必须成对：宿主一旦留在 top layer 就是一个透明的整屏层，会挡住页面自己的弹窗与控件，
+   * 而这种缺陷在正常截图里看不出来（见 tests/verify-top-layer.cjs）。
+   * 「问 ai」把对话层放进了主宿主，于是收起对话层后要在这里补上收回动作。
+   */
+  function demoteHostIfIdle() {
+    const triggerEl = trigger as HTMLElement | null;
+    if (llmOverlayInUse()) return;
+    if (panelOpen || triggerEl?.classList.contains('visible')) return;
+    demoteFromTopLayer(host);
+  }
+
+  /** 右侧「随心问」面板的显示开关（选项页可配置）。隐藏时顺手收起，避免留下半开状态。 */
+  function setLlmDockVisible(visible: unknown) {
+    const next = visible !== false;
+    settings.llmDockVisible = next;
+    if (!next) setLlmDockOpen(false);
+    syncLlmDockHostVisibility();
+  }
+
+  /**
+   * 打开/收起右侧面板。
+   *
+   * pinned 为真表示这次是用户主动点开的——面板将持续显示，直到用户再点一次、
+   * 按关闭按钮、或从选项页关掉开关。指针离开不再自动收起它：收起路径里那套
+   * 「鼠标移开就收」是为旧的划过展开设计的，用在点击展开上会变成「刚点开就消失」。
+   */
+  function setLlmDockOpen(open: boolean, options: { pinned?: boolean } = {}) {
     if (!llmDock) return;
-    if (open && settings.llmDockVisible === false) return;
+    // 侧栏不可用时不允许展开侧栏。但对话窗口（showLlmChatLayer）与侧栏共用一个宿主，
+    // 它的显示不受「随心问」开关约束——「问 ai」在关掉侧栏的配置下依然要能弹出来。
+    if (open && settings.llmDockVisible === false && !llmChatWindows.length) return;
     if (llmCloseTimer) window.clearTimeout(llmCloseTimer);
     llmCloseTimer = null;
     const nextOpen = Boolean(open);
+    if (!nextOpen) llmDockPinnedOpen = false;
+    else if (options.pinned) llmDockPinnedOpen = true;
     // 只有状态真正发生变化时才刷新内容/抢焦点，否则 focusin、pointerenter 这类
     // 高频事件会在用户按下卡片时重建列表，导致 click 事件丢失。
     const justOpened = nextOpen && !llmDockOpen;
@@ -699,11 +956,13 @@ export default defineContentScript({
       return;
     }
     renderLlmHistory();
-    if (justOpened) window.requestAnimationFrame(() => { if (!llmChatLayer || llmChatLayer.hidden) llmSidebarInput?.focus({ preventScroll: true }); });
+    if (justOpened) window.requestAnimationFrame(() => { if (!llmChatWindows.length) llmSidebarInput?.focus({ preventScroll: true }); });
   }
 
   function scheduleLlmDockClose() {
-    if (llmChatLayer && !llmChatLayer.hidden) return;
+    if (llmChatWindows.length) return;
+    // 用户点开的：不自动收。保留自动收只对「程序化打开」这种临时展示有意义。
+    if (llmDockPinnedOpen) return;
     if (llmCloseTimer) window.clearTimeout(llmCloseTimer);
     llmCloseTimer = window.setTimeout(() => {
       llmCloseTimer = null;
@@ -715,10 +974,227 @@ export default defineContentScript({
     }, 260);
   }
 
-  function renderLlmChat() {
-    if (!llmChatScroll || !llmActiveConversation) return;
-    llmChatScroll.replaceChildren();
-    llmActiveConversation.messages.forEach((message) => {
+  /**
+   * 对话窗口的几何记忆：位置、大小、置顶随会话 id 落在本地存储里，跨刷新恢复。
+   *
+   * 用 local 而不是 sync：窗口位置是「这台设备这块屏」的属性，同步到别的设备上反而错位。
+   * 存储坏了就当作没有记忆，退回默认布局，不让它影响窗口能否打开。
+   */
+  let llmWindowGeometry: Record<string, { left?: number; top?: number; width?: number; height?: number; pinned?: boolean }> | null = null;
+  /** 几何读盘的进度。窗口是同步建的，而读存储是异步的——见 ensureLlmWindowGeometry 的兜底。 */
+  let llmGeometryReady: Promise<void> | null = null;
+
+  /**
+   * 保证几何表已从存储读出，返回它的 Promise。
+   *
+   * 读盘必须在**建窗口之前**完成，否则第一个窗口会拿到空表、落到默认位置，
+   * 用户看到的「位置没记住」就是这么来的。这里既做一次性加载，也在加载完成时
+   * 回头把已建好的窗口重新摆正——调用方不必自己 await。
+   */
+  function ensureLlmWindowGeometry(): Promise<void> {
+    if (llmGeometryReady) return llmGeometryReady;
+    llmGeometryReady = new Promise<void>((resolve) => {
+      const settle = (value: unknown) => {
+        llmWindowGeometry = value && typeof value === 'object' ? (value as Record<string, any>) : {};
+        // 加载晚于建窗口时，把已有窗口按记忆重新摆好。
+        llmChatWindows.forEach((win) => applyLlmWindowGeometry(win));
+        resolve();
+      };
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+          chrome.storage.local.get(LLM_WINDOW_GEOMETRY_KEY, (stored) => settle(stored?.[LLM_WINDOW_GEOMETRY_KEY]));
+          return;
+        }
+        const raw = localStorage.getItem(LLM_WINDOW_GEOMETRY_KEY);
+        settle(raw ? JSON.parse(raw) : null);
+      } catch { settle(null); }
+    });
+    return llmGeometryReady;
+  }
+
+  function readLlmWindowGeometry(): Record<string, any> {
+    return (llmWindowGeometry || {}) as Record<string, any>;
+  }
+
+  function persistLlmWindowGeometry(): void {
+    const payload = llmWindowGeometry || {};
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage?.local?.set) { chrome.storage.local.set({ [LLM_WINDOW_GEOMETRY_KEY]: payload }); return; }
+      localStorage.setItem(LLM_WINDOW_GEOMETRY_KEY, JSON.stringify(payload));
+    } catch { /* 存不下就算了，几何只是便利，不是功能 */ }
+  }
+
+  /** 按记忆摆正一个窗口（位置、大小、置顶）。没有会话记忆时只继承全局尺寸，位置保持现状。 */
+  function applyLlmWindowGeometry(win) {
+    const root = win?.root as HTMLElement | null;
+    if (!root || !win.geometryKey) return;
+    const table = readLlmWindowGeometry();
+    const saved = table[win.geometryKey];
+    // 尺寸回落顺序：本会话记忆 → 全局上次尺寸。「问 ai」每次都是新会话，没有全局那份就永远
+    // 回落到默认值，用户拖好的大小每次都白费。
+    const size = saved || table[LLM_WINDOW_SIZE_KEY];
+    if (Number.isFinite(size?.width)) root.style.width = `${size.width}px`;
+    if (Number.isFinite(size?.height)) root.style.height = `${size.height}px`;
+    // 位置只认会话记忆：全局那份不含位置，缺了就用当前（默认错开的）落点。
+    if (Number.isFinite(saved?.left)) root.style.left = `${saved.left}px`;
+    if (Number.isFinite(saved?.top)) root.style.top = `${saved.top}px`;
+    if (typeof saved?.pinned === 'boolean') setLlmWindowPinned(win, saved.pinned);
+    clampLlmWindowRect(root);
+  }
+
+  /** 记住某个窗口的当前几何。关闭与拖动/缩放结束时各调一次。 */
+  function rememberLlmWindowGeometry(win) {
+    const root = win?.root as HTMLElement | null;
+    if (!root || !win.geometryKey) return;
+    const table = readLlmWindowGeometry();
+    const rect = {
+      left: Math.round(root.offsetLeft),
+      top: Math.round(root.offsetTop),
+      width: Math.round(root.offsetWidth),
+      height: Math.round(root.offsetHeight),
+      pinned: Boolean(win.pinned)
+    };
+    // 尺寸每次都额外记一份全局的：新会话按自己的键取不到记忆时靠它继承。
+    table[LLM_WINDOW_SIZE_KEY] = { width: rect.width, height: rect.height };
+    // draft 键的生命周期只有「开了窗口、还没发出第一条消息」这一段，下一次开窗又是新键。
+    // 以它为键记账永远命中不到，只会让存储无界增长——尺寸已由上面那份全局记忆兜住。
+    if (!String(win.geometryKey).startsWith('draft-')) table[win.geometryKey] = rect;
+    persistLlmWindowGeometry();
+  }
+
+  /** 默认落点：靠右往下逐级错开，避免多个窗口完全重叠。 */
+  function defaultLlmWindowRect() {
+    const width = Math.min(420, Math.max(280, window.innerWidth - 32));
+    const height = Math.min(560, Math.max(240, window.innerHeight - 32));
+    const step = (llmWindowCascade % 5) * 26;
+    llmWindowCascade += 1;
+    const left = Math.max(12, window.innerWidth - width - 16 - step);
+    const top = Math.max(12, 16 + step);
+    return { left, top, width, height };
+  }
+
+  /**
+   * 把窗口夹回可抓取的范围内，并返回是否移动过。
+   *
+   * 规则要**一致**（此前 961 行允许挂到屏外、964 行又立刻禁止，自相矛盾）：
+   * 横向至少留 80px 在视口内，纵向保证标题栏（拖动把手）完整可见——否则窗口没法再被拖回来。
+   *
+   * 关键：拖动过程中**每帧**都要调用它，不能只在松手时调。只在松手时夹会让「拖到边界外」
+   * 变成「松手瞬间被拽回来」，用户看到的就是一次突兀的跳变，正是「一闪」的来源之一。
+   */
+  function clampLlmWindowRect(root: HTMLElement) {
+    const headHeight = 61; // .llm-chat-head 的 min-height，标题栏必须留在视口里才抓得住
+    const margin = 8;
+    const width = Math.max(280, Math.min(root.offsetWidth, window.innerWidth - margin * 2));
+    const height = Math.max(240, Math.min(root.offsetHeight, window.innerHeight - margin * 2));
+    const minLeft = -(width - 80);
+    const maxLeft = Math.max(minLeft, window.innerWidth - 80);
+    const maxTop = Math.max(0, window.innerHeight - headHeight);
+    const left = Math.max(minLeft, Math.min(root.offsetLeft, maxLeft));
+    const top = Math.max(0, Math.min(root.offsetTop, maxTop));
+    const nextLeft = Math.round(left);
+    const nextTop = Math.round(top);
+    const nextWidth = Math.round(width);
+    const nextHeight = Math.round(height);
+    const changed = root.offsetLeft !== nextLeft || root.offsetTop !== nextTop
+      || root.offsetWidth !== nextWidth || root.offsetHeight !== nextHeight;
+    root.style.left = `${nextLeft}px`;
+    root.style.top = `${nextTop}px`;
+    root.style.width = `${nextWidth}px`;
+    root.style.height = `${nextHeight}px`;
+    return changed;
+  }
+
+  /** 抬到同层最前。置顶窗口另占更高的层级段，普通窗口之间按打开顺序递增。 */
+  let llmWindowZ = 0;
+  function raiseLlmChatWindow(win) {
+    if (!win?.root) return;
+    llmWindowZ += 1;
+    const root = win.root as HTMLElement;
+    root.style.zIndex = String((win.pinned ? 1000 : 0) + llmWindowZ);
+  }
+
+  /** 设置置顶状态：类名、ARIA 与层级一起改，别只改其中一个（否则界面与行为会对不上）。 */
+  function setLlmWindowPinned(win, pinned) {
+    const root = win?.root as HTMLElement | null;
+    if (!root) return;
+    win.pinned = Boolean(pinned);
+    root.classList.toggle('is-pinned', Boolean(win.pinned));
+    win.pin?.setAttribute('aria-pressed', String(Boolean(win.pinned)));
+    win.pin?.classList.toggle('is-active', Boolean(win.pinned));
+    raiseLlmChatWindow(win);
+  }
+
+  /**
+   * 拖动（整个标题栏，按钮除外）与缩放（右下角抓手）。
+   *
+   * 指针逻辑挂在 window 上并用 setPointerCapture：窗口在拖动过程中可能因为重排离开原位，
+   * 只在元素上监听会丢事件。拖动期间加 `is-dragging` 关掉过渡，避免与位移打架。
+   *
+   * 三个防闪烁要点：
+   *   1. **写入按帧合并**：pointermove 在部分设备上比屏幕刷新率密得多，每个事件都写一次
+   *      style 会造成一帧内多次布局，视觉上就是抖。这里只记最新目标值，由 rAF 每帧落一次盘。
+   *   2. **每帧夹边界**：不能只在松手时夹，否则「拖到边界外再松手」会突然被拽回来（一次跳变）。
+   *   3. **松手不再写位置**：夹边界已在帧内做完，finish 只做状态收尾；重复写还是老值。 */
+  function attachLlmWindowDrag(win, handle: HTMLElement, mode: 'move' | 'resize') {
+    handle.addEventListener('pointerdown', (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      // 标题栏上的按钮不参与拖动：那是点击目标，不是抓手。
+      if (mode === 'move' && (event.target as Element | null)?.closest?.('button')) return;
+      const root = win.root as HTMLElement | null;
+      if (!root) return;
+      event.preventDefault();
+      raiseLlmChatWindow(win);
+      root.classList.add(mode === 'move' ? 'is-dragging' : 'is-resizing');
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startRect = { left: root.offsetLeft, top: root.offsetTop, width: root.offsetWidth, height: root.offsetHeight };
+      try { handle.setPointerCapture(event.pointerId); } catch { /* 捕获失败也照常走 window 监听 */ }
+      // 目标几何（未夹边界前的原始意图）。rAF 拿到它之后夹边界并落盘。
+      let target = { left: startRect.left, top: startRect.top, width: startRect.width, height: startRect.height };
+      let dirty = false;
+      let frame = 0;
+      const flush = () => {
+        frame = 0;
+        if (!dirty) return;
+        dirty = false;
+        if (mode === 'move') { root.style.left = `${target.left}px`; root.style.top = `${target.top}px`; }
+        else { root.style.width = `${target.width}px`; root.style.height = `${target.height}px`; }
+        clampLlmWindowRect(root);
+      };
+      const schedule = () => { if (!frame) frame = window.requestAnimationFrame(flush); };
+      const onMove = (moveEvent: PointerEvent) => {
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+        if (mode === 'move') target = { ...target, left: startRect.left + dx, top: startRect.top + dy };
+        else target = { ...target, width: Math.max(280, startRect.width + dx), height: Math.max(240, startRect.height + dy) };
+        dirty = true;
+        schedule();
+      };
+      const finish = () => {
+        window.removeEventListener('pointermove', onMove, true);
+        window.removeEventListener('pointerup', finish, true);
+        window.removeEventListener('pointercancel', finish, true);
+        if (frame) window.cancelAnimationFrame(frame);
+        flush(); // 收尾落一次盘；夹边界已在 flush 内完成，这里不再单独夹，避免二次跳变
+        root.classList.remove('is-dragging', 'is-resizing');
+        rememberLlmWindowGeometry(win);
+      };
+      window.addEventListener('pointermove', onMove, true);
+      window.addEventListener('pointerup', finish, true);
+      window.addEventListener('pointercancel', finish, true);
+    });
+  }
+
+  /** 在窗口区域里渲染对话流（Markdown）。用户消息保持纯文本，助手回复按 Markdown 排版。 */
+  function renderLlmChatWindow(win) {
+    const scroll = win?.scroll as HTMLElement | null;
+    if (!scroll) return;
+    // 气泡重建前先记位置：用户在往上翻时不该被新回复拽回底部。
+    const nearBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 48;
+    scroll.replaceChildren();
+    const messages = win.conversation?.messages || [];
+    messages.forEach((message) => {
       const row = document.createElement('div');
       row.className = `llm-message ${message.role}`;
       const label = document.createElement('span');
@@ -726,11 +1202,19 @@ export default defineContentScript({
       label.textContent = message.role === 'user' ? '你' : 'LLM';
       const bubble = document.createElement('div');
       bubble.className = 'llm-message-bubble';
-      bubble.textContent = message.content;
+      if (message.role === 'user') {
+        bubble.textContent = message.content;
+      } else {
+        // 助手回复渲染 Markdown。渲染器只输出自己产生的标签（见 shared/markdown.ts 的安全边界）。
+        const body = document.createElement('div');
+        body.className = 'llm-md';
+        body.innerHTML = renderMarkdown(message.content);
+        bubble.append(body);
+      }
       row.append(label, bubble);
-      llmChatScroll.append(row);
+      scroll.append(row);
     });
-    if (llmRequestInFlight) {
+    if (win.requestInFlight) {
       const row = document.createElement('div');
       row.className = 'llm-message assistant pending';
       const label = document.createElement('span');
@@ -740,49 +1224,249 @@ export default defineContentScript({
       bubble.className = 'llm-message-bubble';
       bubble.innerHTML = '<span class="llm-typing" aria-label="正在生成回复"><i></i><i></i><i></i></span>';
       row.append(label, bubble);
-      llmChatScroll.append(row);
+      scroll.append(row);
     }
-    window.requestAnimationFrame(() => { llmChatScroll.scrollTop = llmChatScroll.scrollHeight; });
+    updateLlmChatJump(win);
+    if (nearBottom) window.requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
+  }
+
+  /** 「回到底部」按钮的显隐：只在用户往上翻、且内容确实超出可视区时出现。 */
+  function updateLlmChatJump(win) {
+    const scroll = win?.scroll as HTMLElement | null;
+    const jump = win?.jump as HTMLElement | null;
+    if (!scroll || !jump) return;
+    if (win.state !== 'chat') { jump.hidden = true; return; }
+    const distance = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight;
+    jump.hidden = distance < 48 || scroll.scrollHeight <= scroll.clientHeight;
+  }
+
+  /** 窗口内的历史会话视图：列出全部会话，点一条在当前窗口打开。 */
+  function renderLlmChatHistory(win) {
+    const list = win?.historyList as HTMLElement | null;
+    if (!list) return;
+    const conversations = llmConversations.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+    const count = win.historyCount as HTMLElement | null;
+    if (count) count.textContent = conversations.length ? `${conversations.length} 条` : '';
+    list.replaceChildren();
+    if (!conversations.length) {
+      const empty = document.createElement('div');
+      empty.className = 'llm-chat-history-empty';
+      empty.textContent = '还没有历史对话。提一个问题，它会出现在这里。';
+      list.append(empty);
+      return;
+    }
+    conversations.forEach((conversation) => {
+      list.append(createLlmHistoryCard(conversation, () => openLlmConversation(conversation, win)));
+    });
+  }
+
+  /** 切换窗口的「对话 / 历史」两个视图。 */
+  function setLlmChatWindowState(win, state) {
+    win.state = state === 'history' ? 'history' : 'chat';
+    const inHistory = win.state === 'history';
+    const chat = win.root?.querySelector('.llm-chat-scroll') as HTMLElement | null;
+    const history = win.root?.querySelector('.llm-chat-history') as HTMLElement | null;
+    const compose = win.root?.querySelector('.llm-chat-compose') as HTMLElement | null;
+    if (chat) chat.hidden = inHistory;
+    if (history) history.hidden = !inHistory;
+    // 历史视图里不发送消息，输入区一并收起，避免「看不到对话却能提问」的错位。
+    if (compose) compose.hidden = inHistory;
+    // 返回键只在历史视图里出现（它是「从历史退回对话」，不是「进入历史」）。
+    // 进入历史由独立的 .llm-chat-history-btn 负责，按钮高亮表示当前正处在历史里。
+    if (win.back) win.back.hidden = !inHistory;
+    if (win.historyButton) win.historyButton.classList.toggle('is-active', inHistory);
+    if (win.title) win.title.textContent = inHistory ? '历史对话' : (shortenLlmText(firstMessage(win.conversation, 'user'), 42) || '新对话');
+    if (inHistory) renderLlmChatHistory(win);
+    updateLlmChatJump(win);
+  }
+
+  /** 让某个窗口独占焦点语义：其它窗口的输入框失焦，避免回车发到看不见的窗口里。 */
+  function focusLlmChatWindow(win) {
+    if (!win) return;
+    raiseLlmChatWindow(win);
+    if (win.state === 'history') return;
+    window.requestAnimationFrame(() => (win.input as HTMLTextAreaElement | null)?.focus({ preventScroll: true }));
+  }
+
+  /** 用模板建一个对话窗口并挂进层里。conversation 为空表示开一段新对话。 */
+  function createLlmChatWindow(conversation) {
+    const template = llmChatWindowTemplate;
+    const layer = llmChatLayer as HTMLElement | null;
+    if (!template || !layer) return null;
+    const root = (template.content.cloneNode(true) as DocumentFragment).firstElementChild as HTMLElement | null;
+    if (!root) return null;
+    const win: any = {
+      root,
+      conversation: conversation || null,
+      // 几何记忆按会话 id 存；新对话还没 id 时给个临时键，落库后再顶上。
+      geometryKey: conversation?.id || `draft-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      requestInFlight: false,
+      state: 'chat',
+      pinned: false,
+      scroll: root.querySelector('.llm-chat-scroll'),
+      historyList: root.querySelector('.llm-chat-history-list'),
+      historyCount: root.querySelector('.llm-chat-history-count'),
+      input: root.querySelector('.llm-chat-input'),
+      compose: root.querySelector('.llm-chat-compose'),
+      title: root.querySelector('.llm-chat-title'),
+      subtitle: root.querySelector('.llm-chat-subtitle'),
+      back: root.querySelector('.llm-chat-back'),
+      historyButton: root.querySelector('.llm-chat-history-btn'),
+      pin: root.querySelector('.llm-chat-pin'),
+      jump: root.querySelector('.llm-chat-jump')
+    };
+    // 几何：有会话记忆就恢复，没有就继承全局上次尺寸，再没有才用默认错开位置。
+    // 底色是默认布局；真正的记忆由 applyLlmWindowGeometry 在几何表就绪后套上
+    // （读盘是异步的，第一个窗口很可能在它之前就建好了）。
+    const geoTable = readLlmWindowGeometry();
+    const saved = geoTable[win.geometryKey];
+    const savedSize = saved || geoTable[LLM_WINDOW_SIZE_KEY];
+    const rect = defaultLlmWindowRect();
+    root.style.left = `${Number.isFinite(saved?.left) ? saved.left : rect.left}px`;
+    root.style.top = `${Number.isFinite(saved?.top) ? saved.top : rect.top}px`;
+    root.style.width = `${Number.isFinite(savedSize?.width) ? savedSize.width : rect.width}px`;
+    root.style.height = `${Number.isFinite(savedSize?.height) ? savedSize.height : rect.height}px`;
+    win.pinned = Boolean(saved?.pinned);
+    root.classList.toggle('is-pinned', Boolean(win.pinned));
+    win.pin?.setAttribute('aria-pressed', String(Boolean(win.pinned)));
+    win.pin?.classList.toggle('is-active', Boolean(win.pinned));
+    layer.append(root);
+    // 量之前必须让层可见。`hidden` 的容器里 offsetWidth/offsetLeft 恒为 0，
+    // 几何会被算成「0×0 放在左上角」，窗口于是缩到最小值并贴到 (0,0)。
+    layer.hidden = false;
+    layer.setAttribute('aria-hidden', 'false');
+    clampLlmWindowRect(root);
+    raiseLlmChatWindow(win);
+    // 入场动画只放一次：加 .is-entering，动画结束就摘掉。摘掉后这个类不再回来，
+    // 于是拖动等后续的类增删不会再触发重放（见 CSS 里 .is-entering 的说明）。
+    root.classList.add('is-entering');
+    root.addEventListener('animationend', (event) => {
+      if (event.animationName === 'quickfind-llm-rise') root.classList.remove('is-entering');
+    });
+    // 读到几何记忆后回头摆正这个窗口（含置顶）。已经在建前读到就直接命中了。
+    void ensureLlmWindowGeometry().then(() => applyLlmWindowGeometry(win));
+
+    attachLlmWindowDrag(win, root.querySelector('.llm-chat-head') as HTMLElement, 'move');
+    attachLlmWindowDrag(win, root.querySelector('.llm-chat-resize') as HTMLElement, 'resize');
+    win.pin?.addEventListener('click', () => {
+      setLlmWindowPinned(win, !win.pinned);
+      rememberLlmWindowGeometry(win);
+    });
+    // 返回键：从历史退回对话。历史入口是独立的按钮（可来回切换）。
+    win.back?.addEventListener('click', () => setLlmChatWindowState(win, 'chat'));
+    win.historyButton?.addEventListener('click', () => setLlmChatWindowState(win, win.state === 'history' ? 'chat' : 'history'));
+    root.querySelector('.llm-chat-close')?.addEventListener('click', () => closeLlmChatWindow(win));
+    win.compose?.addEventListener('submit', (event) => { event.preventDefault(); void sendLlmMessageInWindow(win, win.input?.value); });
+    win.input?.addEventListener('input', () => resizeLlmTextarea(win.input));
+    win.input?.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+      event.preventDefault();
+      void sendLlmMessageInWindow(win, win.input?.value);
+    });
+    resizeLlmTextarea(win.input);
+    win.scroll?.addEventListener('scroll', () => updateLlmChatJump(win), { passive: true });
+    win.jump?.addEventListener('click', () => {
+      const scroll = win.scroll as HTMLElement | null;
+      if (scroll) scroll.scrollTop = scroll.scrollHeight;
+      updateLlmChatJump(win);
+    });
+    root.addEventListener('pointerdown', () => raiseLlmChatWindow(win), true);
+
+    llmChatWindows.push(win);
+    syncLlmChatWindowChrome(win);
+    renderLlmChatWindow(win);
+    return win;
+  }
+
+  /** 顶部标题与副标题随会话内容刷新。 */
+  function syncLlmChatWindowChrome(win) {
+    if (!win) return;
+    if (win.title && win.state !== 'history') win.title.textContent = shortenLlmText(firstMessage(win.conversation, 'user'), 42) || '新对话';
+    if (win.subtitle) win.subtitle.textContent = `${normalizeLlmConfig(settings?.llm).model || 'LLM'} · 对话中`;
+  }
+
+  /** 关一个窗口。关掉最后一个时，整层与宿主一并收干净（含 top layer）。 */
+  function closeLlmChatWindow(win) {
+    const index = llmChatWindows.indexOf(win);
+    if (index < 0) return;
+    rememberLlmWindowGeometry(win);
+    llmChatWindows.splice(index, 1);
+    (win.root as HTMLElement | null)?.remove();
+    syncLlmChatLayer();
+    renderLlmHistory();
+  }
+
+  /** 层与宿主的显隐：还有窗口就显示，一个都不剩就收起宿主并收回 top layer。 */
+  function syncLlmChatLayer() {
+    const layer = llmChatLayer as HTMLElement | null;
+    const open = llmChatWindows.length > 0;
+    if (layer) {
+      layer.hidden = !open;
+      layer.setAttribute('aria-hidden', String(!open));
+    }
+    if (!open && settings.llmDockVisible === false) setLlmDockOpen(false);
+    syncLlmDockHostVisibility();
+    demoteHostIfIdle();
   }
 
   function showLlmChatLayer() {
-    if (!llmChatLayer) return;
-    setLlmDockOpen(true);
-    llmChatLayer.hidden = false;
-    llmChatLayer.setAttribute('aria-hidden', 'false');
-    renderLlmChat();
+    const layer = llmChatLayer as HTMLElement | null;
+    if (!layer) return;
+    // 先置层可见再展开宿主：setLlmDockOpen 的「侧栏不可用」闸门认这个状态，
+    // 否则在关掉「随心问」的配置下，「问 ai」会被自己的守卫挡回去。
+    layer.hidden = false;
+    layer.setAttribute('aria-hidden', 'false');
+    // 对话窗口是独立面板，**不把右侧栏一起拉出来**：侧栏展开后会占住右边缘
+    // （宽 392px 的整高面板），既抢视线，又会吞掉「点窗口外面」的那一下——窗口再也关不掉。
+    // 只在「窗口确实要用宿主」这个意义上让宿主可见，侧栏自己的显隐交给开关与滑杆。
+    syncLlmDockHostVisibility();
+    // 窗口在主宿主里，而页面可能有 z-index 拉满的埋点层压在上面，靠 top layer 才稳。
+    promoteToTopLayer(host);
   }
 
+  /** 收起全部对话窗口（Esc、或从侧栏进入大纲时用）。 */
   function hideLlmChatLayer() {
-    if (!llmChatLayer) return;
-    llmChatLayer.hidden = true;
-    llmChatLayer.setAttribute('aria-hidden', 'true');
-    llmChatInput.value = '';
-    resizeLlmTextarea(llmChatInput);
-    if (llmRequestInFlight) return;
-    window.requestAnimationFrame(() => llmSidebarInput?.focus({ preventScroll: true }));
+    llmChatWindows.slice().forEach((win) => closeLlmChatWindow(win));
+    syncLlmChatLayer();
+    if (settings.llmDockVisible === false) return;
+    window.requestAnimationFrame(() => (llmSidebarInput as HTMLTextAreaElement | null)?.focus({ preventScroll: true }));
   }
 
-  function openLlmConversation(conversation) {
+  /**
+   * 打开一段会话：同一个会话只占一个窗口——已有窗口就抬起来，没有才新建。
+   * 这是「一对话一窗口」的落点，避免反复点历史把屏幕堆满。
+   */
+  function openLlmConversation(conversation, originWindow) {
     const normalized = normalizeLlmConversation(conversation);
-    if (!normalized) return;
+    if (!normalized) return null;
     const current = llmConversations.find((item) => item.id === normalized.id);
-    llmActiveConversation = current || normalized;
-    if (!current) llmConversations.unshift(llmActiveConversation);
-    llmChatTitle.textContent = shortenLlmText(firstMessage(llmActiveConversation, 'user'), 42) || '新对话';
-    llmChatSubtitle.textContent = `${normalizeLlmConfig(settings?.llm).model || 'LLM'} · 对话中`;
+    const target = current || normalized;
+    if (!current) llmConversations.unshift(target);
+    const existing = llmChatWindows.find((win) => win.conversation?.id === target.id);
+    if (existing) {
+      // 若是在另一个窗口的历史视图里点的，原窗口留着自己的会话，这里只换目标窗口的内容。
+      existing.conversation = target;
+      setLlmChatWindowState(existing, 'chat');
+      syncLlmChatWindowChrome(existing);
+      renderLlmChatWindow(existing);
+      showLlmChatLayer();
+      focusLlmChatWindow(existing);
+      if (originWindow && originWindow !== existing && originWindow.state === 'history') setLlmChatWindowState(originWindow, 'chat');
+      return existing;
+    }
+    const win = createLlmChatWindow(target);
+    if (!win) return null;
     showLlmChatLayer();
-    window.requestAnimationFrame(() => llmChatInput?.focus({ preventScroll: true }));
+    focusLlmChatWindow(win);
+    return win;
   }
 
+  /** 侧栏「新对话」：只清侧栏输入，不碰已打开的窗口。 */
   function startNewLlmConversation() {
-    llmActiveConversation = null;
-    llmRequestInFlight = false;
-    if (llmChatLayer && !llmChatLayer.hidden) hideLlmChatLayer();
     llmSidebarInput.value = '';
     resizeLlmTextarea(llmSidebarInput);
     renderLlmHistory();
-    window.requestAnimationFrame(() => llmSidebarInput?.focus({ preventScroll: true }));
+    window.requestAnimationFrame(() => (llmSidebarInput as HTMLTextAreaElement | null)?.focus({ preventScroll: true }));
   }
 
   function resolveLlmEndpoint(value) {
@@ -805,7 +1489,7 @@ export default defineContentScript({
     const headers = { 'Content-Type': 'application/json' };
     if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
     // 与 background 侧同样加超时：这条路径在 chrome.runtime 不可用时才走，但同样可能挂起，
-    // 挂起时 llmRequestInFlight 不会复位，会话就卡死在「正在思考…」。
+    // 挂起时窗口的 requestInFlight 不会复位，会话就卡死在「正在思考…」。
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
     return fetch(resolveLlmEndpoint(config.endpoint), { method: 'POST', headers, body: JSON.stringify({ model: config.model, messages, temperature: 0.7, stream: false }), signal: controller.signal }).then(async (response) => {
@@ -841,27 +1525,33 @@ export default defineContentScript({
     return requestLlmViaFetch(config, messages);
   }
 
-  async function sendLlmMessage(value) {
+  /**
+   * 在指定窗口里发一条消息。
+   *
+   * 请求在飞标志挂在窗口上而不是全局：两个窗口各问各的，互不阻塞——全局标志会让
+   * 「第一个窗口还在等回复」变成「第二个窗口发不出去」，而这在多窗口下是常态。
+   */
+  async function sendLlmMessageInWindow(win, value) {
     const text = String(value || '').trim();
-    if (!text || llmRequestInFlight) return;
-    let conversation = llmActiveConversation;
-    if (!conversation) {
+    if (!win || !text || win.requestInFlight) return;
+    if (!win.conversation) {
       const now = Date.now();
-      conversation = { id: `llm-${now}-${Math.random().toString(36).slice(2, 8)}`, messages: [], createdAt: now, updatedAt: now };
-      llmConversations.unshift(conversation);
-      llmActiveConversation = conversation;
+      win.conversation = { id: `llm-${now}-${Math.random().toString(36).slice(2, 8)}`, messages: [], createdAt: now, updatedAt: now };
+      llmConversations.unshift(win.conversation);
     }
+    const conversation = win.conversation;
+    // 草稿键换成真实会话 id，几何记忆才能跟着会话走。
+    if (String(win.geometryKey || '').startsWith('draft-')) win.geometryKey = conversation.id;
     conversation.messages.push({ role: 'user', content: text });
     conversation.updatedAt = Date.now();
-    llmRequestInFlight = true;
-    llmSidebarInput.value = '';
-    llmChatInput.value = '';
-    resizeLlmTextarea(llmSidebarInput);
-    resizeLlmTextarea(llmChatInput);
-    llmChatTitle.textContent = shortenLlmText(firstMessage(conversation, 'user'), 42) || '新对话';
-    llmChatSubtitle.textContent = `${normalizeLlmConfig(settings?.llm).model || 'LLM'} · 对话中`;
+    win.requestInFlight = true;
+    const input = win.input as HTMLTextAreaElement | null;
+    if (input) { input.value = ''; resizeLlmTextarea(input); }
+    if (win.state !== 'chat') setLlmChatWindowState(win, 'chat');
+    syncLlmChatWindowChrome(win);
     showLlmChatLayer();
     syncLlmConfigStatus('busy');
+    renderLlmChatWindow(win);
     renderLlmHistory();
     writeLlmConversations();
     try {
@@ -874,12 +1564,27 @@ export default defineContentScript({
       conversation.updatedAt = Date.now();
       syncLlmConfigStatus('error');
     } finally {
-      llmRequestInFlight = false;
+      win.requestInFlight = false;
       writeLlmConversations();
       renderLlmHistory();
-      renderLlmChat();
-      if (llmChatLayer?.hidden) scheduleLlmDockClose();
+      // 窗口可能在等回复期间被关掉，此时不再操作已摘除的 DOM。
+      if (llmChatWindows.includes(win)) {
+        renderLlmChatWindow(win);
+        syncLlmChatWindowChrome(win);
+      }
     }
+  }
+
+  /** 侧栏输入框发的消息：没有窗口就开一个，有窗口就投给最上面那个。 */
+  function sendLlmMessageFromSidebar(value) {
+    const text = String(value || '').trim();
+    if (!text) return;
+    const target = llmChatWindows.length ? llmChatWindows[llmChatWindows.length - 1] : createLlmChatWindow(null);
+    if (!target) return;
+    showLlmChatLayer();
+    void sendLlmMessageInWindow(target, text);
+    llmSidebarInput.value = '';
+    resizeLlmTextarea(llmSidebarInput);
   }
 
   const NOTES_KEY = 'quickfind-notes';
@@ -1366,7 +2071,31 @@ export default defineContentScript({
   function showOutlineNotes(): void {
     if (!llmDock || (llmDock as HTMLElement).hidden) return;
     if (llmActiveTab !== 'outline') setLlmTab('outline');
-    setLlmDockOpen(true);
+    // 用户点了「笔记」按钮才有这次展示，按主动展开处理，别让它随即被自动收起。
+    setLlmDockOpen(true, { pinned: true });
+  }
+
+  /**
+   * 特殊功能按钮「问 ai」：弹出一个新的对话窗口，把搜索框里的内容作为首个问题发出去。
+   *
+   * 复用既有的对话层与会话存储（quickfind-llm-conversations），不新建第二套对话 UI。
+   * 每次点开**新开一个窗口**：搜索框这句话是要问的题目，接在上一段对话后面说不通；
+   * 用户想回看旧会话，走窗口里的历史入口（同一个会话只占一个窗口）。
+   * 没有查询词时只开一个空窗口，让用户自己起题。
+   */
+  function askAiFromAction(raw: unknown): boolean {
+    const text = String(raw ?? '').trim();
+    if (!llmChatLayer) return false;
+    const win = createLlmChatWindow(null);
+    if (!win) return false;
+    syncLlmConfigStatus();
+    // 先把窗口亮出来：sendLlmMessageInWindow 在「该窗口上一条还在飞」时会提前返回，
+    // 若只靠它来展示，用户就会看到「点了没反应」。
+    showLlmChatLayer();
+    if (text) void sendLlmMessageInWindow(win, text);
+    // 无论有没有带上问题，都把光标放到追问输入框，用户接着问不用再点一次。
+    focusLlmChatWindow(win);
+    return true;
   }
 
   function setLlmTab(tab, options = {}) {
@@ -1386,30 +2115,29 @@ export default defineContentScript({
   }
 
   function initializeLlmDock() {
+    if (IS_SUBFRAME) return;
     if (!llmDock || initializeLlmDock.started) return;
     initializeLlmDock.started = true;
-    llmRail?.addEventListener('pointerenter', () => setLlmDockOpen(true));
-    llmSidebar?.addEventListener('pointerenter', () => setLlmDockOpen(true));
-    llmRail?.addEventListener('focus', () => setLlmDockOpen(true));
-    llmSidebar?.addEventListener('focusin', () => setLlmDockOpen(true));
+    // 侧栏只由「点击」打开。此前是 pointerenter / focus / focusin 都会展开，
+    // 于是鼠标扫过右边缘、或页面把焦点落到滑杆上（按钮天然可聚焦）时，一整个面板
+    // 会自己滑出来——用户看到的就是「莫名奇妙自动展开」，且没有任何操作能预期到它。
+    // 收起路径保持不变（指针离开、关闭按钮、Esc），只有「显示」需要用户明确动作。
     llmRail?.addEventListener('pointerleave', scheduleLlmDockClose);
     llmSidebar?.addEventListener('pointerleave', scheduleLlmDockClose);
-    llmRail?.addEventListener('click', () => { if (!llmDock.classList.contains('is-open')) setLlmDockOpen(true); });
+    llmRail?.addEventListener('click', () => setLlmDockOpen(!llmDockOpen, { pinned: true }));
     llmSidebarClose?.addEventListener('click', () => setLlmDockOpen(false));
     llmNewChat?.addEventListener('click', startNewLlmConversation);
-    llmSidebarCompose?.addEventListener('submit', (event) => { event.preventDefault(); void sendLlmMessage(llmSidebarInput.value); });
-    llmChatCompose?.addEventListener('submit', (event) => { event.preventDefault(); void sendLlmMessage(llmChatInput.value); });
-    llmChatBack?.addEventListener('click', hideLlmChatLayer);
-    llmChatClose?.addEventListener('click', hideLlmChatLayer);
-    llmChatBackdrop?.addEventListener('click', hideLlmChatLayer);
+    llmSidebarCompose?.addEventListener('submit', (event) => { event.preventDefault(); sendLlmMessageFromSidebar(llmSidebarInput.value); });
+    // 每个窗口自己绑定拖动/缩放/按钮（见 createLlmChatWindow），这里只处理全局的指针与键盘。
     window.addEventListener('pointermove', (event) => {
-      if (!llmDock.classList.contains('is-open') || (llmChatLayer && !llmChatLayer.hidden)) return;
+      // 有对话窗口开着时不自动收侧栏：窗口可能正被拖动，收起侧栏会让层高变化、手感发飘。
+      if (!llmDock.classList.contains('is-open') || llmChatWindows.length) return;
       const pointInside = (rect) => rect && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
       if (pointInside(llmRail.getBoundingClientRect()) || pointInside(llmSidebar.getBoundingClientRect())) {
         if (llmCloseTimer) { window.clearTimeout(llmCloseTimer); llmCloseTimer = null; }
       } else scheduleLlmDockClose();
     }, true);
-    [llmSidebarInput, llmChatInput].filter(Boolean).forEach((input) => {
+    [llmSidebarInput].filter(Boolean).forEach((input) => {
       input.addEventListener('input', () => resizeLlmTextarea(input));
       input.addEventListener('keydown', (event) => {
         if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
@@ -1419,7 +2147,23 @@ export default defineContentScript({
       resizeLlmTextarea(input);
     });
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && llmChatLayer && !llmChatLayer.hidden) { event.preventDefault(); hideLlmChatLayer(); }
+      // Esc 关掉最上面那个窗口；全关完了才轮到侧栏。一次性全关在多窗口下太粗暴。
+      if (event.key !== 'Escape' || !llmChatWindows.length) return;
+      event.preventDefault();
+      closeLlmChatWindow(llmChatWindows[llmChatWindows.length - 1]);
+    }, true);
+    /**
+     * 点窗口以外的地方 → 收起**未置顶**的窗口。
+     *
+     * 用 `pointerdown` 而不是 `click`：窗口里按下、拖到窗口外松手（正是拖动窗口的操作）
+     * 在 `click` 阶段会命中「外面」，用 click 判定就会把正在拖的窗口关掉。
+     * 置顶窗口不受影响——那正是「置顶」的语义：钉住不被点走。
+     */
+    document.addEventListener('pointerdown', (event) => {
+      if (!llmChatWindows.length) return;
+      // 点在扩展自己的界面里（任一窗口、侧栏、浮层）就不算「外面」。
+      if (eventInsideOverlay(event)) return;
+      llmChatWindows.slice().forEach((win) => { if (!win.pinned) closeLlmChatWindow(win); });
     }, true);
     llmTabbar?.addEventListener('click', (event) => {
       const button = event.target?.closest?.('.llm-tab');
@@ -1446,9 +2190,10 @@ export default defineContentScript({
     } else setLlmTab('chat', { persist: false });
     loadLlmConversations();
     syncLlmConfigStatus();
+    // 先把窗口几何记忆读进来。窗口是同步建的，读盘是异步的——在这里提前起跑，
+    // 用户点「问 ai」时记忆多半已就绪，不必等异步回来再摆一次。
+    void ensureLlmWindowGeometry();
   }
-
-  initializeLlmDock();
 
   function storageAvailable() {
     return typeof chrome !== 'undefined' && chrome.storage && chrome.storage.sync;
@@ -1585,9 +2330,9 @@ export default defineContentScript({
     selectionPointer = null;
     selectionPointerPending = false;
     selectionPointerText = '';
-    // 触发点与面板都收起了才收回 top layer。笔记侧栏（.llm-dock）还可能在用同一个宿主，
-    // 所以要看它是否还开着，否则会把侧栏一起带下去。
-    if (!llmDockOpen) demoteFromTopLayer(host);
+    // 触发点与面板都收起了才收回 top layer。笔记侧栏与「问 ai」的对话层都共用同一个宿主，
+    // 所以要看它们是否还开着，否则会把面板一起带下去。
+    if (!llmOverlayInUse()) demoteFromTopLayer(host);
   }
 
   function getSelectionRect(range) {
@@ -2473,6 +3218,7 @@ export default defineContentScript({
       if (entry.isSpecial) {
         if (entry.action === 'copy') void copyTextToClipboard(query);
         else if (entry.action === 'notes') saveTextToOutlineNotes(query);
+        else if (entry.action === 'ask-ai') askAiFromAction(query);
         return;
       }
       rememberSearch(query);
@@ -2970,6 +3716,11 @@ export default defineContentScript({
       // 弹窗里的「笔记」按钮把内容交给页面侧栏写入：笔记的最新状态在它手上。
       if (message?.type === 'save-note') {
         sendResponse({ ok: saveTextToOutlineNotes(message.text) });
+        return;
+      }
+      // 弹窗里的「问 ai」按钮把问题交给页面侧的对话层：对话实现只有页面这一份。
+      if (message?.type === 'ask-ai') {
+        sendResponse({ ok: askAiFromAction(message.text) });
         return;
       }
       if (message?.type === 'open-context-search') openContextSearch(message);

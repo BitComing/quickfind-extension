@@ -31,5 +31,15 @@ export const SPECIAL_ACTIONS: SearchSource[] = [
     className: 'special-notes',
     action: 'notes',
     isSpecial: true
+  },
+  {
+    id: 'ask-ai',
+    name: '问 ai',
+    detail: '在当前页面打开对话面板提问',
+    specialTitle: '向 AI 提问',
+    mark: 'AI',
+    className: 'special-ask-ai',
+    action: 'ask-ai',
+    isSpecial: true
   }
 ];
