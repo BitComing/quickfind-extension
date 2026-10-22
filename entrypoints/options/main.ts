@@ -411,12 +411,12 @@ import {
         ...(Array.isArray(pinnedRaw.sites) ? validStoredSites : PINNED_SITES.map((site) => site.id)),
         ...customSites.map((site) => site.id)
       ])];
-    const pinnedDefaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(pinnedRaw.defaultGroupCount ?? 4) || 4)));
+    const pinnedDefaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(pinnedRaw.defaultGroupCount ?? DEFAULT_PINNED_SEARCH.defaultGroupCount) || DEFAULT_PINNED_SEARCH.defaultGroupCount)));
     const rawCollapseDelay = Number(pinnedRaw.collapseDelay ?? DEFAULT_PINNED_SEARCH.collapseDelay);
     const pinnedCollapseDelay = Number.isFinite(rawCollapseDelay) ? Math.max(0, Math.min(60000, Math.round(rawCollapseDelay))) : DEFAULT_PINNED_SEARCH.collapseDelay;
     const pinned = { sites, customSites, defaultGroupCount: pinnedDefaultGroupCount,
     collapseDelay: pinnedCollapseDelay, openInNewTab: pinnedRaw.openInNewTab === true, allSites: pinnedRaw.allSites === true, siteConfigVersion: PINNED_SITE_CONFIG_VERSION };
-    const count = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(stored.defaultGroupCount ?? stored.defaultVisibleCount ?? 4) || 4)));
+    const count = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(stored.defaultGroupCount ?? stored.defaultVisibleCount ?? SHARED_DEFAULTS.defaultGroupCount) || SHARED_DEFAULTS.defaultGroupCount)));
     const editableTriggerMode = ['click', 'hover', 'none'].includes(stored.editableTriggerMode) ? stored.editableTriggerMode : DEFAULTS.editableTriggerMode;
     const selectionTriggerDelay = Math.max(0, Math.min(2000, Math.round(Number(stored.selectionTriggerDelay ?? 200) || 0)));
     const rawLlm = stored.llm && typeof stored.llm === 'object' ? stored.llm : {};
@@ -1551,11 +1551,11 @@ import {
   cancelEdit.addEventListener('click', resetForm);
   addGroupButton.addEventListener('click', addGroup);
   defaultGroupCountInput.addEventListener('change', () => {
-    settings.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(defaultGroupCountInput.value) || 4));
+    settings.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(defaultGroupCountInput.value) || SHARED_DEFAULTS.defaultGroupCount));
     defaultGroupCountInput.value = settings.defaultGroupCount; saveGeneral('selection');
   });
   pinnedDefaultGroupCountInput.addEventListener('change', () => {
-    settings.pinned.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(pinnedDefaultGroupCountInput.value) || 4));
+    settings.pinned.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(pinnedDefaultGroupCountInput.value) || DEFAULT_PINNED_SEARCH.defaultGroupCount));
     pinnedDefaultGroupCountInput.value = settings.pinned.defaultGroupCount; savePinned();
   });
   pinnedCollapseDelayInput?.addEventListener('change', () => {

@@ -61,7 +61,7 @@ export const VERSION_BACKFILL_IDS: string[] = ['baidu', 'google-scholar', 'duckd
 export const DEFAULT_PINNED_SITE_IDS: string[] = ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'sogou', 'bing', 'yandex', 'zhihu', 'bilibili', 'douyin'];
 
 /** 只在列表里显示图标的内置源，默认值用它，名字交给悬浮提示。 */
-export const DEFAULT_ICON_ONLY_IDS: string[] = ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'bing', 'yandex', 'zhihu'];
+export const DEFAULT_ICON_ONLY_IDS: string[] = ['google', 'baidu', 'google-scholar', 'duckduckgo', 'so', 'bing', 'yandex', 'bilibili', 'xiaohongshu', 'youtube', 'zhihu'];
 
 /** 按 id 查内置源。找不到时返回 null，调用方不必再各自 find。 */
 export function builtinSourceById(id: unknown): SearchSource | null {

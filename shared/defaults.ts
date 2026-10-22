@@ -24,22 +24,22 @@ export const DEFAULT_SOURCES: SearchSource[] = BUILTIN_SOURCES.map((source) => (
 /** 默认分组的名字。popup 的 normalize 也用它兜底，避免入口之间出现两个名字。 */
 export const DEFAULT_GROUP_NAME = '默认组';
 
-/** 默认组先直排 4 个常用源，其余按主题收进 4 个分组。 */
+/** 默认组先直排 5 个常用源，其余按主题收进 4 个分组。 */
 export const DEFAULT_GROUPS: RawGroup[] = [
-  { id: 'default', name: DEFAULT_GROUP_NAME, items: ['google', 'bing', 'yandex', 'zhihu', 'group:group-other', 'group:group-video', 'group:group-social', 'group:group-ai'], visible: true },
-  { id: 'group-other', name: '其他', items: ['so', 'sogou', 'duckduckgo', 'baidu', 'google-scholar'], visible: true },
-  { id: 'group-video', name: '视频', items: ['bilibili', 'youtube', 'douyin'], visible: true },
-  { id: 'group-social', name: '社媒', items: ['xiaohongshu', 'x'], visible: true },
+  { id: 'default', name: DEFAULT_GROUP_NAME, items: ['google', 'xiaohongshu', 'bing', 'zhihu', 'bilibili', 'group:group-other', 'group:group-video', 'group:group-social', 'group:group-ai'], visible: true },
+  { id: 'group-other', name: '其他', items: ['so', 'sogou', 'duckduckgo', 'baidu', 'google-scholar', 'yandex'], visible: true },
+  { id: 'group-video', name: '视频', items: ['youtube', 'douyin'], visible: true },
+  { id: 'group-social', name: '社媒', items: ['x'], visible: true },
   { id: 'group-ai', name: 'ai', items: ['google-ai', 'doubao', 'deepseek'], visible: true },
 ];
 
-/** 常驻搜索栏：默认在所有站点出现，展开后 1 秒自动收起。 */
+/** 常驻搜索栏：默认在所有站点出现，展开后 0.25 秒自动收起、在新标签页打开。 */
 export const DEFAULT_PINNED_SEARCH = {
   sites: DEFAULT_PINNED_SITE_IDS,
   customSites: [] as Array<{ id: string; name: string; url: string; selector?: string; categorySelectors?: string[] }>,
-  defaultGroupCount: 4,
-  collapseDelay: 1000,
-  openInNewTab: false,
+  defaultGroupCount: 10,
+  collapseDelay: 250,
+  openInNewTab: true,
   allSites: true,
   siteConfigVersion: PINNED_SITE_CONFIG_VERSION,
 };
@@ -67,7 +67,7 @@ export const DEFAULT_SETTINGS = {
   llm: DEFAULT_LLM,
   triggerMode: 'click' as const,
   editableTriggerMode: 'none' as const,
-  defaultGroupCount: 4,
+  defaultGroupCount: 10,
   selectionTriggerDelay: 200,
   llmDockVisible: false,
 };

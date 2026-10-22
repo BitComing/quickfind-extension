@@ -494,7 +494,7 @@ export default defineContentScript({
       llm: normalizeLlmConfig(source.llm),
       triggerMode: source.triggerMode === 'hover' ? 'hover' : 'click',
       editableTriggerMode: ['click', 'hover', 'none'].includes(source.editableTriggerMode) ? source.editableTriggerMode : DEFAULT_SETTINGS.editableTriggerMode,
-      defaultGroupCount: Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(source.defaultGroupCount ?? source.defaultVisibleCount ?? 4) || 4))),
+      defaultGroupCount: Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(source.defaultGroupCount ?? source.defaultVisibleCount ?? DEFAULT_SETTINGS.defaultGroupCount) || DEFAULT_SETTINGS.defaultGroupCount))),
       selectionTriggerDelay: Math.max(0, Math.min(2000, Math.round(Number(source.selectionTriggerDelay ?? 200) || 0))),
       llmDockVisible: typeof source.llmDockVisible === 'boolean' ? source.llmDockVisible : DEFAULT_SETTINGS.llmDockVisible
     };
@@ -1496,7 +1496,7 @@ export default defineContentScript({
         else if (getSelectionTriggerMode() !== 'hover') cancelTriggerHoverOpen();
         else if (trigger.classList.contains('visible')) scheduleTriggerHoverOpen();
       }
-      if (changes.defaultGroupCount) settings.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(changes.defaultGroupCount.newValue) || 4)));
+      if (changes.defaultGroupCount) settings.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(changes.defaultGroupCount.newValue) || DEFAULT_SETTINGS.defaultGroupCount)));
       if (changes.selectionTriggerDelay) settings.selectionTriggerDelay = Math.max(0, Math.min(2000, Math.round(Number(changes.selectionTriggerDelay.newValue) || 0)));
       trigger.classList.toggle('disabled', !settings.enabled);
       if (!settings.enabled) {
@@ -2621,7 +2621,7 @@ export default defineContentScript({
       });
       target.append(button);
     };
-    const visibleCount = settings.defaultGroupCount || 4;
+    const visibleCount = settings.defaultGroupCount || DEFAULT_SETTINGS.defaultGroupCount;
     const initial = available.slice(0, visibleCount);
     const hidden = available.slice(visibleCount);
     initial.forEach((engine) => createEngineButton(engine, engineList));

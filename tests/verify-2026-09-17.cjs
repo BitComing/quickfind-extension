@@ -145,9 +145,9 @@ async function pinnedState(page) {
   check('「随心问」面板开关 = 关', ui.llmDockVisible === false, String(ui.llmDockVisible));
   check('LLM 启用开关 = 关', ui.llmEnabled === false, String(ui.llmEnabled));
   check('常驻栏「所有站点」开关 = 开', ui.pinnedAllSites === true, String(ui.pinnedAllSites));
-  check('常驻栏收起延时 = 1000', ui.pinnedCollapseDelay === '1000', ui.pinnedCollapseDelay);
-  check('选区默认分组展示数量 = 4', ui.defaultGroupCount === '4', ui.defaultGroupCount);
-  check('常驻栏默认分组展示数量 = 4', ui.pinnedDefaultGroupCount === '4', ui.pinnedDefaultGroupCount);
+  check('常驻栏收起延时 = 250', ui.pinnedCollapseDelay === '250', ui.pinnedCollapseDelay);
+  check('选区默认分组展示数量 = 10', ui.defaultGroupCount === '10', ui.defaultGroupCount);
+  check('常驻栏默认分组展示数量 = 10', ui.pinnedDefaultGroupCount === '10', ui.pinnedDefaultGroupCount);
   console.log(`  选项页分组行文本：${JSON.stringify(ui.groupNames)}`);
   console.log('');
 
