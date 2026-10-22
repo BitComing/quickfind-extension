@@ -140,4 +140,30 @@ async function launchWithExtension(sources) {
   return { context, extId, serve, openOptionsPage, close };
 }
 
-module.exports = { ROOT, EXT, resolvePlaywright, resolveChrome, createChecker, launchWithExtension };
+/**
+ * 收起常驻搜索栏 —— 走真实用户路径：指针移出栏与飞层后，按 collapseDelay 自动收起。
+ *
+ * 收起按钮已于 2026-10-20 按用户要求移除，用例不能再靠点它来收起。
+ * 指针离开后由 window 上的 pointermove 恢复收起排定，到点自动收起；
+ * 所以这里必须用真实指针移动（`page.mouse.move`），不能用脚本直接改 class ——
+ * 那样会绕过收起排定本身，把「自动收起是否还生效」这条契约一起架空。
+ */
+async function collapsePinnedBar(page, hostSelector, { timeout = 5000 } = {}) {
+  const viewport = page.viewportSize() || { width: 1100, height: 800 };
+  const away = { x: Math.round(viewport.width / 2), y: Math.round(viewport.height * 0.7) };
+  // 先落到别处再横移一段：同一坐标重复 move 不一定派发 pointermove。
+  await page.mouse.move(away.x - 40, away.y);
+  await page.mouse.move(away.x, away.y);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const collapsed = await page.evaluate(
+      (selector) => document.querySelector(selector)?.classList.contains('is-collapsed') ?? null,
+      hostSelector,
+    );
+    if (collapsed) return true;
+    await page.waitForTimeout(120);
+  }
+  return false;
+}
+
+module.exports = { ROOT, EXT, resolvePlaywright, resolveChrome, createChecker, launchWithExtension, collapsePinnedBar };

@@ -89,6 +89,24 @@ async function pinnedState(page) {
   }, HOST);
 }
 
+/**
+ * 收起常驻栏 —— 走真实用户路径（指针移出栏，按 collapseDelay 自动收起）。
+ *
+ * 收起按钮已于 2026-10-20 移除，不能再靠点它收起；而自动收起要求指针真的离开，
+ * 所以必须用真实指针移动。直接改 class 会绕过收起排定，把「自动收起是否生效」架空。
+ */
+async function collapsePinnedBar(page, { timeout = 4000 } = {}) {
+  await page.mouse.move(500, 560);
+  await page.mouse.move(550, 600);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const state = await pinnedState(page);
+    if (state.collapsed) return true;
+    await page.waitForTimeout(100);
+  }
+  return false;
+}
+
 (async () => {
   const server = http.createServer((request, response) => {
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -172,10 +190,11 @@ async function pinnedState(page) {
   console.log('\n【2b】常驻搜索框有内容时，展开也不聚焦');
   await worker.evaluate((data) => new Promise((resolve) => chrome.storage.sync.set(data, resolve)), { searchHistory: [{ query: '绿电炼铝', timestamp: Date.now() }] });
   await page.waitForTimeout(400);
-  await page.locator(`${HOST} .collapse-button`).dispatchEvent('click');
+  // 收起按钮已移除，改走真实用户路径：指针移出栏 → 按 collapseDelay 自动收起。
+  const autoCollapsed = await collapsePinnedBar(page);
   await page.waitForTimeout(350);
   state = await pinnedState(page);
-  check('已收起', state.collapsed === true, `collapsed=${state.collapsed}`);
+  check('指针离开后按 collapseDelay 自动收起', autoCollapsed === true && state.collapsed === true, `collapsed=${state.collapsed}`);
   check('兜底值填进搜索框', state.query === '绿电炼铝', `query=${JSON.stringify(state.query)}`);
 
   await page.locator(`${HOST} .reveal-handle`).dispatchEvent('click');

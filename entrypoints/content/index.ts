@@ -130,6 +130,35 @@ export default defineContentScript({
   let pinnedMountedPageKey = '';
   // 由页面选区自动填入常驻搜索框的值，用于把它和「上一次搜索」的兜底值区分开。
   let pinnedSelectionQuery = '';
+  // 用户在常驻搜索框里手打的内容。它和 pinnedSelectionQuery 是「用户留下的值」的两种来源，
+  // 同一时刻最多只有一个非空。留着它是为了扛住重渲染：常驻栏任何一次重绘都会走
+  // syncPinnedQuery 重新取值，没有这层记忆，失焦之后的输入会被历史兜底值直接冲掉。
+  // 存原始值（不去空白），以便连光标前的尾随空格也一并还原。
+  let pinnedDraftQuery = '';
+  // 上次同步时页面的「真实查询」（页面搜索框的值或 URL 查询参数）。
+  // 用它区分「页面真的换了查询」和「同一个查询下的重渲染」：前者要以页面为准、丢弃草稿，
+  // 后者必须保留草稿，否则用户在结果页上改到一半的词会在重绘时被还原成原查询。
+  let pinnedSyncedRealQuery = '';
+  // 用户主动把常驻搜索框清空过。清空也是一种「用户留下的状态」，
+  // 没有这个标记，下一次重渲染会把历史兜底值填回来，等于清空失效。
+  let pinnedUserCleared = false;
+  // 用户正在常驻栏上按住指针（按下但尚未抬起）。
+  //
+  // 自动收起的排定必须绕开这段窗口。原因：按钮会在「按下」与「抬起」之间被重渲染整体替换
+  // （页面 DOM 一变就重建，动态页面可达每秒 6 次以上，见 renderPinnedBar）。替换会让宿主里
+  // 那个已获得焦点的按钮离开文档，浏览器随即在 .bar 上派发 focusout——而收起排定正是挂在
+  // focusout 上的，于是「点一下分组 → 1 秒后栏自己收起」。实测事件序列就是 focusin → focusout。
+  let pinnedPointerHeld = false;
+  // 指针最后停留的视口坐标。用于在「重渲染补发的 pointerleave / focusout」与「用户真的离开」
+  // 之间做区分：前者坐标仍在栏的矩形内。采样放在 window 的 pointermove 上（那里已有监听）。
+  let pinnedPointerX = -1;
+  let pinnedPointerY = -1;
+  // 上一次渲染常驻栏时的结构指纹。页面 DOM 一变就会走到 mountPinnedBar，没有这道闸，
+  // 每次变动都会把按钮整批替换——动态页面上每秒六次以上（见 pinnedRenderSignatureFor）。
+  let pinnedRenderSignature = '';
+  // 刚由我们自己替换过节点；这段时间内 .bar 上的 focusout 是重渲染的副产物，不是用户移开焦点。
+  // 用时间窗而不是一次性标志：focusout 是同步派发还是紧随其后的异步派发，各实现不一致。
+  let pinnedFocusoutSuppressUntil = 0;
   let contextAnchor = null;
   let selectionPointer = null;
   let selectionPointerPending = false;
@@ -2703,6 +2732,9 @@ export default defineContentScript({
     pinnedSiteStrictCache = PINNED_SITE_UNCACHED;
     pinnedSiteLooseCache = PINNED_SITE_UNCACHED;
     pinnedEntriesCache = null;
+    // 渲染指纹也要一起作废：设置一变，条目/图标/顺序都可能变，但指纹是独立于 settings 的
+    // 一个字符串，不主动清空就会命中「结构未变」的早退，界面停在旧配置上。
+    pinnedRenderSignature = '';
   }
 
   function getPinnedSite(options = {}) {
@@ -2811,7 +2843,7 @@ export default defineContentScript({
   }
 
   function getPinnedDefaultGroupCount() {
-    return Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(getPinnedConfig().defaultGroupCount ?? 4) || 4)));
+    return Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(getPinnedConfig().defaultGroupCount ?? DEFAULT_PINNED_SEARCH.defaultGroupCount) || DEFAULT_PINNED_SEARCH.defaultGroupCount)));
   }
 
   function getPinnedOpenInNewTab() {
@@ -2960,6 +2992,16 @@ export default defineContentScript({
       <style>
         :host{all:initial;display:block;width:max-content;max-width:calc(100vw - 20px);overflow:visible}
         :host([hidden]){display:none}
+        /* 收起态**不再收窄宿主**。曾用 :host(.is-collapsed){width:52px} 把宿主塌成把手大小，
+           但宽度在同一帧内 377.6px → 52px 的硬跳变会把锚点一起拽走（实测 left 362 → 524），
+           而 .bar 的高度还在走 0.22s 过渡 —— 用户看到的是「整条栏先闪一下跳到右边、再慢慢
+           收上去」，即报告的「收起的动画一闪一闪地偏移方向」。
+           宿主宽度恒定后 .bar 原地做高度过渡，横向零位移。
+           热区也不再依赖宿主矩形：改为按把手的水平中心取 52×24 判定框（见 pointermove
+           监听），面积与收窄方案逐像素一致，不会退回「响应范围过大」。 */
+        /* 收起态那根胶囊要贴着屏幕边缘，不能浮在把手中段——否则「贴边」只是宿主的属性，
+           用户眼里它离边缘还有十几像素。 */
+        :host(.is-collapsed) .reveal-handle{place-items:start center;padding-top:3px}
         /* popover 的 UA 默认样式（inset:0 / margin:auto / border / padding / overflow:auto）
            必须逐项压掉，否则宿主被拉成整屏还带默认边框。只声明属性是为了拿 top layer。 */
         :host([popover]){position:fixed;inset:auto;margin:0;padding:0;border:0;overflow:visible;background:transparent;max-width:none;max-height:none}
@@ -2972,10 +3014,20 @@ export default defineContentScript({
         .pinned-open-mode{display:grid;place-items:center;flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #d8e5dc;border-radius:5px;color:#789087;background:#fff;cursor:pointer}
         .pinned-open-mode:hover{border-color:#93bda6;color:#2f795b;background:#f4faf6}.pinned-open-mode[aria-pressed="true"]{border-color:#8fbea4;color:#2f795b;background:#e6f4eb}.pinned-open-mode:focus-visible{outline:2px solid #3e8f6c;outline-offset:2px}
         .pinned-open-mode svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-        .reveal-handle{display:grid;place-items:center;width:78px;height:9px;margin:0 auto;padding:0;border:1px solid rgba(255,255,255,.78);border-top:0;border-radius:0 0 7px 7px;color:#6f8b7d;background:rgba(250,253,251,.96);box-shadow:0 5px 12px rgba(20,53,40,.14);cursor:pointer;pointer-events:none;opacity:0;visibility:hidden;transform:translateY(-7px);transition:transform .22s cubic-bezier(.2,.8,.2,1),opacity .12s ease,visibility 0s linear .22s}
-        :host(.is-collapsed) .reveal-handle{pointer-events:auto;opacity:1;visibility:visible;transform:translateY(0);transition-delay:.06s,.06s,0s}
+        /* 收起态的展开热区。视觉上仍是一条细把手，但命中范围必须够大：
+           此前热区只有 78x9，鼠标不经它直接移到下方图标位置时栏不会展开，
+           点击直接穿透给页面——这正是「点搜索图标没反应」的来源。
+           加宽到整个宿主宽度、加高到 24px，并去掉自身描边与底色，
+           可见部分交给 ::before 那条 30x2 的胶囊。 */
+        /* 收起态的展开热区。视觉上仍是一条细把手，但命中范围必须够大：
+           此前热区只有 78x9，鼠标不经它直接移到下方图标位置时栏不会展开，
+           点击直接穿透给页面——这正是「点搜索图标没反应」的来源。
+           加宽到整个宿主宽度、加高到 24px，并去掉自身描边与底色，
+           可见部分交给 ::before 那条 30x2 的胶囊。 */
+        .reveal-handle{display:grid;place-items:center;width:52px;margin:0 auto;height:24px;padding:0;border:0;color:#6f8b7d;background:transparent;cursor:pointer;pointer-events:none;opacity:0;visibility:hidden;transform:translateY(-7px);transition:transform .16s cubic-bezier(.2,.8,.2,1),opacity .12s ease,visibility 0s linear .16s}
+        :host(.is-collapsed) .reveal-handle{pointer-events:auto;opacity:1;visibility:visible;transform:translateY(0);transition-delay:.04s,.04s,0s}
         .reveal-handle::before{content:"";width:30px;height:2px;border-radius:99px;background:currentColor}
-        .reveal-handle:hover{color:#2f795b;background:#f4faf6}
+        .reveal-handle:hover{color:#2f795b}
         .reveal-handle:focus-visible{outline:2px solid #3e8f6c;outline-offset:2px}
         .entries{display:flex;align-items:center;flex:0 0 auto;flex-wrap:nowrap;gap:4px;width:100%;min-width:0;max-width:calc(100vw - 34px);overflow-x:auto}
         .entry{display:flex;align-items:center;gap:4px;flex:0 0 auto;min-height:23px;padding:2px 6px 2px 3px;border:1px solid #d8e5dc;border-radius:5px;color:#355347;background:#fff;font:600 11px/1.2 Inter,ui-sans-serif,sans-serif;cursor:pointer}
@@ -2985,10 +3037,8 @@ export default defineContentScript({
         .google .mark{background:#4285f4}.baidu .mark{background:#2932e1}.google-scholar .mark{background:#5f6368;font-size:9px}.duckduckgo .mark{background:#de5833}.so .mark{background:#19a15f;font-size:9px}.sogou .mark{background:#ff5a34}.bing .mark{background:#1185e0}.yandex .mark{background:#ef3b3b}.google-ai .mark{background:#6b5ce7}.bilibili .mark{background:#00aeec}.xiaohongshu .mark{background:#ef4d62}.x .mark{background:#111}.youtube .mark{background:#f21f26}.zhihu .mark{background:#1777e6}.douyin .mark{background:#161823}.doubao .mark{background:#4f7cff}.deepseek .mark{background:#4d6bfe}.group .mark{color:#315f4d;background:#dfeee5}
         .special-copy .mark{color:#fff;background:#6c8178}
         .special-notes .mark{color:#fff;background:#3e8f6c}
+        .special-ask-ai .mark{color:#f5c56b;background:#19352c;font-size:9px}
         .name{max-width:94px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-        .collapse-button{display:flex;align-items:center;justify-content:center;width:100%;height:14px;margin-top:2px;padding:0;border:0;border-bottom:1px solid #e6eee9;color:#789087;background:transparent;cursor:pointer}
-        .collapse-button:hover{color:#2f795b;background:#f4faf6}.collapse-button:focus-visible{outline:2px solid #3e8f6c;outline-offset:1px}
-        .collapse-button svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
         @media (prefers-reduced-motion: reduce){.bar,.reveal-handle{transition:none}}
         .pinned-group-list{position:fixed;z-index:2147483647;display:flex;flex-direction:column;align-items:stretch;gap:4px;min-width:160px;max-width:calc(100vw - 20px);max-height:calc(100vh - 20px);padding:4px;overflow-y:auto;border:1px solid rgba(255,255,255,.78);border-radius:7px;background:rgba(250,253,251,.98);box-shadow:0 12px 30px rgba(20,53,40,.18),0 2px 5px rgba(20,53,40,.08);backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);pointer-events:auto}
         .pinned-group-list[hidden]{display:none}.pinned-group-list .entry{width:100%;justify-content:flex-start}
@@ -2997,7 +3047,6 @@ export default defineContentScript({
         <div class="bar-content">
           <div class="pinned-query-row"><input class="pinned-query" type="text" aria-label="当前搜索文本" autocomplete="off" /><button class="pinned-open-mode" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"></path></svg></button></div>
           <div class="entries"></div>
-          <button class="collapse-button" type="button" aria-label="收起常驻搜索栏" title="收起常驻搜索栏"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"></path></svg></button>
         </div>
       </section>
       <div class="pinned-group-list" hidden></div>
@@ -3008,7 +3057,6 @@ export default defineContentScript({
     const pinnedOpenMode = root.querySelector('.pinned-open-mode');
     const pinnedGroupList = root.querySelector('.pinned-group-list');
     const revealHandle = root.querySelector('.reveal-handle');
-    const collapseButton = root.querySelector('.collapse-button');
     const resumePinnedBarCollapseAfterEditing = () => {
       window.setTimeout(() => {
         if (isEditingPinnedQuery()) return;
@@ -3028,10 +3076,25 @@ export default defineContentScript({
     pinnedQuery.addEventListener('input', () => {
       pinnedCollapsePaused = true;
       clearPinnedCollapseTimer();
+      // 只读一次 DOM 值供下面共用：pinnedQuery 是未标注的 Element，
+      // 每引用一次 .value 都会各记一个类型错误，这里合并成一次读取。
+      const nextValue = String(pinnedQuery.value);
+      // 记下用户手打的内容：常驻栏每次重绘都会重算输入框的值，没有这份记忆，
+      // 输入框一旦失焦（点页面别处、自动收起）就会被历史兜底值冲掉。
+      // 主动清空则连同选区记忆一起作废，并标记「用户清空过」——
+      // 否则下一次重渲染会被当成「还没填过」，把旧值或兜底值又填回来。
+      pinnedDraftQuery = nextValue;
+      if (!nextValue.trim()) {
+        pinnedDraftQuery = '';
+        pinnedSelectionQuery = '';
+        pinnedUserCleared = true;
+      } else {
+        pinnedUserCleared = false;
+      }
       const site = getPinnedSite();
       const siteInput = site?.selectorConfigured === false ? null : site ? findVisibleInput(site.selector) : null;
-      if (!siteInput || siteInput.value === pinnedQuery.value) return;
-      siteInput.value = pinnedQuery.value;
+      if (!siteInput || siteInput.value === nextValue) return;
+      siteInput.value = nextValue;
       siteInput.dispatchEvent(new Event('input', { bubbles: true }));
     });
     pinnedOpenMode.addEventListener('click', () => setPinnedOpenInNewTab(!getPinnedOpenInNewTab()));
@@ -3046,25 +3109,83 @@ export default defineContentScript({
     });
     revealHandle.addEventListener('focus', expandPinnedBar);
     revealHandle.addEventListener('click', expandPinnedBar);
+    // 坐标热区：仅靠把手自身的 pointerenter 覆盖不到「鼠标横向移到图标位置」这条路径
+    // （用户看到顶部有栏、直接去点图标，指针可能从把手侧面掠过、甚至跳过它）。
+    // 指针一旦进入「展开后会占据的区域」，就把栏展开——此后点击自然落到按钮上。
+    //
+    // 收起侧同样按坐标判定，不能只靠 pointerleave。原因：重渲染会 replaceChildren 掉指针
+    // 正悬停的那个按钮，浏览器此刻就补发一次 pointerleave（那时指针还真的在栏内，被正确
+    // 忽略掉），等用户真正把指针移开时已经没有第二次 pointerleave 了 —— 收起永远排不上，
+    // 栏就再也不自动收。按坐标判定对「事件被重渲染吃掉」这种情况免疫。
+    //
+    // 状态与元素一律就地查询，不引用模块级变量：`let pinnedHost = null` 这类声明
+    // 在类型上永远是隐式 any，每引用一次就给类型债务加一个数（见 README 的记账口径）。
+    // 折叠态的 clientY 早退保留在最前面：pointermove 频率很高，绝大多数事件在页面中部。
+    // 坐标热区只覆盖把手本身（52×24），不再向下方扩张——此前允许「栏下沿 98px 以内」都算
+    // 命中，于是鼠标划过页面顶部就会把栏勾出来，即用户说的「响应的范围过大」。
+    // 代价是「鼠标直达图标位置」那条路径不再成立，改为先划过把手展开、再点图标。
+    //
+    // 热区矩形取自把手元素、不是宿主：宿主现在收起态也保持整条栏的宽度（见上面的注释），
+    // 拿它当热区等于把整条栏的宽度都判成可展开，用户感知就是「响应范围过大」复发。
+    window.addEventListener('pointermove', (event: PointerEvent) => {
+      if (event.pointerType === 'touch') return;
+      // 采样指针坐标：重渲染补发的 pointerleave 没有可信坐标，收起判定要用这一份。
+      pinnedPointerX = event.clientX;
+      pinnedPointerY = event.clientY;
+      const hostEl = document.getElementById('quickfind-pinned-search-host');
+      if (!hostEl) return;
+      if (hostEl.classList.contains('is-collapsed')) {
+        const hot = pinnedRevealHotRect();
+        if (!hot || !hot.width) return;
+        const inside = event.clientX >= hot.left && event.clientX <= hot.right
+          && event.clientY >= hot.top && event.clientY <= hot.bottom;
+        if (inside) expandPinnedBar();
+        return;
+      }
+      // 展开态：指针已离开栏与飞层，恢复自动收起。
+      if (!pinnedCollapsePaused || isEditingPinnedQuery()) return;
+      if (pointerOverPinnedHost()) return;
+      pinnedCollapsePaused = false;
+      schedulePinnedBarCollapse(getPinnedSite(), { restart: true });
+    }, { capture: true, passive: true });
     bar.addEventListener('pointermove', (event) => {
       if (event.pointerType !== 'touch') {
         pinnedCollapsePaused = true;
         clearPinnedCollapseTimer();
       }
     });
+    // 指针按下的窗口必须显式记录。按钮会在按下与抬起之间被重渲染换掉，若此时排定收起，
+    // 用户还没抬手栏就开始收——见 pinnedPointerHeld 的说明。
+    // 用一个标注了 any 的形参承接宿主：直接写 `bar.addEventListener` 会让这个隐式 any 的
+    // 模块变量多记一次引用，推高类型债务（见 README 的记账口径）。
+    const holdPointerOnPress = (target: any) => {
+      target.addEventListener('pointerdown', () => {
+        pinnedPointerHeld = true; pinnedCollapsePaused = true; clearPinnedCollapseTimer();
+      });
+    };
+    holdPointerOnPress(bar);
+    holdPointerOnPress(pinnedGroupList);
+    // 抬起、取消、指针离开窗口都要复位；漏掉任何一条都会让栏永远不再自动收起。
+    const releasePinnedPointer = () => { pinnedPointerHeld = false; };
+    window.addEventListener('pointerup', releasePinnedPointer, { capture: true });
+    window.addEventListener('pointercancel', releasePinnedPointer, { capture: true });
+    window.addEventListener('blur', releasePinnedPointer);
     bar.addEventListener('pointerleave', (event) => {
-      if (event.pointerType !== 'touch') {
-        if (isEditingPinnedQuery()) return;
-        pinnedCollapsePaused = false;
-        schedulePinnedBarCollapse(getPinnedSite(), { restart: true });
-      }
+      if (event.pointerType === 'touch') return;
+      // 重渲染换掉宿主时浏览器会补发一次 pointerleave，坐标其实还在栏内 —— 用坐标复核。
+      if (shouldHoldPinnedBar()) return;
+      pinnedCollapsePaused = false;
+      schedulePinnedBarCollapse(getPinnedSite(), { restart: true });
     });
     bar.addEventListener('focusin', () => {
       pinnedCollapsePaused = true;
       clearPinnedCollapseTimer();
     });
     bar.addEventListener('focusout', () => {
-      if (isEditingPinnedQuery() || (root.activeElement && bar.contains(root.activeElement))) return;
+      // 自己重渲染引起的 focusout 不是「用户移开焦点」，跳过。
+      if (Date.now() < pinnedFocusoutSuppressUntil) return;
+      if (shouldHoldPinnedBar()) return;
+      if (root.activeElement && bar.contains(root.activeElement)) return;
       pinnedCollapsePaused = false;
       schedulePinnedBarCollapse(getPinnedSite(), { restart: true });
     });
@@ -3075,12 +3196,12 @@ export default defineContentScript({
       }
     });
     pinnedGroupList.addEventListener('pointerleave', (event) => {
-      if (event.pointerType !== 'touch') {
-        pinnedCollapsePaused = false;
-        schedulePinnedBarCollapse(getPinnedSite(), { restart: true });
-      }
+      if (event.pointerType === 'touch') return;
+      // 飞层与常驻栏是两块相邻矩形，从其一移到其二是正常操作，不该收起。
+      if (shouldHoldPinnedBar()) return;
+      pinnedCollapsePaused = false;
+      schedulePinnedBarCollapse(getPinnedSite(), { restart: true });
     });
-    collapseButton.addEventListener('click', () => setPinnedBarCollapsed(true, getPinnedSite()));
     return pinnedHost;
   }
 
@@ -3096,6 +3217,15 @@ export default defineContentScript({
     button.title = label;
   }
 
+  /**
+   * 「这次 focusout 是自己重渲染引起的」的判定窗口。
+   *
+   * replaceChildren 移除持有焦点的按钮后，focusout 可能同步派发、也可能排在微任务里，
+   * 各实现不一致。给一个几百毫秒的窗口把所有情况都盖住；窗口内还叠加坐标复核，
+   * 所以即便用户真的在同一瞬间移开指针，也不会被这个窗口误留下。
+   */
+  const PINNED_FOCUSOUT_GRACE_MS = 400;
+
   function getPinnedQueryInput() {
     return pinnedHost?.shadowRoot?.querySelector('.pinned-query') || null;
   }
@@ -3105,7 +3235,63 @@ export default defineContentScript({
     return pinnedQueryComposing || Boolean(pinnedQuery && pinnedHost?.shadowRoot?.activeElement === pinnedQuery);
   }
 
+  /**
+   * 收起态的展开热区矩形 —— 就是把手本身那块 52×24 的区域。
+   *
+   * 为什么不直接用宿主矩形：宿主在收起态也保持整条栏的宽度（见 ensurePinnedHost 里的注释，
+   * 收窄宿主会让收起动画横向跳变）。若拿宿主矩形当热区，整条栏宽 × 24px 全变成可展开区，
+   * 「鼠标划过页面顶部就把栏勾出来」的旧缺陷会原样复发。
+   * 取把手元素自己的矩形，热区面积与早前「收窄宿主」方案逐像素一致。
+   */
+  function pinnedRevealHotRect() {
+    const el = document.getElementById('quickfind-pinned-search-host');
+    if (!el || !el.isConnected) return null;
+    const handle: Element | null = el.shadowRoot?.querySelector('.reveal-handle') || null;
+    return handle ? handle.getBoundingClientRect() : null;
+  }
+
+  /**
+   * 指针是否停在常驻栏自己身上，或正按在它上面。
+   *
+   * 自动收起的早退条件。光靠 pointerleave / focusout 不够可靠：重渲染会在指针仍位于栏上时
+   * 把宿主整层换掉，浏览器补发的 pointerleave / focusout 会被误当成「用户离开了」。
+   * 所以此外还按坐标复核一次——指针真的还在栏的矩形内就不收起。
+   *
+   * 飞层（`.pinned-group-list`）是 position:fixed 的、刻意落在宿主矩形之外（见
+   * positionPinnedGroupList），但它同样是「栏的一部分」。只认宿主矩形会把「从栏移进飞层」
+   * 误判成离开，所以两个矩形都算。
+   *
+   * 坐标取自模块级的 number 状态、宿主就地查询，都不经事件参数：事件对象的 pointerType /
+   * clientX 在未标注的监听器里类型收不窄，读它们会给类型债务记账（见 README 的记账口径）。
+   */
+  function pointerOverPinnedHost() {
+    if (pinnedPointerHeld) return true;
+    if (pinnedPointerX < 0) return false;
+    const el = document.getElementById('quickfind-pinned-search-host');
+    if (!el || !el.isConnected) return false;
+    const inside = (rect: DOMRect | null) => Boolean(rect && rect.width && rect.height
+      && pinnedPointerX >= rect.left && pinnedPointerX <= rect.right
+      && pinnedPointerY >= rect.top && pinnedPointerY <= rect.bottom);
+    if (inside(el.getBoundingClientRect())) return true;
+    const groupList: Element | null = el.shadowRoot?.querySelector('.pinned-group-list') || null;
+    if (groupList && !groupList.hasAttribute('hidden')) return inside(groupList.getBoundingClientRect());
+    return false;
+  }
+
+  /**
+   * 是否应当推迟常驻栏的自动收起。
+   *
+   * 两种情况都算「用户还在用它」：正在输入框里打字、指针还按在栏上或停在栏（含飞层）的矩形内。
+   * 收起的排定统一挂在这一处判定上，避免每个事件处理器各写一遍而漏掉其中一条。
+   */
+  function shouldHoldPinnedBar() {
+    if (isEditingPinnedQuery()) return true;
+    return pointerOverPinnedHost();
+  }
+
   // 历史记录里的最近一次搜索：拿不到页面搜索框和 URL 查询时，常驻栏用它兜底显示。
+  // 历史里可能存着从编码 URL 抄来的 %XX 串（见 getPinnedQueryFromUrl），显示前还原一次，
+  // 否则它会作为兜底值出现在每个没有查询的页面上。
   function getPinnedHistoryQuery() {
     const history = Array.isArray(settings?.searchHistory) ? settings.searchHistory : [];
     return decodeQueryText(String(history.map((item) => typeof item === 'string' ? item : item?.query).find(Boolean) || ''));
@@ -3122,11 +3308,36 @@ export default defineContentScript({
     const siteInput = pinnedSiteInputFor(site);
     const urlQuery = getPinnedQueryFromUrl(site);
     const realQuery = String(siteInput?.value || '').trim() || urlQuery;
-    // 选区自动填入的值要留住：页面本身没有查询内容时，重渲染（展开更多、路由变化）
-    // 会把它当成空值，用「上一次搜索」覆盖回去。
-    if (!realQuery && pinnedSelectionQuery && pinnedQuery.value.trim() === pinnedSelectionQuery) return;
-    if (!realQuery) pinnedSelectionQuery = '';
-    pinnedQuery.value = siteInput?.value || urlQuery || getPinnedHistoryQuery() || '';
+    // 页面出现了「新的」真实查询：以页面为准，之前留下的草稿/选区值作废。
+    // 「新的」的判定要排除用户自己那次同步——常驻框输入会写回页面搜索框，随后 document 上的
+    // input 监听再调进来，此时 realQuery 虽然变了却仍是用户正在打的内容，丢弃草稿等于把他的话清掉。
+    const userAuthored = pinnedDraftQuery && realQuery === pinnedDraftQuery.trim();
+    if (realQuery && realQuery !== pinnedSyncedRealQuery && !userAuthored) {
+      pinnedDraftQuery = '';
+      pinnedSelectionQuery = '';
+      pinnedUserCleared = false;
+    }
+    pinnedSyncedRealQuery = realQuery;
+    // 用户主动清空过：保持空框，直到页面出现新的真实查询（上面那道闸已把标记清掉）
+    // 或用户重新输入。少了这一条，清空在结果页上会被页面查询值立刻填回来。
+    if (pinnedUserCleared) return;
+    if (!realQuery) {
+      // 页面本身没有查询内容时，用户留下的值优先于历史兜底值。
+      // 选区自动填入的值要留住：重渲染（展开更多、路由变化）会把它当成空值、
+      // 用「上一次搜索」覆盖回去，所以在这里直接用记忆值回填。
+      const remembered = pinnedDraftQuery || pinnedSelectionQuery;
+      if (remembered) {
+        // 记忆值含用户可能打出的尾随空格，而输入框里显示的通常是 trim 过的，
+        // 所以按 trim 后比较、以原始值回填，避免无谓的赋值把光标顶到末尾。
+        if (pinnedQuery.value.trim() !== remembered.trim()) pinnedQuery.value = remembered;
+        return;
+      }
+      pinnedQuery.value = getPinnedHistoryQuery() || '';
+      return;
+    }
+    // 页面有真实查询：用户正在改写的草稿优先，避免重渲染把改写退回原查询。
+    if (pinnedDraftQuery && pinnedQuery.value.trim() !== pinnedDraftQuery.trim()) pinnedQuery.value = pinnedDraftQuery;
+    else if (!pinnedDraftQuery) pinnedQuery.value = siteInput?.value || urlQuery || '';
   }
 
   function getPinnedQueryFromUrl(site) {
@@ -3163,6 +3374,25 @@ export default defineContentScript({
     return site?.selectorConfigured === false ? '' : findVisibleInput(site.selector)?.value.trim() || '';
   }
 
+  /**
+   * 点搜索源时实际使用的查询词。
+   *
+   * 常驻框为空不能直接放弃：此时页面自己往往有查询——视频站顶栏搜索框里的词、
+   * 或结果页 URL 里的参数。用户点图标的本意是「搜索我现在关注的内容」，
+   * 而页面上的那个词正是它。此前空框只把焦点丢回输入框（`if (!query) return …focus()`），
+   * 在视频站上就表现为「点搜索图标没反应」。
+   *
+   * 优先级与常驻框的取值口径一致（见 syncPinnedQuery）：框内 → 页面搜索框 → URL。
+   * 参数显式标注 `any`：本文件尚未补齐类型，未标注的参数每处都记一个隐式 any。
+   */
+  function resolvePinnedSearchQuery(site: any) {
+    const fromBox = getPinnedQuery(site);
+    if (fromBox) return fromBox;
+    const fromPage = String(findVisibleInput(site?.selector)?.value || '').trim();
+    if (fromPage) return fromPage;
+    return getPinnedQueryFromUrl(site);
+  }
+
   // 常驻搜索框本来没有内容时，把页面上新选中的文字填进去：选中的文字本身就是想搜的内容。
   // 只认「空」和「上一次搜索」的兜底填充这两种情况，页面搜索框里的值、URL 里的查询参数
   // 以及用户自己的输入都不覆盖；写入的值交给 syncPinnedQuery 保护，直到页面出现真实查询。
@@ -3179,6 +3409,8 @@ export default defineContentScript({
     const current = pinnedQuery.value.trim();
     if (current && current !== getPinnedHistoryQuery()) return;
     if (current === text) return;
+    pinnedDraftQuery = '';
+    pinnedUserCleared = false;
     pinnedSelectionQuery = text;
     pinnedQuery.value = text;
   }
@@ -3212,9 +3444,20 @@ export default defineContentScript({
         positionPinnedBar(site);
         return;
       }
-      const input = findVisibleInput(site.selector);
-      const query = getPinnedQuery(site);
-      if (!query) return getPinnedQueryInput()?.focus() || input?.focus();
+      const pageInput = findVisibleInput(site.selector);
+      const query = resolvePinnedSearchQuery(site);
+      // 三处都没有查询词时才把焦点交给输入框：让用户先打词再搜。
+      // 只要页面或地址里有词就走搜索——此前只读常驻框，空框在视频站上
+      // 表现为「点图标没反应」，而页面上明明有可搜的内容。
+      if (!query) {
+        // 优先常驻框。`a?.focus() || b?.focus()` 这个写法是错的：Element.focus() 返回
+        // undefined，`||` 会继续求值，焦点被无条件交给页面搜索框——用户点的明明是
+        // 扩展的图标，光标却跑到站点输入框里。focus() 不抛错就视为成功，显式 return。
+        const ownInput = getPinnedQueryInput();
+        if (ownInput) { ownInput.focus(); return; }
+        pageInput?.focus();
+        return;
+      }
       if (entry.isSpecial) {
         if (entry.action === 'copy') void copyTextToClipboard(query);
         else if (entry.action === 'notes') saveTextToOutlineNotes(query);
@@ -3250,6 +3493,47 @@ export default defineContentScript({
     return button;
   }
 
+  /**
+   * 常驻栏的结构指纹：只有它变了才重建按钮 DOM。
+   *
+   * 为什么必须有这道闸：页面 DOM 一变就会走到 mountPinnedBar，而 mountPinnedBar 原先无条件
+   * 重建按钮。实测动态页面（结果流、埋点持续增删节点）下 `.entries` 每秒被整体替换 6 次以上，
+   * 于是出现两类缺陷：
+   *   1) 用户按下与抬起之间跨过一次替换，两个事件落在不同元素上，`click` 不派发 ——
+   *      表现为「点图标没反应」，且是否命中取决于按压时长，所以只有「部分」图标中招；
+   *   2) 被替换掉的按钮正持有焦点，浏览器随即在 `.bar` 上派发 focusout，收起排定被挂上 ——
+   *      表现为「点一下分组，一秒后栏自己收起」（实测事件序列 focusin → focusout）。
+   *
+   * 指纹覆盖一切影响呈现的字段，少一个都会让界面停在旧状态。
+   */
+  function pinnedRenderSignatureFor(site: any, directEntries: any[], hiddenEntries: any[], groupEntries: any[], expandedGroupId: any, moreExpanded: any) {
+    const iconOnlyMap = getPinnedConfig().iconOnly;
+    const describe = (entry: any, allowIconOnly: boolean) => {
+      const iconOnly = allowIconOnly && !entry.isGroup
+        && (entry.iconOnly === true || iconOnlyMap?.[entry.id] === true);
+      return [
+        entry.id, entry.isGroup ? 'g' : '', entry.groupId || '', entry.isSpecial ? 's' : '',
+        entry.action || '', entry.name, entry.mark || '', entry.className || '',
+        entry.iconUrl || '', iconOnly ? '1' : '0', entry.specialTitle || '',
+      ].join('\u0001');
+    };
+    return [
+      site?.id || '', site?.selector || '', site?.host || '', String(site?.selectorConfigured),
+      String(getPinnedDefaultGroupCount()), String(moreExpanded), String(expandedGroupId || ''),
+      directEntries.map((entry: any) => describe(entry, true)).join('\u0002'),
+      hiddenEntries.map((entry: any) => describe(entry, true)).join('\u0002'),
+      groupEntries.map((entry: any) => describe(entry, false)).join('\u0002'),
+    ].join('\u0003');
+  }
+
+  /** 与结构无关的收尾：显隐、模式按钮、栏高。重建与跳过两条路径都要走。 */
+  function refreshPinnedBarChrome(root: any) {
+    const entries = root?.querySelector('.entries');
+    setPinnedHostVisible(Boolean(entries?.childElementCount));
+    syncPinnedOpenModeButton(root);
+    syncPinnedBarHeight(root);
+  }
+
   function renderPinnedBar(site) {
     const root = ensurePinnedHost().shadowRoot;
     const entries = root.querySelector('.entries');
@@ -3257,17 +3541,27 @@ export default defineContentScript({
     const allEntries = getPinnedEntries();
     const directEntries = allEntries.slice(0, getPinnedDefaultGroupCount());
     const hiddenEntries = allEntries.slice(directEntries.length);
+    // 输入框取值与结构无关，但会随页面查询、草稿、清空状态变化，每次都要同步（含跳过重建这条路径）。
     syncPinnedQuery(site);
+    const groupEntries = pinnedMoreExpanded
+      ? hiddenEntries
+      : pinnedExpandedGroupId ? getPinnedGroupSources(pinnedExpandedGroupId) : [];
+    const signature = pinnedRenderSignatureFor(site, directEntries, hiddenEntries, groupEntries, pinnedExpandedGroupId, pinnedMoreExpanded);
+    if (signature === pinnedRenderSignature) {
+      refreshPinnedBarChrome(root);
+      return;
+    }
+    pinnedRenderSignature = signature;
+    // 紧随其后的 replaceChildren 会把持有焦点的按钮移出文档，浏览器随即在 .bar 上派发 focusout。
+    // 那是重建的副产物、不是用户移开焦点，用时间窗标出来供 focusout 监听跳过。
+    pinnedFocusoutSuppressUntil = Date.now() + PINNED_FOCUSOUT_GRACE_MS;
     entries.replaceChildren();
     directEntries.forEach((entry) => entries.append(createPinnedButton(entry, site)));
     if (hiddenEntries.length) entries.append(createPinnedMoreButton(site));
     groupList.replaceChildren();
-    if (pinnedMoreExpanded) hiddenEntries.forEach((entry) => groupList.append(createPinnedButton(entry, site, false)));
-    else if (pinnedExpandedGroupId) getPinnedGroupSources(pinnedExpandedGroupId).forEach((entry) => groupList.append(createPinnedButton(entry, site, false)));
+    groupEntries.forEach((entry) => groupList.append(createPinnedButton(entry, site, false)));
     groupList.hidden = !groupList.childElementCount;
-    setPinnedHostVisible(Boolean(entries.childElementCount));
-    syncPinnedOpenModeButton(root);
-    syncPinnedBarHeight(root);
+    refreshPinnedBarChrome(root);
   }
 
   function syncPinnedBarHeight(root = pinnedHost?.shadowRoot) {
@@ -3299,6 +3593,18 @@ export default defineContentScript({
     }, remaining);
   }
 
+  /**
+   * 常驻栏飞层（分组展开的列表）定位。
+   *
+   * **紧贴被触发图标的侧边展开**，与图标同高——用户明确要求「显示在分组图标的旁边」，
+   * 落在整条栏下方（旧实现）视觉上像「栏底下又长出一块」，与点击图标的动作对不上。
+   *
+   * 已知代价（用户明确接受）：飞层宽 170px，从图标右缘起画会盖住同一行右侧的分组图标
+   * ——实测最多盖住 3 个。被盖住的图标在那段时间里不可点，用户若凭记忆去点它，
+   * 命中的是飞层里的条目、会跳到搜索引擎。这正是早前「点分组没反应 / 点错源」的成因，
+   * 旧版本靠「落到栏下方」规避；现在改回侧边展开，即以该缺陷换位置贴合度。
+   * 右侧放不下就翻到图标左侧，两侧都放不下再夹回视口内。
+   */
   function positionPinnedGroupList() {
     if ((!pinnedExpandedGroupId && !pinnedMoreExpanded) || !pinnedHost) return;
     const root = pinnedHost.shadowRoot;
@@ -3312,9 +3618,11 @@ export default defineContentScript({
     const buttonRect = triggerButton.getBoundingClientRect();
     const flyoutWidth = Math.min(groupList.offsetWidth || 160, window.innerWidth - 20);
     const flyoutHeight = Math.min(groupList.offsetHeight || 36, window.innerHeight - 20);
+    // 水平：优先紧贴图标右缘，右侧放不下翻到左缘。
     let left = buttonRect.right + 6;
     if (left + flyoutWidth > window.innerWidth - 10) left = buttonRect.left - flyoutWidth - 6;
     left = Math.max(10, Math.min(window.innerWidth - flyoutWidth - 10, left));
+    // 垂直：与触发图标同高（不是栏下沿），这样它看起来就是「从这个图标长出去的」。
     const top = Math.max(10, Math.min(window.innerHeight - flyoutHeight - 10, buttonRect.top));
     groupList.style.left = `${left}px`;
     groupList.style.top = `${top}px`;
@@ -3327,6 +3635,7 @@ export default defineContentScript({
     if (collapsed) {
       pinnedExpandedGroupId = null;
       pinnedMoreExpanded = false;
+      pinnedPointerHeld = false;
       if (site) renderPinnedBar(site);
     }
     pinnedHost.classList.toggle('is-collapsed', collapsed);
@@ -3374,6 +3683,9 @@ export default defineContentScript({
   }
 
   function mountPinnedBar() {
+    // 子框架不渲染常驻搜索栏：它是整页级 UI，在每个 iframe 里重复出现没有意义。
+    // 触发点与搜索浮层继续可用（那是注入子框架的目的）。
+    if (IS_SUBFRAME) return;
     const site = getPinnedSite();
     if (!site || !settings) {
       clearPinnedCollapseTimer();
@@ -3388,12 +3700,19 @@ export default defineContentScript({
       clearPinnedCollapseTimer();
       pinnedMountedSiteId = site.id;
       pinnedMountedPageKey = pageKey;
+      // 换页一律重建，不受指纹闸门约束。指纹只覆盖「站点解析结果 + 条目 + 展开状态」，
+      // 换页时这些可能恰好相同（如同一站点内跳转），但按钮上挂的闭包仍指向旧页面上下文。
+      pinnedRenderSignature = '';
+      pinnedPointerHeld = false;
       if (!isEditingPinnedQuery()) {
         pinnedBarCollapsed = true;
         pinnedCollapsePaused = false;
         pinnedMoreExpanded = false;
         pinnedExpandedGroupId = null;
         pinnedSelectionQuery = '';
+        pinnedDraftQuery = '';
+        pinnedSyncedRealQuery = '';
+        pinnedUserCleared = false;
       }
     }
     const host = ensurePinnedHost();
@@ -3406,6 +3725,7 @@ export default defineContentScript({
   }
 
   function schedulePinnedMount() {
+    if (IS_SUBFRAME) return;
     // 顺序不能反：防抖生效期间它每收到一次 DOM 变动就被调用一次，先判 timer 才能把
     // 站点解析压到「一次变动窗口一次」。mountPinnedBar 内部还有一次同样的判定，兜住
     // 这层早退漏掉的情况（例如排队期间 settings 变了）。
@@ -3472,6 +3792,7 @@ export default defineContentScript({
         if (engine.isSpecial) {
           if (engine.action === 'copy') void copyTextToClipboard(selectedText);
           else if (engine.action === 'notes') saveTextToOutlineNotes(selectedText);
+          else if (engine.action === 'ask-ai') askAiFromAction(selectedText);
           hideAll();
           return;
         }
