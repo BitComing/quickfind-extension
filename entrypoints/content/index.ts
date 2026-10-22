@@ -1458,12 +1458,38 @@ export default defineContentScript({
     return (typeof event.composedPath === 'function' && event.composedPath().includes(host)) || host.contains(event.target);
   }
 
+  // 会与页面快捷键冲突的编辑键。视频站（B 站、YouTube 等）用空格做播放/暂停、
+  // 用方向键做快进/音量，而扩展输入框里这些键应该是纯编辑操作。
+  const OVERLAY_EDIT_KEYS = new Set([' ', 'Spacebar', 'Space', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']);
+
+  /**
+   * 扩展输入框的按键隔断。
+   *
+   * 视频站的通用判法是「document 捕获阶段监听 keydown，target 是 INPUT/TEXTAREA
+   * 就放行」——借此区分「在搜索框打字」与「全站快捷键」。扩展的输入框在 shadow DOM 里，
+   * 页面侧看到的 event.target 被重定向成宿主 <div>，那条判定失效，空格于是被当成
+   * 播放/暂停：在扩展输入框里打字会暂停视频。
+   *
+   * 判定不能只看某一个输入框。此前只认选区浮层的 queryInput，而常驻搜索栏与 LLM 侧栏
+   * 各自是独立 shadow root，它们的按键全部漏给了页面。改为看整条事件路径：只要经过
+   * 某个扩展宿主、且路径里确实有可编辑元素，就把编辑键拦在扩展内部。
+   * 只拦编辑键，其余按键照常外传，不影响页面自身的键盘操作。
+   */
   function keepPanelSearchKeysInOverlay(event) {
+    if (!OVERLAY_EDIT_KEYS.has(event.key) && event.code !== 'Space') return;
     const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
-    if (!path.includes(queryInput)) return;
-    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== ' ' && event.key !== 'Spacebar' && event.code !== 'Space') return;
-    // Preserve the textarea's native editing behavior while keeping page-level
-    // video shortcuts from receiving its navigation and space keys.
+    if (!path.length) return;
+    // 按 id 取常驻栏宿主，而不是引用模块级变量：那个变量由 `let = null` 声明，
+    // 每引用一次就记一个隐式 any，会给类型债务加数（见 README 的记账口径）。
+    if (!path.some((node: any) => node === host || node?.id === 'quickfind-pinned-search-host')) return;
+    // 用 nodeType/tagName 判定而不依赖跨世界 instanceof：content script 在隔离世界运行，
+    // 从页面侧拿到的元素对象其原型链与本世界不同。isContentEditable 只有 HTMLElement 有，
+    // 所以先按 nodeType 收窄，再读属性。
+    const editing = path.some((node: any) => node && node.nodeType === 1 &&
+      (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.isContentEditable === true));
+    if (!editing) return;
+    // 输入框的原生编辑行为（插入空格、移动光标）不依赖 window 上的监听器，
+    // 所以这里只阻断页面侧的快捷键，输入本身不受影响。
     event.stopImmediatePropagation();
   }
 
