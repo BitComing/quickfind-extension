@@ -2,6 +2,11 @@
 .playwright-cli/
 output/playwright/
 
+# 本机 sync 存储快照：由 output/read-sync-log.cjs 导出，含个人 searchHistory，不入库
+output/_live-sync-state.json
+# 过程截图（体积大且随环境变化，回归用例在 tests/ 入库）
+output/shots/
+
 # Local backup of the corrupted repo (can be deleted once verified)
 .git.bak/
 
