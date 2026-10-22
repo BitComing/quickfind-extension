@@ -4,6 +4,8 @@ import { SPECIAL_ACTIONS } from '@/shared/search-actions';
 import { createNoteDrag } from '@/shared/note-drag';
 import { BUILTIN_SOURCES, backfillBuiltinSources, DEFAULT_PINNED_SITE_IDS, PINNED_SITE_CONFIG_VERSION } from '@/shared/builtins';
 import { DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS, MAX_DEFAULT_GROUP_COUNT } from '@/shared/defaults';
+import { decodeQueryText, normalizeSelectionText } from '@/shared/query-text';
+import { markdownToPlainText, renderMarkdown } from '@/shared/markdown';
 import {
   createEmptyNotes as outlineCreateEmptyNotes,
   normalizeNotes as outlineNormalizeNotes,
@@ -24,9 +26,33 @@ import {
 
 export default defineContentScript({
   matches: ['<all_urls>'],
+  // 也注入子框架：否则 iframe 里选中文字不会有触发图标（此前就是这样，
+  // 用户读到的表现是「有些地方选中文字不出图标」）。子框架里只保留选区触发点
+  // 与搜索浮层——常驻搜索栏与 LLM 侧栏是整页级 UI，重复出现在每个 iframe 里毫无意义，
+  // 见下面的 IS_SUBFRAME 分支。
+  allFrames: true,
+  // srcdoc / about:blank 这类没有自身 URL 的子框架也要注入（默认不注入，页面上表现
+  // 就是「iframe 里的字选中了却没反应」）。match_origin_as_fallback 让这类框架
+  // 按其创建者的源来匹配 <all_urls>。
+  matchAboutBlank: true,
+  matchOriginAsFallback: true,
   runAt: 'document_idle',
   main() {
   'use strict';
+  // 顶层文档才渲染常驻搜索栏、LLM 侧栏这些整页级 UI；子框架只做选区触发。
+  const IS_SUBFRAME = window.top !== window.self;
+
+  /**
+   * 页面 shadow DOM 内选区的取回结果。
+   *
+   * 单独起一个名字是必要的：`found` 是个「闭包内被赋值、闭包外被读取」的变量，
+   * 不标类型会被推断成 never（TS2339/TS7034），而这里必须显式写明它装了什么。
+   */
+  interface ShadowSelectionHit {
+    text: string;
+    range: Range;
+    rect: { left: number; right: number; top: number; bottom: number; width: number; height: number };
+  }
 
   const PINNED_SITES = [
     { id: 'google', name: 'Google' },
@@ -1587,7 +1613,8 @@ export default defineContentScript({
     const input = document.activeElement;
     if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) return null;
     if (typeof input.selectionStart !== 'number' || typeof input.selectionEnd !== 'number' || input.selectionStart === input.selectionEnd) return null;
-    const text = input.value.slice(input.selectionStart, input.selectionEnd).replace(/\s+/g, ' ').trim();
+    // textarea 里的选区本身可能就是多行，保留它的换行；单行 input 显示不了换行，仍压平。
+    const text = normalizeSelectionText(input.value.slice(input.selectionStart, input.selectionEnd), input instanceof HTMLTextAreaElement);
     if (!text) return null;
     return { text, input, rect: getInputSelectionRect(input, input.selectionStart, input.selectionEnd) };
   }
@@ -1599,9 +1626,53 @@ export default defineContentScript({
     const editable = anchor?.closest?.('[contenteditable="true"]');
     if (!editable || !editable.isContentEditable || !editable.contains(selection.focusNode)) return null;
     const range = selection.getRangeAt(0);
-    const text = selection.toString().replace(/\s+/g, ' ').trim();
+    // 页面正文的选区天然带段落边界，保留换行与段间空行，别把多段挤成一行。
+    const text = normalizeSelectionText(selection.toString(), true);
     if (!text) return null;
     return { text, element: editable, range, rect: getSelectionRect(range) };
+  }
+
+  /**
+   * 选中文字落在**页面自己的 shadow DOM** 里时，取回选区。
+   *
+   * 为什么必须单独处理：浏览器对「选区跨过影子边界」的情况，会让 window.getSelection()
+   * 返回一个 `isCollapsed === true` 的选区（`toString()` 却仍有文字，`getRangeAt(0)`
+   * 是一段空 range、几何全为 0）。于是 showForSelection 里「collapsed 就当没有选区」
+   * 的判定会把这类选区整个丢掉——表现就是「有些地方选中文字不出图标」。
+   * 这与本扩展自己的 shadow root 无关（宿主是文档里普通元素，选区仍在 document 树内）。
+   *
+   * Chromium 在 shadowRoot 上提供了非标准的 `getSelection()`，在**拥有选区的那个根**上
+   * 调用会得到正常折叠状态与真实几何；在别的根上调用则返回折叠选区。据此判定归属。
+   * 只遍历 open 的 shadow root —— closed 的取不到内部选区，只能保持现状。
+   *
+   * 遍历有代价（每层都要 getSelection()），所以挂在 mouseup / selectionchange 上，
+   * 且只在「document 选区为空或已折叠」时才走这条路径：主文档选区不受影响、不付这个成本。
+   */
+  function getShadowSelection(): ShadowSelectionHit | null {
+    let found: ShadowSelectionHit | null = null;
+    // 参数显式标 any：本文件尚未补齐类型，未标注的参数每处都记一个隐式 any（见 README 记账口径）。
+    const visit = (root: any) => {
+      if (found) return;
+      let elements: any;
+      try { elements = root.querySelectorAll('*'); } catch { return; }
+      for (const element of elements) {
+        if (found) return;
+        const shadowRoot = element.shadowRoot;
+        if (!shadowRoot) continue;
+        try {
+          const selection = typeof shadowRoot.getSelection === 'function' ? shadowRoot.getSelection() : null;
+          if (selection && selection.rangeCount && !selection.isCollapsed) {
+            const range = selection.getRangeAt(0);
+            // 页面正文的选区天然带段落边界，保留换行与段间空行。
+            const text = normalizeSelectionText(selection.toString(), true);
+            if (text) { found = { text, range, rect: getSelectionRect(range) }; return; }
+          }
+        } catch { /* 取不到就跳过这个根 */ }
+        visit(shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
   }
 
   function positionTrigger(rect) {
@@ -1636,6 +1707,20 @@ export default defineContentScript({
     const height = Math.max(minHeight, Math.min(maxHeight, queryInput.scrollHeight || minHeight));
     queryInput.style.height = `${height}px`;
     queryInput.style.overflowY = (queryInput.scrollHeight || 0) > maxHeight ? 'auto' : 'hidden';
+  }
+
+  /** 切到多行输入外观。展开态只改内边距与行高，能装下的高度由 resizeQueryInput 现算。 */
+  function setQueryRowExpanded(expanded: any) {
+    queryRow.classList.toggle('expanded', expanded);
+    queryExpand.setAttribute('aria-expanded', String(expanded));
+    const label = expanded ? '收起多行输入' : '展开多行输入';
+    queryExpand.setAttribute('aria-label', label);
+    queryExpand.setAttribute('title', label);
+  }
+
+  /** 多行选区进框时自动展开：单行外观会把换行挤在一行的行高里，看不出来是几段。 */
+  function syncQueryRowExpandForText(text: any) {
+    if (String(text || '').includes('\n')) setQueryRowExpanded(true);
   }
 
   function getAvailableEngines() {
@@ -1700,7 +1785,9 @@ export default defineContentScript({
   }
 
   function rememberSearch(query) {
-    const normalized = query.replace(/\s+/g, ' ').trim();
+    // 从编码 URL 抄来的查询先还原再入库，否则这串 %XX 会作为「最近一次搜索」
+    // 被常驻栏在之后每个没有查询的页面上兜底显示出来。
+    const normalized = decodeQueryText(query).replace(/\s+/g, ' ').trim();
     if (!normalized) return;
     const history = settings.searchHistory
       .map((item) => typeof item === 'string' ? { query: item } : item)
@@ -2250,7 +2337,7 @@ export default defineContentScript({
   // 历史记录里的最近一次搜索：拿不到页面搜索框和 URL 查询时，常驻栏用它兜底显示。
   function getPinnedHistoryQuery() {
     const history = Array.isArray(settings?.searchHistory) ? settings.searchHistory : [];
-    return String(history.map((item) => typeof item === 'string' ? item : item?.query).find(Boolean) || '');
+    return decodeQueryText(String(history.map((item) => typeof item === 'string' ? item : item?.query).find(Boolean) || ''));
   }
 
   // site 的形状见 getPinnedSite()，本文件补齐类型标注时统一收敛到 shared/settings.ts。
@@ -2282,16 +2369,18 @@ export default defineContentScript({
     for (const key of keys) {
       for (const params of paramsList) {
         const match = Array.from(params.entries()).find(([name, value]) => name.toLowerCase() === key && value.trim());
-        if (match) return match[1].trim();
+        // URLSearchParams 只解一层百分号编码；双重编码的地址解出来仍是 %XX 串，再还原一次。
+        if (match) return decodeQueryText(match[1].trim());
       }
     }
     if (site.pathHasMarker) {
       let pathname = location.pathname || '/';
       try { pathname = decodeURIComponent(pathname); } catch { /* keep encoded path */ }
+      pathname = decodeQueryText(pathname);
       const prefix = String(site.pathPrefix || ''), suffix = String(site.pathSuffix || '');
       if (pathname.toLowerCase().startsWith(prefix.toLowerCase()) && pathname.toLowerCase().endsWith(suffix.toLowerCase())) {
         const value = pathname.slice(prefix.length, pathname.length - suffix.length || undefined);
-        if (value && value.toLowerCase() !== '__quickfind_query__') return value;
+        if (value && value.toLowerCase() !== '__quickfind_query__') return decodeQueryText(value);
       }
     }
     return '';
@@ -2655,14 +2744,30 @@ export default defineContentScript({
     const editableSelection = inputSelection || contentEditableSelection;
     if (editableSelection && settings.editableTriggerMode === 'none') return hideAll();
     const selection = inputSelection ? null : window.getSelection();
-    if (!inputSelection && (!selection || selection.isCollapsed)) return hideAll();
-    const text = editableSelection ? editableSelection.text : selection.toString().replace(/\s+/g, ' ').trim();
-    if (!text || text.length > 5000) return hideAll();
+    // 页面自己被 shadow DOM 包住的选区：document 选区会退化成 collapsed（见 getShadowSelection）。
+    // 只在「折叠但 toString 仍有文字」时才去遍历影子根——普通点击的 toString 为空，
+    // 不会为此付出遍历成本。主文档选区不受影响。
+    const shadowSelection = inputSelection || contentEditableSelection
+      ? null
+      : (selection && selection.isCollapsed && selection.toString().trim() ? getShadowSelection() : null);
+    if (!inputSelection && !shadowSelection && (!selection || selection.isCollapsed)) return hideAll();
+    // 浮层面板的搜索框是 textarea，能显示换行——选中的多段文字按原始分行进入，
+    // 不再压成一行。单行的下游（常驻栏 input、弹窗 input、搜索 URL）各自折叠空白。
+    const documentText = selection ? normalizeSelectionText(selection.toString(), true) : '';
+    const text = editableSelection ? editableSelection.text
+      : shadowSelection ? shadowSelection.text
+      : documentText;
+    // 这里**不设长度上限**：此前有一段 `text.length > 5000 → hideAll()`，于是整页
+    // Ctrl+A（长文页动辄上万字）时触发点静默消失，用户看到的就是「有些地方选不中」。
+    // 任何阈值都只是把同一个缺陷挪到另一个长度上，所以直接取消。
+    if (!text) return hideAll();
     if (!selectionPointerPending && selectionPointerText && selectionPointerText !== text) selectionPointer = null;
     selectionPointerPending = false;
     selectionPointerText = text;
-    const range = inputSelection ? null : contentEditableSelection?.range || selection.getRangeAt(0);
-    const rect = inputSelection ? inputSelection.rect : contentEditableSelection?.rect || getSelectionRect(range);
+    const liveRange = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+    const range = inputSelection ? null : contentEditableSelection?.range || shadowSelection?.range || liveRange;
+    const rect = inputSelection ? inputSelection.rect
+      : contentEditableSelection?.rect || shadowSelection?.rect || (liveRange ? getSelectionRect(liveRange) : null);
     if (!rect || (!rect.width && !rect.height)) return hideAll();
     selectedText = text;
     selectedRange = range ? range.cloneRange() : null;
@@ -2674,6 +2779,7 @@ export default defineContentScript({
     panelManuallyMoved = false;
     trigger.classList.toggle('disabled', !settings.enabled);
     queryInput.value = text;
+    syncQueryRowExpandForText(text);
     resizeQueryInput();
     positionTrigger(rect);
     trigger.classList.add('visible');
@@ -2697,6 +2803,7 @@ export default defineContentScript({
     panelOpen = true;
     trigger.setAttribute('aria-expanded', 'true');
     queryInput.value = selectedText;
+    syncQueryRowExpandForText(selectedText);
     resizeQueryInput();
     renderEngines();
     positionPanel();
@@ -2727,8 +2834,15 @@ export default defineContentScript({
     if (!selectedRange || !selectedRange.startContainer?.isConnected) return;
     const selection = window.getSelection();
     if (!selection) return;
-    selection.removeAllRanges();
-    selection.addRange(selectedRange.cloneRange());
+    // 页面 shadow DOM 里的选区不能交给 document 选区还原：它的容器不在文档树里，
+    // addRange/selectNode 会抛错（而那只影响「面板打开后维持高亮」，不值得让流程中断）。
+    if (selectedRange.startContainer.getRootNode?.() !== document) return;
+    // 浏览器允许用 selectNodeContents 选中节点内容；某些选区的边界是元素本身时
+    // addRange 会拒绝，这里按是否可接受分流。
+    try {
+      selection.removeAllRanges();
+      selection.addRange(selectedRange.cloneRange());
+    } catch { /* 还原高亮失败不影响搜索本身 */ }
   }
 
   function snapshotRect(rect) {
@@ -2764,6 +2878,7 @@ export default defineContentScript({
     trigger.setAttribute('aria-expanded', 'false');
     panelOpen = true;
     queryInput.value = text;
+    syncQueryRowExpandForText(text);
     resizeQueryInput();
     renderEngines();
     panel.classList.add('visible');
@@ -2817,8 +2932,13 @@ export default defineContentScript({
   }, true);
   if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      // 这些消息按标签页广播；注入全部框架后每个 iframe 都会收到。只有顶层框架能
+      // 给出用户真正看到的选区、持有笔记侧栏与对话层，所以子框架一律不响应——
+      // 否则 sendResponse 会先被某个 iframe 的空结果抢占（表现为「读不到选中文字」）。
+      if (IS_SUBFRAME) return;
       if (message?.type === 'get-selection') {
-        sendResponse({ text: getInputSelection()?.text || window.getSelection()?.toString().replace(/\s+/g, ' ').trim() || '' });
+        // 弹窗的搜索框是单行 input，显示不了换行，这里按单行规整。
+        sendResponse({ text: getInputSelection()?.text || normalizeSelectionText(window.getSelection()?.toString(), false) || '' });
         return;
       }
       // 弹窗里的「笔记」按钮把内容交给页面侧栏写入：笔记的最新状态在它手上。
@@ -2861,11 +2981,7 @@ export default defineContentScript({
   queryInput.addEventListener('input', () => { selectedText = queryInput.value;
   resizeQueryInput(); if (panelOpen && anchorRect) requestAnimationFrame(() => { positionPanel(); positionGroupEngineList(); }); });
   queryExpand.addEventListener('click', () => {
-    const expandedInput = !queryRow.classList.contains('expanded');
-    queryRow.classList.toggle('expanded', expandedInput);
-    queryExpand.setAttribute('aria-expanded', String(expandedInput));
-    queryExpand.setAttribute('aria-label', expandedInput ? '收起多行输入' : '展开多行输入');
-    queryExpand.title = expandedInput ? '收起多行输入' : '展开多行输入';
+    setQueryRowExpanded(!queryRow.classList.contains('expanded'));
     resizeQueryInput();
     queryInput.focus();
     if (panelOpen && anchorRect) requestAnimationFrame(() => {
@@ -2954,8 +3070,10 @@ export default defineContentScript({
 
   function tryPrefillDoubao() {
     if (!/doubao\.com$/i.test(location.hostname)) return;
-    const query = new URLSearchParams(location.search).get('quickfind');
-    if (!query) return;
+    const raw = new URLSearchParams(location.search).get('quickfind');
+    if (!raw) return;
+    // 与常驻栏同一口径：地址里可能残留一层百分号编码，写进输入框前先还原。
+    const query = decodeQueryText(raw);
     let attempts = 0;
     const timer = window.setInterval(() => {
       attempts += 1;
@@ -2969,6 +3087,8 @@ export default defineContentScript({
     }, 400);
   }
   document.documentElement.append(host);
+  // LLM 侧栏与对话层都挂在这个宿主里，必须先入文档再初始化（子框架里 initializeLlmDock 自行早退）。
+  initializeLlmDock();
   loadSettings();
   const pinnedObserver = new MutationObserver(schedulePinnedMount);
   pinnedObserver.observe(document.documentElement, { childList: true, subtree: true });

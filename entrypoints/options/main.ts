@@ -23,6 +23,7 @@ import {
   notesToMarkdownLines as outlineNotesToMarkdownLines,
   parseMarkdownNotes as outlineParseMarkdownNotes,
 } from '@/shared/outline';
+import { decodeQueryText } from '@/shared/query-text';
 
 (function () {
   'use strict';
@@ -215,7 +216,7 @@ import {
   function normalizeSearchHistory(history) {
     if (!Array.isArray(history)) return [];
     return history.map((item) => {
-      const query = String(typeof item === 'string' ? item : item?.query || '').replace(/\s+/g, ' ').trim();
+      const query = decodeQueryText(String(typeof item === 'string' ? item : item?.query || '')).replace(/\s+/g, ' ').trim();
       if (!query) return null;
       const timestamp = Number(typeof item === 'string' ? NaN : item?.timestamp);
       return Number.isFinite(timestamp) ? { query, timestamp } : { query };
