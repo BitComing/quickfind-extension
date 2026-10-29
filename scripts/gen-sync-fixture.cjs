@@ -1,5 +1,5 @@
 // 由实时配置生成回归基准 tests/fixtures/_sync-state.txt（与旧的 KEY(n)/VAL(n) 格式一致）。
-// 只写基准文件，不改源码。用法：node output/gen-sync-fixture.cjs
+// 只写基准文件，不改源码。用法：node scripts/gen-sync-fixture.cjs
 const fs = require('fs');
 const path = require('path');
 

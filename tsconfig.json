@@ -9,12 +9,10 @@
   "exclude": [
     "node_modules",
     ".output",
-    ".output2",
     ".git",
     ".git.bak",
     ".playwright-cli",
     ".workbuddy",
-    "legacy",
     "output"
   ]
 }

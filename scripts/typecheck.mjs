@@ -37,7 +37,7 @@ const BASELINE_PATH = path.join(ROOT, '.typecheck-baseline.json');
 const NOCHECK = /^\s*\/\/\s*@ts-nocheck\s*$/;
 /** 参与检查的目录，以及一律跳过的目录。 */
 const SCAN_DIRS = ['entrypoints', 'shared', 'types'];
-const SKIP_DIRS = new Set(['node_modules', '.output', '.output2', '.wxt', 'legacy', 'output', '.git', '.git.bak', '.workbuddy', '.playwright-cli']);
+const SKIP_DIRS = new Set(['node_modules', '.output', '.wxt', 'output', '.git', '.git.bak', '.workbuddy', '.playwright-cli']);
 /** 非 pretty 输出下每条诊断独占一行，形如 `path(line,col): error TS7006: msg`。 */
 const DIAG = /^(.+?)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s*(.*)$/;
 

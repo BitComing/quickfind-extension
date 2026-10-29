@@ -36,12 +36,13 @@
 | `shared/` | 跨入口共享的代码：`settings.ts`（领域类型）、`search-actions.ts`（特殊功能按钮定义）、`notes.ts`（笔记存储形状与「存到第一行」的写入规则） |
 | `public/` | 静态资源（图标等），构建时原样拷贝 |
 | `types/` | 补充类型声明 |
-| `scripts/` | 工程脚本：`typecheck.mjs`（类型检查与类型债务度量） |
+| `scripts/` | 工程脚本：`typecheck.mjs`（类型检查与类型债务度量）；`gen-sync-fixture.cjs` / `read-sync-log.cjs`（同步基准的生成与取证）；`shoot-pinned.cjs`（常驻栏截图） |
 | `tests/` | 端到端回归用例与 `helpers.cjs`（加载真实构建产物跑浏览器） |
+| `docs/` | 评审与设计存档。历史快照，其中的行号会随代码变动失效，不要当现状读 |
 | `biome.json` | Lint 配置。只开零争议规则（未使用变量/导入、`==`、`useConst` 等），见「工程门禁」 |
 | `.github/workflows/ci.yml` | CI：lint + 类型债务 → 构建 → 端到端回归 |
-| `legacy/` | 迁移前的根目录平铺产物，仅作回退参照，不参与构建 |
 | `.output/` | 构建产物（忽略提交） |
+| `output/` | 仅放本机产物：截图（`playwright/`、`shots/`）与 sync 存储快照，均不入库 |
 | `.typecheck-baseline.json` | 类型债务基线，随代码提交，用于阻止债务增加 |
 
 ## 开发命令

@@ -1,13 +1,15 @@
 /**
  * 一次性截图：常驻栏收起态 / 展开态 / 分组飞层。
- * 用法：node output/shoot-pinned.cjs
+ * 用法：node scripts/shoot-pinned.cjs（先 npm run build）
+ *
+ * 截图落在 output/shots/（已 gitignore），脚本本身在 scripts/。
  */
 const path = require('path');
 const fs = require('fs');
 const { launchWithExtension } = require('../tests/helpers.cjs');
 
 const PINNED_HOST = '#quickfind-pinned-search-host';
-const OUT = path.resolve(__dirname, 'shots');
+const OUT = path.resolve(__dirname, '..', 'output', 'shots');
 
 const PAGE = `<!doctype html><meta charset="utf-8"><title>shot</title>
 <style>body{font:16px sans-serif;margin:0;padding:24px;height:3000px;background:#fff}

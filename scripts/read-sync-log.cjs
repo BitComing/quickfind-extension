@@ -1,5 +1,5 @@
 // 解析扩展 sync 存储（LevelDB log），输出完整键值到 stdout（JSON）。
-// 只读。用法：node output/read-sync-log.cjs [logPath]
+// 只读。用法：node scripts/read-sync-log.cjs [logPath]
 const fs = require('fs');
 const path = require('path');
 
