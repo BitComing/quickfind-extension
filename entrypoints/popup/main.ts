@@ -9,21 +9,17 @@
 import type {
   HistoryItem,
   QuickFindSettings,
-  RawGroup,
-  SearchGroup,
   SearchSource,
   StoredSettings,
 } from '@/shared/settings';
-import { SPECIAL_ACTIONS } from '@/shared/search-actions';
 import { LEGACY_NOTES_STORAGE_KEY, NOTES_STORAGE_KEY, prependNotesLines, splitNotesLines } from '@/shared/notes';
-import { BUILTIN_SOURCES, backfillBuiltinSources } from '@/shared/builtins';
-import { DEFAULT_GROUP_NAME, DEFAULT_SETTINGS } from '@/shared/defaults';
+import { DEFAULT_SETTINGS } from '@/shared/defaults';
 import { decodeQueryText } from '@/shared/query-text';
+import { normalizeSettings, resolveGroupEntries } from '@/shared/settings-store';
 
 (function () {
   'use strict';
 
-  const builtins: SearchSource[] = BUILTIN_SOURCES;
   // 传给 chrome.storage.sync.get 的默认值：既是键集合也提供缺省值，因此需要索引签名。
   const defaults: StoredSettings & Record<string, unknown> = {
     ...DEFAULT_SETTINGS,
@@ -48,67 +44,7 @@ import { decodeQueryText } from '@/shared/query-text';
   let historyOpen = false;
   let queryEditedSinceOpen = false;
 
-  function normalize(value: StoredSettings): QuickFindSettings {
-    const rawGroups: RawGroup[] = Array.isArray(value.groups) ? value.groups : [];
-    const configured = Array.isArray(value.sources) && (value.sources.length || rawGroups.some((group) => group.id === 'default'));
-    // configured 为真时 value.sources 必然是数组，此处断言只表达这一前提。
-    const rawSources: SearchSource[] = configured ? [...value.sources!] : builtins.map((source): SearchSource => ({ ...source,
-    enabled: value.engines?.[source.id] !== false, iconOnly: value.iconOnly?.[source.id] === true })).concat(Array.isArray(value.customEngines) ? value.customEngines : []);
-    if (configured) {
-      // 补源规则与另两个入口共用一份（shared/builtins.ts）：只在配置版本落后时补，
-      // 否则用户自己删掉的内置源会在打开弹窗后被悄悄加回来。
-      backfillBuiltinSources(rawSources, value.sourceConfigVersion, true, false);
-    }
-    const sources: SearchSource[] = rawSources.filter((source) => source && source.id && source.name && (source.url || source.buildUrl)).map((source) => ({ ...source,
-    id: String(source.id), className: source.className || (String(source.id).startsWith('custom-') ? 'custom' : String(source.id)) }));
-    const sourceMap = new Map<string, SearchSource>(sources.map((source): [string, SearchSource] => [source.id, source]));
-    const actionTokens = new Set(SPECIAL_ACTIONS.map((action) => 'action:' + action.id));
-    const oldDefault = rawGroups.find((group) => group.id === 'default');
-    const customGroups: SearchGroup[] = rawGroups.filter((group) => group && group.id && group.id !== 'default')
-      .map((group) => ({ id: String(group.id), name: String(group.name || '未命名分组'), items: [], visible: group.visible !== false && group.showInDefault !== false }));
-    const customIds = new Set(customGroups.map((group) => group.id));
-    const assigned = new Set<string>();
-    customGroups.forEach((group) => {
-      const rawGroup = rawGroups.find((item) => String(item?.id) === group.id);
-      (rawGroup?.items || rawGroup?.sourceIds || []).map(String).forEach((id) => {
-        if ((sourceMap.has(id) || actionTokens.has(id)) && !assigned.has(id)) { group.items.push(id); assigned.add(id); }
-      });
-    });
-    const order: string[] = Array.isArray(value.engineOrder) ? value.engineOrder.map(String) : sources.map((source) => source.id);
-    const defaultItems: string[] = [];
-    const seen = new Set<string>();
-    (oldDefault?.items || oldDefault?.sourceIds || order).map(String).forEach((item) => {
-      const validGroup = item.startsWith('group:') && customIds.has(item.slice(6));
-      const validSource = sourceMap.has(item) && !assigned.has(item);
-      const validAction = actionTokens.has(item) && !assigned.has(item);
-      if ((validGroup || validSource || validAction) && !seen.has(item)) { defaultItems.push(item); seen.add(item); }
-    });
-    sources.forEach((source) => { if (!assigned.has(source.id) && !seen.has(source.id)) { defaultItems.push(source.id); seen.add(source.id); } });
-    customGroups.forEach((group) => { const token = 'group:' + group.id; if (!seen.has(token)) defaultItems.push(token); });
-    const groups: SearchGroup[] = [{ id: 'default', name: String(oldDefault?.name || DEFAULT_GROUP_NAME), items: defaultItems, visible: oldDefault?.visible !== false }, ...customGroups];
-    return { enabled: value.enabled !== false, sources, groups, searchHistory: Array.isArray(value.searchHistory) ? value.searchHistory : [] };
-  }
-
-  function getGroupSources(group: { id?: string; items: string[] }): SearchSource[] {
-    const sourceMap = new Map<string, SearchSource>(settings.sources.map((source): [string, SearchSource] => [source.id, source]));
-    const sources: SearchSource[] = [];
-    group.items.forEach((id) => {
-      if (group.id === 'default' && String(id).startsWith('group:')) {
-        const customGroup = settings.groups.find((item) => item.id === String(id).slice(6));
-        if (customGroup && customGroup.visible !== false && customGroup.showInDefault !== false) sources.push({ id: 'group:' + customGroup.id,
-        groupId: customGroup.id, name: customGroup.name, mark: '群', className: 'group', isGroup: true });
-        return;
-      }
-      if (String(id).startsWith('action:')) {
-        const action = SPECIAL_ACTIONS.find((item) => item.id === String(id).slice(7));
-        if (action) sources.push({ ...action, id: String(id) });
-        return;
-      }
-      const source = sourceMap.get(id);
-      if (source && source.enabled !== false) sources.push(source);
-    });
-    return sources;
-  }
+  // 源的收敛、条目解析都在 shared/settings-store.ts，弹窗这里只负责渲染。
   // normalize 已保证每个源至少具备 url 或 buildUrl 之一，走 url 分支时它必然存在。
   function getSearchUrl(source: SearchSource, query: string): string { if (source.id === 'doubao') return `https://www.doubao.com/chat/?quickfind=${encodeURIComponent(query)}`;
   return typeof source.buildUrl === 'function' ? source.buildUrl(query) : source.url!.replace(/\{query\}/gi, encodeURIComponent(query)); }
@@ -256,7 +192,7 @@ import { decodeQueryText } from '@/shared/query-text';
       groupTabs.append(tab);
     });
     engineSettings.replaceChildren(); const active = settings.groups.find((group) => group.id === activeGroupId) || settings.groups[0];
-    getGroupSources(active || { items: [] }).forEach((source) => { const button = document.createElement('button');
+    resolveGroupEntries(settings, active?.id || 'default').forEach((source) => { const button = document.createElement('button');
     button.type = 'button'; button.className = `engine-row${source.isGroup ? ' group-row' : ''}`;
     button.title = source.isGroup ? `打开${source.name}` : source.isSpecial ? String(source.specialTitle || source.name) : `使用${source.name}搜索`;
     const ident = document.createElement('span'); ident.className = 'engine-ident';
@@ -292,13 +228,13 @@ import { decodeQueryText } from '@/shared/query-text';
   queryInput.addEventListener('input', () => { queryEditedSinceOpen = true; syncClearButton(); });
   queryInput.addEventListener('keydown', (event) => { if (event.key !== 'Enter' || event.isComposing) return;
   const active = settings?.groups.find((group) => group.id === activeGroupId) || settings?.groups[0];
-  const source = getGroupSources(active || { items: [] }).find((item) => !item.isGroup); if (!source) return; event.preventDefault(); submitSearch(source); });
+  const source = resolveGroupEntries(settings, active?.id || 'default').find((item) => !item.isGroup); if (!source) return; event.preventDefault(); submitSearch(source); });
   clearQuery.addEventListener('click', () => { queryInput.value = ''; syncClearButton(); queryInput.focus(); });
   historyToggle.addEventListener('click', () => { historyOpen = !historyOpen; historyToggle.setAttribute('aria-expanded', String(historyOpen)); historyList.hidden = !historyOpen; });
   openOptions.addEventListener('click', () => chrome.runtime.openOptionsPage());
   chrome.storage.onChanged?.addListener((changes, area) => { if (area !== 'sync') return;
-  chrome.storage.sync.get({ ...defaults }, (stored) => { savePopupCache(stored); render(normalize(stored)); }); });
-  function initialize(stored: StoredSettings) { const normalized = normalize({ ...defaults, ...stored });
+  chrome.storage.sync.get({ ...defaults }, (stored) => { savePopupCache(stored); render(normalizeSettings(stored)); }); });
+  function initialize(stored: StoredSettings) { const normalized = normalizeSettings({ ...defaults, ...stored });
   render(normalized); const latest = normalized.searchHistory?.[0];
   if (latest && !queryInput.value) queryInput.value = typeof latest === 'string' ? latest : latest.query || ''; syncClearButton(); requestSelection(); }
   function loadPopupSettings() { if (!chrome.storage.session) { chrome.storage.sync.get(defaults, (stored) => { savePopupCache(stored);

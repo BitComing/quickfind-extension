@@ -33,7 +33,7 @@
 | 路径 | 说明 |
 | --- | --- |
 | `entrypoints/` | 扩展源码：`popup/`、`options/`、`content/`、`background.ts` |
-| `shared/` | 跨入口共享的代码：`settings.ts`（领域类型）、`search-actions.ts`（特殊功能按钮定义）、`notes.ts`（笔记存储形状与「存到第一行」的写入规则） |
+| `shared/` | 跨入口共享的代码：`settings.ts`（领域类型）、`settings-store.ts`（存储形状 → 渲染形状的唯一实现：源的收敛与分组条目解析）、`builtins.ts`（内置源目录与补源规则）、`defaults.ts`（默认配置）、`search-actions.ts`（特殊功能按钮定义）、`notes.ts`（笔记存储键与「存到第一行」的写入规则）、`outline.ts`（大纲纯模型层） |
 | `public/` | 静态资源（图标等），构建时原样拷贝 |
 | `types/` | 补充类型声明 |
 | `scripts/` | 工程脚本：`typecheck.mjs`（类型检查与类型债务度量）；`gen-sync-fixture.cjs` / `read-sync-log.cjs`（同步基准的生成与取证）；`shoot-pinned.cjs`（常驻栏截图） |

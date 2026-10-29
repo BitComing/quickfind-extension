@@ -2,8 +2,8 @@
 // 由早期手写 JavaScript 迁移而来，尚未补齐类型标注；补全后删除本行。见 README「迁移状态」。
 import { SPECIAL_ACTIONS } from '@/shared/search-actions';
 import { createNoteDrag } from '@/shared/note-drag';
-import { BUILTIN_SOURCES, backfillBuiltinSources, SOURCE_CONFIG_VERSION, PINNED_SITE_CONFIG_VERSION as SHARED_PINNED_VERSION } from '@/shared/builtins';
-import { DEFAULT_GROUP_NAME, DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS as SHARED_DEFAULTS, DEFAULT_SOURCES, DEFAULT_GROUPS, LEGACY_CONFIG_KEYS, MAX_DEFAULT_GROUP_COUNT } from '@/shared/defaults';
+import { SOURCE_CONFIG_VERSION, PINNED_SITE_CONFIG_VERSION as SHARED_PINNED_VERSION } from '@/shared/builtins';
+import { DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS as SHARED_DEFAULTS, DEFAULT_SOURCES, DEFAULT_GROUPS, LEGACY_CONFIG_KEYS, MAX_DEFAULT_GROUP_COUNT } from '@/shared/defaults';
 import {
   createEmptyNotes as outlineCreateEmptyNotes,
   normalizeNotes as outlineNormalizeNotes,
@@ -24,6 +24,8 @@ import {
   parseMarkdownNotes as outlineParseMarkdownNotes,
 } from '@/shared/outline';
 import { decodeQueryText } from '@/shared/query-text';
+import { NOTES_STORAGE_KEY } from '@/shared/notes';
+import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/settings-store';
 
 (function () {
   'use strict';
@@ -49,8 +51,7 @@ import { decodeQueryText } from '@/shared/query-text';
     };
   }
 
-  // 内置源目录、默认配置、补源规则都来自 shared/，本文件不再各自维护一份。
-  const BUILTINS = BUILTIN_SOURCES;
+  // 内置源目录、默认配置、补源规则、源的收敛都在 shared/，本文件不再各自维护一份。
   const LEGACY_KEYS = LEGACY_CONFIG_KEYS;
   const CONFIG_VERSION = SOURCE_CONFIG_VERSION;
   const PINNED_SITES = [
@@ -76,8 +77,8 @@ import { decodeQueryText } from '@/shared/query-text';
   // sources/groups 或旧版 engines/iconOnly 的安装一律走版本迁移，不会被这里覆盖。
 
   // sources/groups 必须留空，不能直接用 shared 里的默认值：
-  // normalizeList 一见 sources 非空就不再走 copyBuiltins 回落路径，而旧版安装（只有 engines/
-  // iconOnly、没有 sources）正是靠那条回落路径读出开关的——塞进来会把它们的配置冲掉。
+  // 收敛时一见 sources 非空就不再走旧版回落路径，而旧版安装（只有 engines/iconOnly、
+  // 没有 sources）正是靠那条回落路径读出开关的——塞进来会把它们的配置冲掉。
   // 全新安装的默认值由 defaultConfigSeed() 在「真的什么都没有」时注入。
   const DEFAULTS = { ...SHARED_DEFAULTS, sources: [], groups: [] };
 
@@ -170,6 +171,8 @@ import { decodeQueryText } from '@/shared/query-text';
   const importNotesButton = document.querySelector('#import-notes');
   const importNotesFile = document.querySelector('#import-notes-file');
 
+  // IndexedDB 的库名。与同步存储里的键（shared/notes.ts 的 NOTES_STORAGE_KEY）恰好同字面量，
+  // 但是两套不同的命名空间；改这里会让已有安装读不到旧库，不要动。
   const NOTES_DB_NAME = 'quickfind-notes';
   const NOTES_STORE = 'documents';
   const NOTES_DOCUMENT_ID = 'main';
@@ -189,22 +192,6 @@ import { decodeQueryText } from '@/shared/query-text';
   let notesHistorySuspend = false;
   let notesWriteQueue = Promise.resolve();
   const NOTES_HISTORY_LIMIT = 100;
-
-  function copyBuiltins(raw) {
-    const config = raw || {};
-    const custom = Array.isArray(config.customEngines) ? config.customEngines : [];
-    return BUILTINS.map((source) => ({ ...source, enabled: config.engines?.[source.id] !== false, iconOnly: config.iconOnly?.[source.id] === true })).concat(custom);
-  }
-
-  function cleanSource(source) {
-    if (!source || !source.id || !source.name || !(source.url || source.buildUrl)) return null;
-    return {
-      id: String(source.id), name: String(source.name), mark: String(source.mark || '?').slice(0, 2),
-      url: String(source.url || ''), detail: String(source.detail || source.url || ''), iconUrl: String(source.iconUrl || ''),
-      className: source.className || (String(source.id).startsWith('custom-') ? 'custom' : String(source.id)),
-      enabled: source.enabled !== false, iconOnly: source.iconOnly === true
-    };
-  }
 
   function specialActionToken(id) { return 'action:' + String(id); }
   function specialActionByToken(token) {
@@ -243,11 +230,11 @@ import { decodeQueryText } from '@/shared/query-text';
   }
 
   function getExistingSourceSites() {
-    const sourceSets = [settings?.general?.sources];
-    if (!sourceSets.some((sources) => Array.isArray(sources) && sources.length)) sourceSets.push(copyBuiltins(settings || {}));
+    // settings.general.sources 已是收敛后的形状；只有它为空时才回落到内置源目录。
+    const listed = settings?.general?.sources;
+    const sources = Array.isArray(listed) && listed.length ? listed : configuredSources({});
     const seen = new Set();
-    return sourceSets.flatMap((sources) => (Array.isArray(sources) ? sources : []))
-      .map(cleanSource).filter((source) => source && source.url).filter((source) => !seen.has(source.id) && seen.add(source.id))
+    return sources.map(cleanSource).filter((source) => source && source.url).filter((source) => !seen.has(source.id) && seen.add(source.id))
       .map((source) => ({ id: source.id, name: source.name, source: true }));
   }
 
@@ -317,73 +304,12 @@ import { decodeQueryText } from '@/shared/query-text';
     if (pinnedSiteError) pinnedSiteError.textContent = '';
   }
 
-  // Default items contain source IDs, action:<id> tokens, and group:<id> tokens.
-  // This lets custom groups, sources, and special actions share one order.
-  function normalizeList(raw, fallbackSources) {
-    const sourceValue = raw && typeof raw === 'object' ? raw : {};
-    const rawGroups = Array.isArray(sourceValue.groups) ? sourceValue.groups : [];
-    const hasSources = Array.isArray(sourceValue.sources) && (sourceValue.sources.length || rawGroups.some((group) => group?.id === 'default'));
-    const sourceMap = new Map();
-    (hasSources ? sourceValue.sources : fallbackSources).map(cleanSource).filter(Boolean).forEach((source) => {
-      if (!sourceMap.has(source.id)) sourceMap.set(source.id, source);
-    });
-    const sources = Array.from(sourceMap.values());
-    const sourceIds = new Set(sourceMap.keys());
-    const actionTokens = new Set(SPECIAL_ACTIONS.map((action) => specialActionToken(action.id)));
-    const rawDefault = rawGroups.find((group) => group?.id === 'default');
-    const customGroups = rawGroups.filter((group) => group && group.id && group.id !== 'default')
-      .map((group) => ({ id: String(group.id), name: String(group.name || '未命名分组'), items: [], visible: group.visible !== false && group.showInDefault !== false }));
-    const customIds = new Set(customGroups.map((group) => group.id));
-    const assigned = new Set();
-    customGroups.forEach((group) => {
-      const rawGroup = rawGroups.find((item) => String(item?.id) === group.id);
-      (rawGroup?.items || rawGroup?.sourceIds || []).map(String).forEach((id) => {
-        const validSource = sourceIds.has(id);
-        const validAction = actionTokens.has(id);
-        if ((validSource || validAction) && !assigned.has(id)) { group.items.push(id); assigned.add(id); }
-      });
-    });
-    const defaultItems = [];
-    const seen = new Set();
-    (rawDefault?.items || rawDefault?.sourceIds || []).map(String).forEach((item) => {
-      const validGroup = item.startsWith('group:') && customIds.has(item.slice(6));
-      const validSource = sourceIds.has(item) && !assigned.has(item);
-      const validAction = actionTokens.has(item) && !assigned.has(item);
-      if ((validGroup || validSource || validAction) && !seen.has(item)) { defaultItems.push(item); seen.add(item); }
-    });
-    const order = Array.isArray(sourceValue.engineOrder) ? sourceValue.engineOrder.map(String) : sources.map((source) => source.id);
-    order.forEach((id) => {
-      if (sourceIds.has(id) && !assigned.has(id) && !seen.has(id)) { defaultItems.push(id); seen.add(id); }
-    });
-    sources.forEach((source) => {
-      if (!assigned.has(source.id) && !seen.has(source.id)) { defaultItems.push(source.id); seen.add(source.id); }
-    });
-    customGroups.forEach((group) => {
-      const token = 'group:' + group.id;
-      if (!seen.has(token)) defaultItems.push(token);
-    });
-    return { sources, groups: [{ id: 'default', name: String(rawDefault?.name || DEFAULT_GROUP_NAME), items: defaultItems, visible: rawDefault?.visible !== false }, ...customGroups] };
-  }
-
-  /**
-   * 补齐旧配置缺的内置源，并把新补的源挂进默认组。
-   *
-   * 判断规则来自 shared/builtins.ts（与 content、popup 共用一份）：只在配置版本落后时补。
-   * 此前这里用的是本地 NEW_BUILTIN_IDS（只 6 个），而 content 用的是 10 个、popup 是第三种写法，
-   * 同一份旧配置在三个入口会补出不同的源。
-   */
-  function appendNewBuiltins(normalized, stored) {
-    const added = backfillBuiltinSources(normalized.sources, stored?.sourceConfigVersion, true, false);
-    if (!added.length) return normalized;
-    const defaultGroup = normalized.groups.find((group) => group.id === 'default');
-    if (!defaultGroup) return normalized;
-    added.forEach((id) => defaultGroup.items.push(id));
-    return normalized;
-  }
+  // 默认组的条目顺序（源 id、action:<id>、group:<id> 混排）与源的收敛都在
+  // shared/settings-store.ts，三个入口共用同一份规则。
 
   // 全新安装（存储里既没有 sources/groups，也没有旧版 engines/iconOnly 痕迹）直接落在默认
   // 配置上。已有配置一律走版本迁移：旧版安装的 engines/iconOnly/customEngines 只能靠
-  // copyBuiltins 的回落路径读出来，而那条路径要求 sources 为空，所以默认值不能塞进 DEFAULTS，
+  // 「sources 为空时按开关重建内置源」那条回落路径读出来，所以默认值不能塞进 DEFAULTS，
   // 否则会把旧安装的源开关冲掉。
   function defaultConfigSeed(stored: any) {
     const storedGroups: any[] = Array.isArray(stored.groups) ? stored.groups : [];
@@ -393,10 +319,7 @@ import { decodeQueryText } from '@/shared/query-text';
   }
 
   function normalizeSettings(stored) {
-    const needsBuiltinMigration = Number(stored.sourceConfigVersion) < CONFIG_VERSION;
-    const general = needsBuiltinMigration
-      ? appendNewBuiltins(normalizeList(stored, copyBuiltins(stored)), stored)
-      : normalizeList(stored, copyBuiltins(stored));
+    const general = normalizeSearchConfig(stored);
     const pinnedRaw = stored.pinnedSearch && typeof stored.pinnedSearch === 'object' ? stored.pinnedSearch : {};
     const hasPinnedSiteConfig = Number(pinnedRaw.siteConfigVersion) >= PINNED_SITE_CONFIG_VERSION;
     const customSites = Array.isArray(pinnedRaw.customSites) ? pinnedRaw.customSites.map(cleanPinnedSite).filter(Boolean) : [];
@@ -525,9 +448,9 @@ import { decodeQueryText } from '@/shared/query-text';
 
   function readNotesFromLocal() {
     if (!chrome.storage?.local) {
-      try { return Promise.resolve(JSON.parse(localStorage.getItem('quickfind-notes') || 'null')); } catch { return Promise.resolve(null); }
+      try { return Promise.resolve(JSON.parse(localStorage.getItem(NOTES_STORAGE_KEY) || 'null')); } catch { return Promise.resolve(null); }
     }
-    return new Promise((resolve) => chrome.storage.local.get('quickfind-notes', (value) => resolve(value?.['quickfind-notes'] || null)));
+    return new Promise((resolve) => chrome.storage.local.get(NOTES_STORAGE_KEY, (value) => resolve(value?.[NOTES_STORAGE_KEY] || null)));
   }
 
   async function loadNotes() {
@@ -572,8 +495,8 @@ import { decodeQueryText } from '@/shared/query-text';
       try {
         // Always mirror to storage so the in-page sidebar sees the latest notes.
         if (chrome.storage?.local) await new Promise((resolve,
-        reject) => chrome.storage.local.set({ 'quickfind-notes': notesState }, () => chrome.runtime?.lastError ? reject(chrome.runtime.lastError) : resolve()));
-        else localStorage.setItem('quickfind-notes', JSON.stringify(notesState));
+        reject) => chrome.storage.local.set({ [NOTES_STORAGE_KEY]: notesState }, () => chrome.runtime?.lastError ? reject(chrome.runtime.lastError) : resolve()));
+        else localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(notesState));
         saved = true;
       } catch { /* ignore */ }
       if (!saved) {
@@ -588,9 +511,9 @@ import { decodeQueryText } from '@/shared/query-text';
   // Keep the notes panel live when the in-page sidebar (or another settings tab) edits the notes.
   if (chrome.storage?.onChanged) {
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local' || !changes['quickfind-notes'] || !notesLoaded) return;
+      if (area !== 'local' || !changes[NOTES_STORAGE_KEY] || !notesLoaded) return;
       if (notesSaveTimer) return; // local edits pending; last writer wins
-      const incoming = changes['quickfind-notes'].newValue as { updatedAt?: unknown } | null | undefined;
+      const incoming = changes[NOTES_STORAGE_KEY].newValue as { updatedAt?: unknown } | null | undefined;
       if (!incoming || typeof incoming !== 'object') return;
       // 自己写出去的变动会以 onChanged 的形式回来。先按 updatedAt 认出来直接返回，
       // 省掉一次全量 normalizeNotes（遍历+重建树）与一次 JSON.stringify 签名比对。

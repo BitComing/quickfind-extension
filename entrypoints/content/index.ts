@@ -1,9 +1,10 @@
 // @ts-nocheck
 // 由早期手写 JavaScript 迁移而来，尚未补齐类型标注；补全后删除本行。见 README「迁移状态」。
-import { SPECIAL_ACTIONS } from '@/shared/search-actions';
 import { createNoteDrag } from '@/shared/note-drag';
-import { BUILTIN_SOURCES, backfillBuiltinSources, DEFAULT_PINNED_SITE_IDS, PINNED_SITE_CONFIG_VERSION } from '@/shared/builtins';
+import { LEGACY_NOTES_STORAGE_KEY, NOTES_STORAGE_KEY } from '@/shared/notes';
+import { BUILTIN_SOURCES, DEFAULT_PINNED_SITE_IDS, PINNED_SITE_CONFIG_VERSION } from '@/shared/builtins';
 import { DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS, MAX_DEFAULT_GROUP_COUNT } from '@/shared/defaults';
+import { normalizeSearchConfig, resolveGroupEntries } from '@/shared/settings-store';
 import { decodeQueryText, normalizeSelectionText } from '@/shared/query-text';
 import { markdownToPlainText, renderMarkdown } from '@/shared/markdown';
 import {
@@ -84,19 +85,9 @@ export default defineContentScript({
     rect: { left: number; right: number; top: number; bottom: number; width: number; height: number };
   }
 
-  const PINNED_SITES = [
-    { id: 'google', name: 'Google' },
-    { id: 'baidu', name: '百度' },
-    { id: 'google-scholar', name: '谷歌学术' },
-    { id: 'duckduckgo', name: 'DuckDuckGo' },
-    { id: 'so', name: '360 搜索' },
-    { id: 'sogou', name: '搜狗' },
-    { id: 'bing', name: 'Bing' },
-    { id: 'yandex', name: 'Yandex' },
-    { id: 'zhihu', name: '知乎' },
-    { id: 'bilibili', name: '哔哩哔哩' },
-    { id: 'douyin', name: '抖音' }
-  ];
+  // 站点目录只在选项页维护（它需要 url 与选择器用于编辑）。内容脚本只按
+  // DEFAULT_PINNED_SITE_IDS 判断「当前页是不是内置搜索站点」，此前这里还留着一份
+  // 只有 id+名字的副本，从未被引用——已删除。
   const LEGACY_PINNED_SITE_IDS = new Set(['google', 'bing', 'yandex', 'zhihu', 'bilibili']);
   const GENERIC_PINNED_INPUT_SELECTOR = 'input[type="search"], input[name="q"], input[name="query"], input[name="keyword"], input[name="text"], input[placeholder*="搜索"], input[placeholder*="Search"], textarea[name="q"]';
 
@@ -1616,8 +1607,9 @@ export default defineContentScript({
     resizeLlmTextarea(llmSidebarInput);
   }
 
-  const NOTES_KEY = 'quickfind-notes';
-  const NOTES_LEGACY_KEY = 'quickfind-outline-notes';
+  // 键名来自 shared/notes.ts：三个入口读写的是同一份笔记，字面量各写一份迟早写错一处。
+  const NOTES_KEY = NOTES_STORAGE_KEY;
+  const NOTES_LEGACY_KEY = LEGACY_NOTES_STORAGE_KEY;
   const OUTLINE_TAB_KEY = 'quickfind-outline-tab';
   const OUTLINE_TITLES = { chat: '随心问', outline: '无限大纲笔记' };
   const NOTES_HISTORY_LIMIT = 100;
@@ -2523,65 +2515,25 @@ export default defineContentScript({
     if (String(text || '').includes('\n')) setQueryRowExpanded(true);
   }
 
+  /**
+   * 当前配置下的条目解析统一走 shared/settings-store.ts。
+   *
+   * 这里此前有三份几乎同构的实现：浮层用的 getAvailableEngines、常驻栏用的
+   * getPinnedEntries、分组飞层用的 getPinnedGroupSources。它们对「哪些条目该出现」
+   * 的判断本该一致，实际连分组角标（浮层 '群'、常驻栏 '组'）和空名兜底都不一样。
+   * 现在三处共用同一个纯函数，本文件只保留 DOM 适配与缓存。
+   */
+  function normalizedConfig() {
+    if (!normalizedConfigCache) normalizedConfigCache = normalizeSearchConfig(settings);
+    return normalizedConfigCache;
+  }
+
   function getAvailableEngines() {
-    const sourceMap = new Map();
-    const groups = Array.isArray(settings.groups) ? settings.groups : [];
-    const hasConfiguredSources = Array.isArray(settings.sources) && (settings.sources.length || groups.some((group) => group.id === 'default'));
-    const sources = hasConfiguredSources
-      ? [...settings.sources]
-      : ENGINES.map((engine) => ({ ...engine, enabled: settings.engines[engine.id] !== false, iconOnly: settings.iconOnly[engine.id] === true }));
-    // 补源规则与另两个入口共用一份（shared/builtins.ts），只在配置版本落后时补。
-    if (hasConfiguredSources) backfillBuiltinSources(sources, settings.sourceConfigVersion, true, false);
-    sources.forEach((source) => sourceMap.set(source.id, { ...source, className: source.className || (String(source.id).startsWith('custom-') ? 'custom' : source.id) }));
-    const defaultGroup = groups.find((group) => group.id === 'default');
-    const items = defaultGroup?.items || defaultGroup?.sourceIds || [];
-    const defaultVisible = defaultGroup?.visible !== false;
-    const customOwned = new Set(groups.filter((group) => group.id !== 'default').flatMap((group) => group.items || group.sourceIds || []).map(String));
-    const ordered = [];
-    const addSource = (id) => {
-      const source = sourceMap.get(id);
-      if (source && source.enabled !== false && source.name && (source.url || source.buildUrl) && !ordered.some((item) => item.id === id)) ordered.push(source);
-    };
-    const addSpecialAction = (id) => {
-      const action = SPECIAL_ACTIONS.find((item) => item.id === String(id));
-      const entryId = `action:${id}`;
-      if (action && !ordered.some((item) => item.id === entryId)) ordered.push({ ...action, id: entryId });
-    };
-    const addGroup = (groupId) => {
-      const group = groups.find((item) => item.id === groupId);
-      if (group && group.id !== 'default' && group.visible !== false &&
-      group.showInDefault !== false && group.name && !ordered.some((item) => item.id === `group:${group.id}`)) ordered.push({ id: `group:${group.id}`,
-      groupId: group.id, name: group.name, mark: '群', className: 'group', isGroup: true });
-    };
-    const addDefaultSource = (id) => { if (!customOwned.has(String(id))) addSource(id); };
-    if (defaultVisible) {
-      if (items.length) items.forEach((id) => {
-        const token = String(id);
-        if (token.startsWith('group:')) addGroup(token.slice(6));
-        else if (token.startsWith('action:')) { if (!customOwned.has(token)) addSpecialAction(token.slice(7)); }
-        else addDefaultSource(token);
-      });
-      else if (settings.sources?.length) settings.sources.forEach((source) => addDefaultSource(source.id));
-      else (settings.engineOrder || []).forEach(addDefaultSource);
-      if (items.length && hasConfiguredSources) sources.forEach((source) => addDefaultSource(source.id));
-      if (!items.length && !hasConfiguredSources) settings.customEngines.filter((source) => source.enabled !== false).forEach((source) => addSource(source.id));
-      groups.filter((group) => group.id !== 'default' && group.visible !== false && group.showInDefault !== false).forEach((group) => addGroup(group.id));
-    }
-    return ordered;
+    return resolveGroupEntries(normalizedConfig(), 'default');
   }
 
   function getGroupSources(groupId) {
-    const group = (settings.groups || []).find((item) => item.id === groupId);
-    if (!group) return [];
-    const sourceMap = new Map((settings.sources || []).map((source) => [source.id, source]));
-    return (group.items || group.sourceIds || []).map((id) => {
-      const token = String(id);
-      if (token.startsWith('action:')) {
-        const action = SPECIAL_ACTIONS.find((item) => item.id === token.slice(7));
-        return action ? { ...action, id: token } : null;
-      }
-      return sourceMap.get(token);
-    }).filter((source) => source && (source.isSpecial || (source.enabled !== false && source.name && (source.url || source.buildUrl))));
+    return resolveGroupEntries(normalizedConfig(), groupId);
   }
 
   function rememberSearch(query) {
@@ -2726,12 +2678,15 @@ export default defineContentScript({
   let pinnedSiteStrictCache: any = PINNED_SITE_UNCACHED;
   let pinnedSiteLooseCache: any = PINNED_SITE_UNCACHED;
   let pinnedEntriesCache: any = null;
+  /** 收敛后的 sources + groups，见 normalizedConfig()。任何一次设置变动都要作废。 */
+  let normalizedConfigCache: any = null;
 
   function invalidatePinnedCache() {
     pinnedSiteCacheKey = '';
     pinnedSiteStrictCache = PINNED_SITE_UNCACHED;
     pinnedSiteLooseCache = PINNED_SITE_UNCACHED;
     pinnedEntriesCache = null;
+    normalizedConfigCache = null;
     // 渲染指纹也要一起作废：设置一变，条目/图标/顺序都可能变，但指纹是独立于 settings 的
     // 一个字符串，不主动清空就会命中「结构未变」的早退，界面停在旧配置上。
     pinnedRenderSignature = '';
@@ -2868,84 +2823,13 @@ export default defineContentScript({
   }
 
   function getPinnedEntries() {
-    // 纯函数：只读 settings 与 module 常量。positionPinnedBar 每次滚动都会走到这里
-    // （经由 refreshSelectionPosition），而返回值被安全检查读、不写、不长期持有。
     if (pinnedEntriesCache) return pinnedEntriesCache;
-    const config = getPinnedConfig();
-    const groups = Array.isArray(config.groups) ? config.groups : [];
-    const configured = Array.isArray(config.sources) && (config.sources.length || groups.some((group) => group?.id === 'default'));
-    const rawSources = configured
-      ? [...config.sources]
-      : (Array.isArray(config.sources) && config.sources.length ? config.sources : ENGINES.map((engine) => ({ ...engine,
-      enabled: config.engines?.[engine.id] !== false, iconOnly: config.iconOnly?.[engine.id] === true })).concat(config.customEngines || []));
-    // 与上方 getAvailableEngines 用同一条规则、同一个版本号。此前这里另写一份只补 6 个源的清单
-    // （另 4 个靠 getPinnedConfig 把 siteConfigVersion 折算成 0/3 来间接决定要不要补），
-    // 结果同一份旧配置在搜索列表里补 10 个、在常驻栏只补 6 个。
-    const backfilledBuiltinIds = configured ? backfillBuiltinSources(rawSources, settings.sourceConfigVersion, true, false) : [];
-    const sourceMap = new Map();
-    rawSources.forEach((source) => {
-      if (!source?.id || !source.name || !(source.url || source.buildUrl)) return;
-      sourceMap.set(String(source.id), { ...source, id: String(source.id), className: source.className || (String(source.id).startsWith('custom-') ? 'custom' : String(source.id)) });
-    });
-    const defaultGroup = groups.find((group) => group?.id === 'default');
-    const customOwned = new Set(groups.filter((group) => group?.id && group.id !== 'default').flatMap((group) => group.items || group.sourceIds || []).map(String));
-    const ordered = [];
-    const addSource = (id) => {
-      const source = sourceMap.get(String(id));
-      if (source && source.enabled !== false && !ordered.some((item) => item.id === source.id)) ordered.push(source);
-    };
-    const addSpecialAction = (id) => {
-      const action = SPECIAL_ACTIONS.find((item) => item.id === String(id));
-      const entryId = `action:${id}`;
-      if (action && !ordered.some((item) => item.id === entryId)) ordered.push({ ...action, id: entryId });
-    };
-    const addGroup = (id) => {
-      const group = groups.find((item) => String(item?.id) === String(id));
-      const entryId = 'group:' + id;
-      if (group && group.id !== 'default' && group.visible !== false && group.showInDefault !== false && !ordered.some((item) => item.id === entryId)) ordered.push({ id: entryId,
-      groupId: String(id), name: String(group.name || '未命名分组'), mark: '组', className: 'group', isGroup: true });
-    };
-    const items = [...(defaultGroup?.items || defaultGroup?.sourceIds || []), ...backfilledBuiltinIds];
-    if (defaultGroup?.visible !== false) {
-      if (items.length) items.forEach((item) => {
-        const token = String(item);
-        if (token.startsWith('group:')) addGroup(token.slice(6));
-        else if (token.startsWith('action:')) { if (!customOwned.has(token)) addSpecialAction(token.slice(7)); }
-        else if (!customOwned.has(token)) addSource(token);
-      });
-      else {
-        (config.engineOrder || Array.from(sourceMap.keys())).forEach((id) => !customOwned.has(String(id)) && addSource(id));
-        sourceMap.forEach((source) => { if (!customOwned.has(source.id)) addSource(source.id); });
-      }
-      groups.filter((group) => group?.id && group.id !== 'default' && group.visible !== false && group.showInDefault !== false).forEach((group) => addGroup(group.id));
-    }
-    pinnedEntriesCache = ordered;
-    return ordered;
+    pinnedEntriesCache = resolveGroupEntries(normalizedConfig(), 'default');
+    return pinnedEntriesCache;
   }
 
   function getPinnedGroupSources(groupId) {
-    const config = getPinnedConfig();
-    const group = (config.groups || []).find((item) => String(item?.id) === String(groupId));
-    if (!group) return [];
-    const sourceMap = new Map();
-    const addSources = (sources) => (Array.isArray(sources) ? sources : []).forEach((source) => {
-      if (source?.id && source?.name && (source.url || source.buildUrl) && !sourceMap.has(String(source.id))) {
-        sourceMap.set(String(source.id), { ...source, id: String(source.id), className: source.className || (String(source.id).startsWith('custom-') ? 'custom' : String(source.id)) });
-      }
-    });
-    addSources(config.sources);
-    addSources(config.customEngines);
-    addSources(settings.sources);
-    addSources(settings.customEngines);
-    if (!sourceMap.size) addSources(ENGINES);
-    return (group.items || group.sourceIds || []).map((id) => {
-      const token = String(id);
-      if (token.startsWith('action:')) {
-        const action = SPECIAL_ACTIONS.find((item) => item.id === token.slice(7));
-        return action ? { ...action, id: token } : null;
-      }
-      return sourceMap.get(token);
-    }).filter((source) => source && (source.isSpecial || (source.enabled !== false && source.name && (source.url || source.buildUrl))));
+    return resolveGroupEntries(normalizedConfig(), groupId);
   }
 
   /**
