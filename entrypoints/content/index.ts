@@ -130,7 +130,21 @@ export default defineContentScript({
   let pinnedHost = null;
   let pinnedExpandedGroupId = null;
   let pinnedMoreExpanded = false;
-  let pinnedBarCollapsed = false;
+  // 常驻栏的静止态是「收起」。
+  //
+  // 初值必须是 true，不能是 false：内容脚本一启动就会挂着 window 上的 scroll / resize 监听
+  // （refreshSelectionPosition → positionPinnedBar），而真实页面在加载期必然派发 scroll
+  // （还原滚动位置、锚点、懒加载脚本），那一刻宿主若按「展开」建出来，用户就会先看到一条
+  // 展开的空栏、再由 mountPinnedBar 收起——即报告的「打开网页时一刹那展开收起」。
+  // 展开只能来自用户动作（划过把手 / 点把手），所以这里没有任何理由以展开为初值。
+  let pinnedBarCollapsed = true;
+  // 真实配置是否已从 storage 读回。
+  //
+  // settings 的初值是 DEFAULT_SETTINGS 的一份副本，它只是「还没读到用户配置」时的占位，
+  // 不代表用户的真实意图。常驻栏的整套内容（站点、条目、启用开关）都来自 settings，
+  // 因此在这面标志立起来之前一律不许挂载、不许显示：否则会先按默认配置画一遍
+  // （画错站点、画到用户已关闭的页面上），再被真实配置改掉，同样是闪烁。
+  let pinnedSettingsReady = false;
   let pinnedCollapseTimer = null;
   let pinnedCollapseDeadline = 0;
   let pinnedCollapsePaused = false;
@@ -2282,10 +2296,13 @@ export default defineContentScript({
   });
 
   function loadSettings() {
-    if (!storageAvailable()) return;
+    // 没有 storage 就没有真实配置可等，直接放行，别把常驻栏永久锁在「不可见」。
+    if (!storageAvailable()) { pinnedSettingsReady = true; return; }
     chrome.storage.sync.get(null, (stored) => {
       settings = cloneSettings(stored);
       invalidatePinnedCache();
+      // 先立标志再挂载：mountPinnedBar 会检查它，顺序反了等于什么都没挡。
+      pinnedSettingsReady = true;
       setLlmDockVisible(settings.llmDockVisible);
       trigger.classList.toggle('disabled', !settings.enabled);
       syncLlmConfigStatus();
@@ -2889,6 +2906,15 @@ export default defineContentScript({
     // popover 属性让宿主有资格进 top layer（见 promoteToTopLayer）。UA 默认样式会把它拉成
     // 整屏带边框，所以只声明属性、把样式留给下面的 CSS 覆盖。
     pinnedHost.setAttribute('popover', 'manual');
+    // 建出来就是「收起 + 不可见」，而不是等第一次 mount 之后再补。
+    //
+    // 这两句都必须在宿主入文档之前定好，否则第一帧就可能按「展开」算样式：`.bar` 的高度
+    // 带 0.22s 过渡，只要有一帧按展开算过，收起就会变成「先撑开再缩回」的动画——
+    // 用户看到的就是那条一闪而过的展开栏。类名在插入前加上，首帧即收起，没有过渡起点。
+    // 不可见同理会由第一次 mount 显式打开（renderPinnedBar / positionPinnedBar 都会调
+    // setPinnedHostVisible），所以这里先关着不会漏显示。
+    pinnedHost.classList.add('is-collapsed');
+    pinnedHost.hidden = true;
     const root = pinnedHost.attachShadow({ mode: 'open' });
     root.innerHTML = `
       <style>
@@ -3566,6 +3592,12 @@ export default defineContentScript({
   }
 
   function positionPinnedBar(site) {
+    // 配置没到位之前一格都不画：settings 此刻还是 DEFAULT_SETTINGS 那份占位值，
+    // 按它算出来的「这一页该不该有常驻栏、放哪些源」都不是用户的真实配置。
+    // 这条早退挡的正是加载期那条路径：scroll / resize → refreshSelectionPosition →
+    // positionPinnedBar 会先于 storage 回调执行（实测 70ms vs 75ms），
+    // 于是宿主在 mountPinnedBar 之前就被建出来并显示了一帧。
+    if (!pinnedSettingsReady) return null;
     const entriesAvailable = Boolean(site && getPinnedEntries().length && settings?.enabled);
     if (!entriesAvailable) {
       clearPinnedCollapseTimer();
@@ -3585,6 +3617,9 @@ export default defineContentScript({
   }
 
   function mountPinnedBar() {
+    // settings 只是占位默认值时不许挂载：常驻栏的内容完全由配置决定，
+    // 先按默认值画一遍再被真实配置改掉，等于让用户看两次不同的栏。
+    if (!pinnedSettingsReady) return;
     const site = getPinnedSite();
     if (!site || !settings) {
       clearPinnedCollapseTimer();
