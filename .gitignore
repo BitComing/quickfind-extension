@@ -1,11 +1,9 @@
 # Browser automation output（仅忽略截图等临时产物；回归用例在 tests/ 入库）
 .playwright-cli/
-output/playwright/
 
-# 本机 sync 存储快照：由 scripts/read-sync-log.cjs 导出，含个人 searchHistory，不入库
-output/_live-sync-state.json
-# 过程截图（体积大且随环境变化，回归用例在 tests/ 入库）
-output/shots/
+# 本机产物整目录不入库：audit 探针、过程截图、sync 存储快照（可能是个人数据）。
+# 回归用例在 tests/，产物在 .output/，都不受影响。
+output/
 
 # Local backup of the corrupted repo (can be deleted once verified)
 .git.bak/
