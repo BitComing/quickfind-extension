@@ -74,7 +74,8 @@ export function normalizeNotes(raw: unknown): NotesState {
     createdAt: Number(rootValue.createdAt) || rootNow, updatedAt: rootNow,
   };
   Object.values(nodes).forEach((node) => {
-    if (node.id === 'root' || !nodes[node.parentId] || node.parentId === node.id) node.parentId = 'root';
+    const parentId = node.parentId;
+    if (node.id === 'root' || !parentId || !nodes[parentId] || parentId === node.id) node.parentId = 'root';
   });
   const declaredChildren = new Map<string, string[]>(Object.keys(nodes).map((id) => [id, []]));
   Object.entries(source.nodes).forEach(([key, value]) => {
@@ -106,7 +107,7 @@ export function normalizeNotes(raw: unknown): NotesState {
   Object.values(nodes).forEach((node) => {
     if (node.id === 'root' || visited.has(node.id)) return;
     node.parentId = 'root';
-    nodes.root.children.push(node.id);
+    nodes.root!.children.push(node.id);
     visited.add(node.id);
     attach(node.id);
   });
@@ -230,9 +231,11 @@ export function moveNote(state: NotesState, sourceId: string, targetId: string, 
     target.collapsed = false;
   } else {
     newParent = noteById(state, target.parentId) || noteById(state, 'root');
+    // 先判空再用：根节点理论上一定存在，但这里不能把「不存在」变成一次崩溃。
+    if (!newParent) return NO_CHANGE;
     index = newParent.children.indexOf(targetId) + (placement === 'after' ? 1 : 0);
   }
-  if (!newParent || index < 0) return NO_CHANGE;
+  if (index < 0) return NO_CHANGE;
   source.parentId = newParent.id;
   source.updatedAt = Date.now();
   newParent.children.splice(Math.min(index, newParent.children.length), 0, sourceId);
@@ -360,9 +363,9 @@ export function parseMarkdownNotes(text: unknown, makeId: () => string): NotesSt
   String(text || '').split(/\r?\n/).forEach((line) => {
     if (!line.trim()) return;
     const match = line.match(/^(\s*)(?:[-*+]\s+|\d+[.)]\s+)?(.*)$/);
-    if (!match || !match[2].trim()) return;
-    const depth = Math.floor(match[1].replace(/\t/g, '  ').length / 2);
-    const raw = match[2].trim();
+    if (!match || !match[2]?.trim()) return;
+    const depth = Math.floor((match[1] ?? '').replace(/\t/g, '  ').length / 2);
+    const raw = (match[2] ?? '').trim();
     const completed = /^\[x\]\s+/i.test(raw);
     const value = raw.replace(/^\[[ xX]\]\s+/, '');
     while (stack.length && stack[stack.length - 1]!.depth >= depth) stack.pop();
