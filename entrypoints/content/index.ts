@@ -27,21 +27,40 @@ import {
 
 export default defineContentScript({
   matches: ['<all_urls>'],
-  // 也注入子框架：否则 iframe 里选中文字不会有触发图标（此前就是这样，
-  // 用户读到的表现是「有些地方选中文字不出图标」）。子框架里只保留选区触发点
-  // 与搜索浮层——常驻搜索栏与 LLM 侧栏是整页级 UI，重复出现在每个 iframe 里毫无意义，
-  // 见下面的 IS_SUBFRAME 分支。
-  allFrames: true,
-  // srcdoc / about:blank 这类没有自身 URL 的子框架也要注入（默认不注入，页面上表现
-  // 就是「iframe 里的字选中了却没反应」）。match_origin_as_fallback 让这类框架
-  // 按其创建者的源来匹配 <all_urls>。
-  matchAboutBlank: true,
-  matchOriginAsFallback: true,
+  // 只注入顶层文档，**任何子框架都不注入**。
+  //
+  // 早先这里是 allFrames + matchAboutBlank + matchOriginAsFallback，理由很直接：
+  // 不注入子框架，iframe 里选中文字就没有触发图标。但同一条协议也把页面里那些
+  // 并不需要扩展关照的小框架一并覆盖了——客服挂件、广告位、播放器、代码预览窗、
+  // OAuth 弹层……它们同样是 iframe。在那些框架里选中文字，浮层会在框架内部弹出，
+  // 还会被框架边界裁成很小一块，用户看到的就是「插件跑到小窗口里去了」。
+  //
+  // 想把「框架里选中、外层页面弹出」做成稳定能力是不行的：浮层按窗口视口定位，
+  // 跨源框架既读不到父窗口尺寸，也无法把自己的位置换算到外层坐标系，只能靠猜。
+  // 所以这里取一组确定的行为：扩展只作用于用户当前所在的这个网页本身，
+  // 子框架里一律不出现——包括触发图标。
+  allFrames: false,
   runAt: 'document_idle',
   main() {
   'use strict';
-  // 顶层文档才渲染常驻搜索栏、LLM 侧栏这些整页级 UI；子框架只做选区触发。
-  const IS_SUBFRAME = window.top !== window.self;
+
+  /**
+   * 非 HTML 文档一律不初始化。
+   *
+   * 直接打开 XML / SVG 时（对象存储的 AccessDenied 错误页就是最常见的例子：
+   * https://static.deepseek.com/ 返回 `application/xml`，正文是一段 `<Error>`），
+   * `document.createElement('div')` 造出来的是没有 HTML 接口的元素，`host.style` 是
+   * undefined —— 下面那句 `host.style.cssText = ...` 会抛
+   * `TypeError: Cannot set properties of undefined (setting 'cssText')`，整个内容脚本
+   * 就地中止，控制台留一条未处理异常。
+   *
+   * 判据刻意用「造一个元素看它有没有 style」，而不是 `document.contentType`：
+   * text/plain 页面的 MIME 也不是 text/html，但浏览器把它渲染成 HTML 文档，正文照样
+   * 可选、浮层照样能用，按 MIME 判会把这些正常页面一并误杀。而这里试出来的判断
+   * 恰好等于「这个文档里能不能放 HTML 元素」。这类 XML 页面没有可搜的正文，
+   * 本来也不该有浮层，直接退出即可。
+   */
+  if (!document.createElement('div').style) return;
 
   /**
    * 一个对话窗口的运行时形状。
@@ -2136,7 +2155,6 @@ export default defineContentScript({
   }
 
   function initializeLlmDock() {
-    if (IS_SUBFRAME) return;
     if (!llmDock || initializeLlmDock.started) return;
     initializeLlmDock.started = true;
     // 侧栏只由「点击」打开。此前是 pointerenter / focus / focusin 都会展开，
@@ -3567,9 +3585,6 @@ export default defineContentScript({
   }
 
   function mountPinnedBar() {
-    // 子框架不渲染常驻搜索栏：它是整页级 UI，在每个 iframe 里重复出现没有意义。
-    // 触发点与搜索浮层继续可用（那是注入子框架的目的）。
-    if (IS_SUBFRAME) return;
     const site = getPinnedSite();
     if (!site || !settings) {
       clearPinnedCollapseTimer();
@@ -3609,7 +3624,6 @@ export default defineContentScript({
   }
 
   function schedulePinnedMount() {
-    if (IS_SUBFRAME) return;
     // 顺序不能反：防抖生效期间它每收到一次 DOM 变动就被调用一次，先判 timer 才能把
     // 站点解析压到「一次变动窗口一次」。mountPinnedBar 内部还有一次同样的判定，兜住
     // 这层早退漏掉的情况（例如排队期间 settings 变了）。
@@ -3909,10 +3923,8 @@ export default defineContentScript({
   }, true);
   if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      // 这些消息按标签页广播；注入全部框架后每个 iframe 都会收到。只有顶层框架能
-      // 给出用户真正看到的选区、持有笔记侧栏与对话层，所以子框架一律不响应——
-      // 否则 sendResponse 会先被某个 iframe 的空结果抢占（表现为「读不到选中文字」）。
-      if (IS_SUBFRAME) return;
+      // 这些消息按标签页广播。内容脚本现在只注入顶层文档，能收到它们的一定是用户
+      // 正在看的那个页面实例——选区、笔记侧栏与对话层都只有这一份。
       if (message?.type === 'get-selection') {
         // 弹窗的搜索框是单行 input，显示不了换行，这里按单行规整。
         sendResponse({ text: getInputSelection()?.text || normalizeSelectionText(window.getSelection()?.toString(), false) || '' });
@@ -4069,7 +4081,7 @@ export default defineContentScript({
     }, 400);
   }
   document.documentElement.append(host);
-  // LLM 侧栏与对话层都挂在这个宿主里，必须先入文档再初始化（子框架里 initializeLlmDock 自行早退）。
+  // LLM 侧栏与对话层都挂在这个宿主里，必须先入文档再初始化。
   initializeLlmDock();
   loadSettings();
   const pinnedObserver = new MutationObserver(schedulePinnedMount);

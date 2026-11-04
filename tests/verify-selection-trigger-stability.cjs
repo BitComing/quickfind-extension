@@ -9,7 +9,10 @@
  *   二、页面自己的 shadow DOM 里的选区 → 浏览器让 window.getSelection() 退化成
  *       `isCollapsed === true`（toString() 却仍有文字、getRangeAt(0) 几何全 0），
  *       于是「collapsed 就当没有选区」把它整段丢掉。现代站点大量使用影子根。
- *   三、iframe 内的选区 → 内容脚本此前不注入子框架，那里根本没有扩展。
+ *   三、iframe 内的选区 → 曾经靠 allFrames 注入子框架来解决；但那条路径同时把客服挂件、
+ *       广告位、播放器这类小框架一起覆盖了，浮层在框架内部弹出、还被框架边界裁成一小块，
+ *       用户看到的是「插件跑到小窗口里去了」。现在改成**只注入顶层文档**，这里钉住这个契约：
+ *       子框架里既没有插件节点，框架内的选区也不会让外层页面弹浮层。
  *
  * 每条都用**行为断言**表达：真实鼠标拖选后读触发图标的可见性与位置，不靠读源码推断。
  * 反向对照（普通正文、user-select:none）一并写入，证明断言不是恒真。
@@ -41,7 +44,7 @@ const PAGE = `<!doctype html><meta charset="utf-8"><title>qf trigger stability</
   <div id="longwrap"><p id="longp">${LONG_TEXT}</p></div>
 </body>`;
 
-/** 在 iframe 内部注入可选正文（srcdoc 走 about:blank 路径，需 match_about_blank）。 */
+/** 页面里的 iframe：srcdoc 内容（顺带覆盖「没有自身 URL 的框架」这类最容易被顺手注入的框架）。 */
 const INNER = '<!doctype html><meta charset="utf-8"><body style="margin:0;font:16px sans-serif">'
   + '<p id="ip" style="width:500px;line-height:1.9;margin:10px">iframe 里的这段文字，选中后也应当出现触发图标。</p></body>';
 
@@ -175,27 +178,24 @@ const selectRange = async (page, selector, length) => {
       Boolean(wrongRoot.value) && wrongRoot.value.includes('影子根里的这段文字'), JSON.stringify(wrongRoot));
     console.log('');
 
-    // ---------- 【3】iframe 内的选区 ----------
-    console.log('【3】iframe 里选中文字也要出现触发图标');
+    // ---------- 【3】iframe 内一律不出现 ----------
+    console.log('【3】iframe 里不再出现插件（此前浮层会在小窗口里弹出来）');
+    await clearSelection(page);
     let frame = null;
     for (const candidate of page.frames()) {
       try {
         if (await candidate.evaluate(() => Boolean(document.getElementById('ip')))) { frame = candidate; break; }
       } catch { /* 跨源跳过 */ }
     }
-    check('找到含可选正文的 iframe', frame !== null, String(Boolean(frame)));
+    check('找到页面里的 iframe（前置条件）', frame !== null, String(Boolean(frame)));
     if (frame) {
       const frameHost = await frame.evaluate((selector) => Boolean(document.querySelector(selector)), PANEL_HOST);
-      check('内容脚本已注入子框架', frameHost === true, String(frameHost));
+      check('内容脚本不注入子框架', frameHost === false, String(frameHost));
 
-      await frame.evaluate((selector) => {
-        document.querySelector(selector)?.shadowRoot?.querySelector('.quickfind-trigger')?.classList.remove('visible');
-        window.getSelection()?.removeAllRanges();
-      }, PANEL_HOST);
-      await page.waitForTimeout(150);
-      // 在 iframe 内造选区并派发 mouseup。与顶层各段同一口径（程序化 range + 真实 mouseup），
+      // 在 iframe 内造选区并派发 mouseup：注入时这样必然弹出触发图标，不注入则整个框架里
+      // 一个插件节点都不该有。与顶层各段同一口径（程序化 range + 真实 mouseup），
       // 不依赖「真实鼠标能否命中 iframe」这种与注入无关的抖动。
-      await frame.evaluate((selector) => {
+      await frame.evaluate(() => {
         const element = document.getElementById('ip');
         const node = element.firstChild;
         const range = document.createRange();
@@ -205,25 +205,26 @@ const selectRange = async (page, selector, length) => {
         selection.removeAllRanges();
         selection.addRange(range);
         document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 120, clientY: 120 }));
-        void selector;
-      }, PANEL_HOST);
+      });
       await page.waitForTimeout(550);
-      const inFrame = await frame.evaluate((selector) => {
-        const trigger = document.querySelector(selector)?.shadowRoot?.querySelector('.quickfind-trigger');
+      const inFrame = await frame.evaluate(() => {
         const selection = window.getSelection();
         return {
-          visible: trigger ? trigger.classList.contains('visible') : null,
           selLen: selection ? selection.toString().trim().length : 0,
-          input: document.querySelector(selector)?.shadowRoot?.querySelector('.query-input')?.value ?? null,
+          quickfindNodes: document.querySelectorAll('[id^="quickfind"]').length,
         };
-      }, PANEL_HOST);
+      });
       check('iframe 内产生选区（前置条件）', inFrame.selLen > 0, JSON.stringify(inFrame));
-      check('iframe 内出现触发图标（此前子框架根本没注入）', inFrame.visible === true, JSON.stringify(inFrame));
-      check('触发点带上了 iframe 内选中的文字', Boolean(inFrame.input) && inFrame.input.includes('iframe 里的这段文字'), JSON.stringify(inFrame));
+      check('iframe 内没有任何插件节点（浮层不会在小窗口里弹出）', inFrame.quickfindNodes === 0, JSON.stringify(inFrame));
 
-      // 常驻搜索栏是整页级 UI，不该在子框架里重复出现。
+      // 框架里的选区也不该顺带让外层页面弹浮层：外层文档自己的选区是空的。
+      const outerAfterFrame = await readTrigger(page);
+      check('框架内的选区不会让外层页面弹出浮层',
+        outerAfterFrame !== null && outerAfterFrame.visible === false, JSON.stringify(outerAfterFrame));
+
+      // 常驻搜索栏是整页级 UI，更不该在子框架里出现。
       const framePinned = await frame.evaluate(() => Boolean(document.getElementById('quickfind-pinned-search-host')));
-      check('子框架不重复渲染常驻搜索栏', framePinned === false, String(framePinned));
+      check('子框架里没有常驻搜索栏', framePinned === false, String(framePinned));
     }
     console.log('');
 
