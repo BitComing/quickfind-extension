@@ -192,7 +192,13 @@ async function mockLicenseApi(page, createCode) {
     check('购买说明是四步', about.paySteps.length === 4, JSON.stringify(about.paySteps));
     check('四步写清付款、加微信、发截图、领激活码', /付款|扫码付款/.test(about.paySteps[0]) && /插件付费/.test(about.paySteps[1]) && /截图/.test(about.paySteps[2]) && /激活码/.test(about.paySteps[3]), JSON.stringify(about.paySteps));
     check('写明了微信号 beta2meta', about.paySteps.some((step) => step.includes('beta2meta')), JSON.stringify(about.paySteps));
-    check('收款码与微信二维码都加载成功', about.payCodes.length === 2 && about.payCodes.every((code) => code.loaded), JSON.stringify(about.payCodes));
+    // 收款码是私有素材（public/pay/ 不入库，见 .gitignore）：从仓库构建出来的产物里没有这两张图。
+    // 两种形态都算对——有图就必须真的解码成功；没图就必须整块隐藏，而不是留两个破图框。
+    const payCodesHidden = await page.evaluate(() => document.querySelectorAll('.pay-codes').length === 0);
+    const payCodesOk = about.payCodes.length === 0
+      ? payCodesHidden
+      : about.payCodes.length === 2 && about.payCodes.every((code) => code.loaded);
+    check('收款码：有图则加载成功，无图则整块隐藏', payCodesOk, JSON.stringify({ payCodes: about.payCodes, hidden: payCodesHidden }));
     console.log('');
 
     // ── 2. 免费额度：分组 ───────────────────────────────────────────

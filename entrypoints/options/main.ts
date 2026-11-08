@@ -2126,9 +2126,15 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
 
   // 收款码与联系码是私有素材（public/pay/ 不入库）：从源码构建时这两张图不存在，
   // 浏览器会画出两个破图框。加载失败就把整块扫码区域摘掉，上面的微信号文字仍然有效。
-  document.querySelectorAll('.pay-codes img').forEach((img) => {
-    img.addEventListener('error', () => { img.closest('.pay-codes')?.remove(); }, { once: true });
-  });
+  // 图片在 DOM 解析时就已开始加载，脚本跑到这里时可能**已经**失败过（事件早于监听器），
+  // 所以先按 complete + naturalWidth 判一次，再接 error 兜住「还在加载、稍后失败」。
+  (() => {
+    const dropPayCodes = () => document.querySelectorAll('.pay-codes').forEach((node) => node.remove());
+    document.querySelectorAll<HTMLImageElement>('.pay-codes img').forEach((img) => {
+      if (img.complete && img.naturalWidth === 0) { dropPayCodes(); return; }
+      img.addEventListener('error', dropPayCodes, { once: true });
+    });
+  })();
 
   chrome.storage.sync.get(null, (stored) => {
     settings = normalizeSettings({ ...DEFAULTS, ...defaultConfigSeed(stored), ...stored });
