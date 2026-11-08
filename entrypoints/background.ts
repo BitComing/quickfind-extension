@@ -1,3 +1,5 @@
+import { normalizeLocale, setLocale, t } from '@/shared/i18n';
+
 export default defineBackground(() => {
   const CONTEXT_MENU_ID = 'quickfind-context-search';
   const POPUP_CACHE_KEY = 'quickfind-popup-cache';
@@ -12,10 +14,10 @@ export default defineBackground(() => {
   function describeLlmError(error: unknown): string {
     const name = (error as { name?: string } | null)?.name;
     if (name === 'AbortError' || name === 'TimeoutError') {
-      return `请求超时（超过 ${Math.round(LLM_TIMEOUT_MS / 1000)} 秒未响应）。`;
+      return t('请求超时（超过 {n} 秒未响应）。', { n: Math.round(LLM_TIMEOUT_MS / 1000) });
     }
     const message = (error as { message?: string } | null)?.message;
-    return message || '无法连接到 API。';
+    return message || t('无法连接到 API。');
   }
 
   function refreshPopupCache() {
@@ -38,23 +40,37 @@ export default defineBackground(() => {
       void chrome.runtime.lastError;
       chrome.contextMenus.create({
         id: CONTEXT_MENU_ID,
-        title: '使用 QuickFind 搜索',
+        title: t('使用 QuickFind 搜索'),
         contexts: ['all']
       });
     });
   }
 
-  chrome.runtime.onInstalled.addListener(() => {
+  // 语言是右键菜单文案的一部分：启动时读一次，改动时重建菜单。
+  function syncLanguage(value?: unknown) {
+    if (value === undefined) {
+      chrome.storage.sync.get('language', (stored) => {
+        setLocale(normalizeLocale(stored?.language));
+        ensureContextMenu();
+      });
+      return;
+    }
+    setLocale(normalizeLocale(value));
     ensureContextMenu();
+  }
+
+  chrome.runtime.onInstalled.addListener(() => {
+    syncLanguage();
     refreshPopupCache();
   });
 
   chrome.runtime.onStartup?.addListener(() => {
-    ensureContextMenu();
+    syncLanguage();
     refreshPopupCache();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'sync' && changes.language) syncLanguage(changes.language.newValue);
     if (area === 'sync' && Object.keys(changes).length) schedulePopupCacheRefresh();
   });
 
@@ -77,13 +93,15 @@ export default defineBackground(() => {
   // CSP/CORS policies do not prevent a configured assistant from responding.
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== 'quickfind-llm-chat') return;
+    // 错误提示要跟内容脚本同一语言：请求消息里带着当前语言。
+    if (message.language) setLocale(normalizeLocale(message.language));
     const config = message.config && typeof message.config === 'object' ? message.config : {};
     const endpoint = String(config.endpoint || '').trim();
     const apiKey = String(config.apiKey || '').trim();
     const model = String(config.model || '').trim();
     const messages = Array.isArray(message.messages) ? message.messages : [];
     if (!endpoint || !model || !messages.length) {
-      sendResponse({ ok: false, error: '请先在设置中填写 API 地址和模型。' });
+      sendResponse({ ok: false, error: t('请先在设置中填写 API 地址和模型。') });
       return;
     }
     const requestEndpoint = /\/chat\/completions$/i.test(endpoint)
@@ -107,13 +125,13 @@ export default defineBackground(() => {
       let payload: any = null;
       try { payload = await response.json(); } catch { /* retain status-based error */ }
       if (!response.ok) {
-        const detail = payload?.error?.message || payload?.message || `请求失败（${response.status}）`;
+        const detail = payload?.error?.message || payload?.message || t('请求失败（{n}）', { n: response.status });
         sendResponse({ ok: false, error: String(detail) });
         return;
       }
       const content = payload?.choices?.[0]?.message?.content;
       if (typeof content !== 'string' || !content.trim()) {
-        sendResponse({ ok: false, error: '接口返回了空回复。' });
+        sendResponse({ ok: false, error: t('接口返回了空回复。') });
         return;
       }
       sendResponse({ ok: true, content: content.trim(), usage: payload?.usage || null });

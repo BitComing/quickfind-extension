@@ -5,8 +5,10 @@ import { LEGACY_NOTES_STORAGE_KEY, NOTES_STORAGE_KEY } from '@/shared/notes';
 import { BUILTIN_SOURCES, DEFAULT_PINNED_SITE_IDS, PINNED_SITE_CONFIG_VERSION } from '@/shared/builtins';
 import { DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS, MAX_DEFAULT_GROUP_COUNT } from '@/shared/defaults';
 import { normalizeSearchConfig, resolveGroupEntries } from '@/shared/settings-store';
+import { actionLabel, actionTooltip, applyI18n, countText, getLocale, groupLabel, normalizeLocale, setLocale, sourceLabel, t } from '@/shared/i18n';
 import { decodeQueryText, normalizeSelectionText } from '@/shared/query-text';
 import { markdownToPlainText, renderMarkdown } from '@/shared/markdown';
+import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
 import {
   createEmptyNotes as outlineCreateEmptyNotes,
   normalizeNotes as outlineNormalizeNotes,
@@ -117,7 +119,8 @@ export default defineContentScript({
 
   let settings = cloneSettings(DEFAULT_SETTINGS);
   let selectedText = '';
-  let selectedRange = null;
+  // Range 对象，类型归属 DOM；本文件未补类型，显式 any 免得每个使用点各记一次隐式 any。
+  let selectedRange: any = null;
   let selectedInput = null;
   let selectedInputStart = 0;
   let selectedInputEnd = 0;
@@ -127,7 +130,13 @@ export default defineContentScript({
   let expandedGroupId = null;
   let panelManuallyMoved = false;
   let panelDragState = null;
-  let pinnedHost = null;
+  // 右键搜索源图标后弹出的「打开方式」菜单。同一时刻最多一个，记录元素与拆监听的回调。
+  // root 记下它开在哪一套 shadow tree 里：常驻栏与选中文字浮层各有自己的收尾，
+  // 收尾只该带走自己这一套里的菜单（见 closeOpenModeMenuIn）。
+  let openModeMenu = null;
+  // 显式 any：它初值是 null，不标注时 TypeScript 会把类型收成 null，之后每次读
+// shadowRoot / classList 都要各记一条隐式 any；这里只把它当元素容器用。
+  let pinnedHost: any = null;
   let pinnedExpandedGroupId = null;
   let pinnedMoreExpanded = false;
   // 常驻栏的静止态是「收起」。
@@ -183,12 +192,29 @@ export default defineContentScript({
   // 刚由我们自己替换过节点；这段时间内 .bar 上的 focusout 是重渲染的副产物，不是用户移开焦点。
   // 用时间窗而不是一次性标志：focusout 是同步派发还是紧随其后的异步派发，各实现不一致。
   let pinnedFocusoutSuppressUntil = 0;
+  // 常驻栏宿主的宽度——算横向位置时唯一需要的测量量。
+  //
+  // 为什么要缓存：滚动、页面变动（每 120ms 一次挂载）都会走到 positionPinnedBar，
+  // 而它原先每次都读一次 barHost.offsetWidth。读它可能触发强制布局，代价随文档规模上涨，
+  // 而宽度只取决于三件事：条目内容变了（renderPinnedBar 重建）、视口宽度变了（resize）、
+  // 宿主从隐藏转可见（hidden 元素量出来恒为 0）。其余时候沿用上次结果，
+  // 热路径上就只剩几个数字比较。
+  let pinnedBarHostWidth = 0;
+  let pinnedBarHostWidthDirty = true;
+  // 常驻栏内容高度（写进 --pinned-bar-height 的值）。同理只在内容/展开态真的变了才重量：
+  // 量它要读 .bar-content.scrollHeight，也是一次强制布局。
+  let pinnedBarContentHeight = 0;
+  let pinnedBarContentHeightDirty = true;
+  // 已排队的「重新定位选中浮层/常驻栏」帧号，见 scheduleRefreshSelectionPosition。
+  let refreshSelectionFrame = 0;
   let contextAnchor = null;
   let selectionPointer = null;
   let selectionPointerPending = false;
   let selectionPointerText = '';
   let mouseButtonDown = false;
   let selectionShowTimer = null;
+  // 触发点显示期间巡检「选区还在不在」的计时器，见 selectionLooksGone / startSelectionWatch。
+  let selectionWatchTimer: any = null;
   const LLM_CONVERSATIONS_KEY = 'quickfind-llm-conversations';
   /** LLM 请求超时上限，与 background 侧保持一致（那边也有同名常量，改一处要改两处）。 */
   const LLM_TIMEOUT_MS = 60000;
@@ -263,51 +289,68 @@ export default defineContentScript({
         width: max-content;
         max-width: calc(100vw - 20px);
         padding: 5px 7px 7px;
-        border: 1px solid rgba(255,255,255,.7);
+        border: 1px solid rgba(17,24,39,.08);
         border-radius: 11px;
-        background: rgba(250, 253, 251, .94);
-        box-shadow: 0 18px 45px rgba(20, 53, 40, .2), 0 2px 5px rgba(20, 53, 40, .08);
-        backdrop-filter: blur(18px) saturate(1.25);
-        -webkit-backdrop-filter: blur(18px) saturate(1.25);
+        background: rgba(255, 255, 255, .96);
+        box-shadow: 0 18px 45px rgba(17, 24, 39, .16), 0 2px 5px rgba(17, 24, 39, .06);
+        backdrop-filter: blur(18px) saturate(1.1);
+        -webkit-backdrop-filter: blur(18px) saturate(1.1);
         opacity: 0;
         transform: translateY(-5px);
         pointer-events: none;
         transition: opacity .16s ease, transform .16s ease;
       }
       .quickfind-panel.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
-      .panel-drag-handle { display:grid; place-items:center; width:100%; height:9px; padding:0; border:0; color:#a2b4aa; background:transparent; cursor:grab; touch-action:none; }
+      .panel-drag-handle { display:grid; place-items:center; width:100%; height:9px; padding:0; border:0; color:#c3c7cf; background:transparent; cursor:grab; touch-action:none; }
       .panel-drag-handle::before { content:""; width:27px; height:3px; border-radius:99px; background:currentColor; }
-      .panel-drag-handle:hover { color:#527967; }
+      .panel-drag-handle:hover { color:#8a9099; }
       .panel-drag-handle:active, .quickfind-panel.dragging .panel-drag-handle { cursor:grabbing; }
       .panel-head { display:flex; flex-direction:column; align-items:stretch; min-width:0; margin-bottom:6px; }
       .query-row { position:relative; display:flex; align-items:center; min-width:180px; }
       .query-input { width:100%; height:28px; min-height:28px;
       max-height:116px; padding:3px 31px 3px 8px; overflow:hidden;
-      resize:none; border:1px solid #dbe8e0; border-radius:6px; outline:none; color:#29483b; background:rgba(255,255,255,.9); font:11px/18px Inter,ui-sans-serif,sans-serif; }
-      .query-input:focus { border-color:#6eaf8d; box-shadow:0 0 0 2px rgba(62,143,108,.12); }
+      resize:none; border:1px solid #d7d9df; border-radius:6px; outline:none; color:#17181c; background:#fff; font:11px/18px Inter,ui-sans-serif,sans-serif; }
+      .query-input:focus { border-color:#2f795b; box-shadow:0 0 0 2px rgba(47,121,91,.12); }
       .query-row.expanded .query-input { padding-top:5px; padding-bottom:5px; overflow-y:auto; line-height:16px; }
       .query-expand { position:absolute; top:4px; right:4px;
-      display:grid; place-items:center; width:20px; height:20px; padding:0; border:0; border-radius:5px; color:#789087; background:transparent; cursor:pointer; }
-      .query-expand:hover, .query-expand[aria-expanded="true"] { color:#2f795b; background:#edf7f0; }
-      .query-expand:focus-visible { outline:2px solid #3a8c6a; outline-offset:2px; }
+      display:grid; place-items:center; width:20px; height:20px; padding:0; border:0; border-radius:5px; color:#8a9099; background:transparent; cursor:pointer; }
+      .query-expand:hover, .query-expand[aria-expanded="true"] { color:#2f795b; background:#f1f2f4; }
+      .query-expand:focus-visible { outline:2px solid #2f795b; outline-offset:2px; }
       .query-expand svg { width:13px; height:13px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
       .engine-list { display:flex; align-items:center; flex-wrap:nowrap; gap:4px; width:max-content; max-width:100%; overflow-x:auto; }
-      .hidden-engine-list { display:flex; flex-direction:column; align-items:stretch; gap:4px; width:100%; min-width:180px; margin-top:5px; padding-top:5px; border-top:1px solid #e5eee8; }
-      .hidden-engine-list[hidden] { display:none; }
-      .group-engine-list { position:absolute; z-index:1; display:flex;
-      flex-direction:column; align-items:stretch; gap:4px; min-width:160px;
-      max-width:calc(100vw - 20px); max-height:calc(100vh - 20px);
-      padding:5px; overflow-y:auto; border:1px solid rgba(255,255,255,.78);
-      border-radius:8px; background:rgba(250,253,251,.98); box-shadow:0 12px 30px rgba(20,53,40,.18),0 2px 5px rgba(20,53,40,.08);
-      backdrop-filter:blur(14px) saturate(1.2); -webkit-backdrop-filter:blur(14px) saturate(1.2); pointer-events:auto; }
-      .group-engine-list[hidden] { display:none; }
-      .group-engine-list .engine { width:100%; justify-content:flex-start; }
+      /* 「更多」展开的菜单：与常驻搜索栏的更多飞层同一套外观——浮在面板外的
+         一张白卡（同样的圆角、描边、投影与背景模糊），行距也压到同一档。
+         此前它是面板里的一段内联列表：展开后整块面板被撑高、下面多一条分隔线，
+         同一功能在常驻栏与选区工具栏长得完全两样。 */
+      .hidden-engine-list, .group-engine-list {
+        position:absolute; z-index:2;
+        display:flex; flex-direction:column; align-items:stretch; gap:4px;
+        width:170px; max-width:calc(100vw - 20px); max-height:calc(100vh - 20px);
+        padding:4px; overflow-y:auto;
+        border:1px solid rgba(17,24,39,.1); border-radius:7px;
+        background:rgba(255,255,255,.98);
+        box-shadow:0 12px 30px rgba(17,24,39,.16),0 2px 5px rgba(17,24,39,.06);
+        backdrop-filter:blur(14px) saturate(1.1); -webkit-backdrop-filter:blur(14px) saturate(1.1);
+        pointer-events:auto;
+      }
+      .hidden-engine-list[hidden], .group-engine-list[hidden] { display:none; }
+      .hidden-engine-list .engine, .group-engine-list .engine {
+        width:100%; min-height:23px; justify-content:flex-start; gap:4px;
+        padding:2px 6px 2px 3px; border-color:#d7d9df; border-radius:5px;
+        font:600 11px/1.2 Inter,ui-sans-serif,sans-serif;
+        transition:border-color .14s ease,background .14s ease;
+      }
+      .hidden-engine-list .engine:hover, .group-engine-list .engine:hover { border-color:#c9ccd2; background:#f6f7f8; transform:none; box-shadow:none; }
+      .hidden-engine-list .engine:focus-visible, .group-engine-list .engine:focus-visible { outline:2px solid #2f795b; outline-offset:2px; }
+      .hidden-engine-list .engine .engine-mark, .group-engine-list .engine .engine-mark { width:17px; height:17px; border-radius:4px; font-size:10px; }
+      .hidden-engine-list .engine .engine-name, .group-engine-list .engine .engine-name { max-width:94px; font-size:11px; }
+      /* 分组飞层与「更多」菜单共用上面这套卡面：从「更多」里点分组时，
+         菜单原地换成该分组的内容，不会突然变小的同时把行撑高。 */
       .engine { display:flex; flex:0 0 auto; min-width:0; flex-direction:row;
       align-items:center; gap:4px; padding:4px 6px 4px 4px;
-      border:1px solid #dbe8e0; border-radius:7px; color:#324640;
-      background:rgba(255,255,255,.75); cursor:pointer; transition: border-color .14s ease, background .14s ease, transform .14s ease, box-shadow .14s ease; }
-      .hidden-engine-list .engine { width:100%; justify-content:flex-start; }
-      .engine:hover { border-color:#a8cbb9; background:#f7fcf9; transform:translateY(-1px); box-shadow:0 4px 10px rgba(42, 88, 68, .1); }
+      border:1px solid #e1e2e6; border-radius:7px; color:#33363d;
+      background:#fff; cursor:pointer; transition: border-color .14s ease, background .14s ease, transform .14s ease, box-shadow .14s ease; }
+      .engine:hover { border-color:#c9ccd2; background:#f6f7f8; transform:translateY(-1px); box-shadow:0 4px 10px rgba(17, 24, 39, .08); }
       .engine:active { transform:translateY(0); }
       .engine-mark { display:grid; place-items:center; width:19px; height:19px; overflow:hidden; border-radius:5px; font:700 11px/1 Arial, sans-serif; }
       .engine-mark img { width:100%; height:100%; object-fit:cover; }
@@ -333,12 +376,22 @@ export default defineContentScript({
       .douyin .engine-mark { color:#fff; background:#161823; }
       .doubao .engine-mark { color:#fff; background:#4f7cff; }
       .deepseek .engine-mark { color:#fff; background:#4d6bfe; font-size:9px; }
-      .special-copy .engine-mark { color:#fff; background:#6c8178; }
+      .special-copy .engine-mark { color:#fff; background:#6b7280; }
       .special-notes .engine-mark { color:#fff; background:#3e8f6c; }
       .special-ask-ai .engine-mark { color:#f5c56b; background:#19352c; font-size:9px; }
-      .custom .engine-mark { color:#587269; background:#e6efe9; }
-      .more-engine .engine-mark { color:#587269; background:#e6efe9; font-size:13px; }
-      .group .engine-mark { color:#315f4d; background:#dfeee5; font-size:12px; }
+      .custom .engine-mark { color:#4b5563; background:#f1f2f4; }
+      .more-engine .engine-mark { color:#4b5563; background:#f1f2f4; font-size:13px; }
+      .group .engine-mark { color:#4b5563; background:#f1f2f4; font-size:12px; }
+      /* 右键搜索源图标后的打开方式菜单：白底浮层，两项互斥，选完即关。 */
+      .qf-open-menu { position:fixed; z-index:2147483647; display:flex; flex-direction:column; min-width:118px; padding:4px;
+      border:1px solid rgba(17,24,39,.1); border-radius:8px; background:rgba(255,255,255,.98);
+      box-shadow:0 12px 30px rgba(17,24,39,.16),0 2px 5px rgba(17,24,39,.06);
+      backdrop-filter:blur(14px) saturate(1.1); -webkit-backdrop-filter:blur(14px) saturate(1.1);
+      font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; pointer-events:auto; }
+      .qf-open-menu-item { display:flex; align-items:center; width:100%; min-height:26px; padding:0 8px; border:0; border-radius:5px;
+      color:#33363d; background:transparent; font:600 11px/1.2 Inter,ui-sans-serif,sans-serif; text-align:left; white-space:nowrap; cursor:pointer; }
+      .qf-open-menu-item:hover { color:#17181c; background:#f1f2f4; }
+      .qf-open-menu-item:focus-visible { outline:2px solid #2f795b; outline-offset:-2px; }
       .llm-dock { position:fixed; inset:0; z-index:2147483646;
       width:100vw; height:100vh; pointer-events:none; font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#203b31; }
       .llm-dock[hidden] { display:none; }
@@ -360,13 +413,13 @@ export default defineContentScript({
       height:100vh; overflow:hidden; border-left:1px solid #dce9e1;
       background:#fff; box-shadow:-18px 0 46px rgba(25,57,42,.15); pointer-events:auto; transform:translateX(102%); transition:transform .28s cubic-bezier(.2,.8,.2,1); }
       .llm-dock.is-open .llm-sidebar { transform:translateX(0); }
-      .llm-sidebar-head { display:flex; align-items:center; gap:10px; min-height:74px; padding:17px 18px 12px; border-bottom:1px solid #edf3ef; }
-      .llm-brand-mark { display:grid; place-items:center; width:34px; height:34px; flex:0 0 auto; border-radius:10px; color:#f5c56b; background:#19352c; }
+      .llm-sidebar-head { display:flex; align-items:center; gap:10px; min-height:74px; padding:17px 18px 12px; border-bottom:1px solid #f1f2f4; }
+      .llm-brand-mark { display:grid; place-items:center; width:34px; height:34px; flex:0 0 auto; border-radius:10px; color:#f5c56b; background:#17181c; }
       .llm-brand-mark svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
       .llm-kicker { color:#779286; font-size:9px; font-weight:750; letter-spacing:.13em; }
-      .llm-title { margin-top:2px; color:#19352c; font-size:18px; font-weight:730; line-height:1.2; }
-      .llm-sidebar-close { display:grid; place-items:center; width:28px; height:28px; margin-left:auto; padding:0; border:0; border-radius:6px; color:#81958a; background:transparent; cursor:pointer; }
-      .llm-sidebar-close:hover { color:#19352c; background:#edf5ef; }
+      .llm-title { margin-top:2px; color:#17181c; font-size:18px; font-weight:730; line-height:1.2; }
+      .llm-sidebar-close { display:grid; place-items:center; width:28px; height:28px; margin-left:auto; padding:0; border:0; border-radius:6px; color:#6b7280; background:transparent; cursor:pointer; }
+      .llm-sidebar-close:hover { color:#17181c; background:#f1f2f4; }
       .llm-sidebar-close svg,.llm-new-chat svg,.llm-chat-icon svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
       .llm-status-row { display:flex; align-items:center; gap:7px; min-height:38px; padding:0 18px; color:#73867c; font-size:10px; }
       .llm-status-dot { width:7px; height:7px; flex:0 0 auto; border-radius:50%; background:#d6a05b; box-shadow:0 0 0 3px #fff6e9; }
@@ -375,19 +428,19 @@ export default defineContentScript({
       .llm-status-dot.error { background:#c76a5f; box-shadow:0 0 0 3px #fcecea; }
       .llm-status-text { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .llm-new-chat { display:inline-flex; align-items:center;
-      gap:4px; min-height:25px; margin-left:auto; padding:0 7px; border:1px solid #d6e6dc; border-radius:6px; color:#3c6d58; background:#fff; font-size:10px; cursor:pointer; }
-      .llm-new-chat:hover { border-color:#7db394; background:#f2faf4; }
-      .llm-history-wrap { min-height:0; flex:1; padding:8px 15px 14px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:#cadbd0 transparent; }
-      .llm-history-heading { display:flex; align-items:center; justify-content:space-between; padding:5px 3px 9px; color:#506d5d; font-size:11px; font-weight:700; }
-      .llm-history-count { color:#9aaa9f; font-size:10px; font-weight:500; }
+      gap:4px; min-height:25px; margin-left:auto; padding:0 7px; border:1px solid #d7d9df; border-radius:6px; color:#3c6d58; background:#fff; font-size:10px; cursor:pointer; }
+      .llm-new-chat:hover { border-color:#2f795b; background:#f6f7f8; }
+      .llm-history-wrap { min-height:0; flex:1; padding:8px 15px 14px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:#d4d7dc transparent; }
+      .llm-history-heading { display:flex; align-items:center; justify-content:space-between; padding:5px 3px 9px; color:#6b7280; font-size:11px; font-weight:700; }
+      .llm-history-count { color:#9aa1ab; font-size:10px; font-weight:500; }
       .llm-history-list { display:flex; flex-direction:column; gap:8px; }
       /* 卡片是 div 而不是 button：里面要放删除按钮，而 button 不能嵌套 button
          （浏览器会把它拆开，删除按钮就点不到）。交互语义用 role/tabindex 补。 */
       .llm-history-card { display:flex; align-items:flex-start; gap:4px; width:100%; min-height:78px;
-      padding:12px 9px 12px 13px; border:1px solid #e0ece4; border-radius:8px;
-      color:#29483b; background:#fbfdfb; text-align:left; cursor:pointer; transition:border-color .14s ease,background .14s ease,box-shadow .14s ease,transform .14s ease; }
-      .llm-history-card:hover { border-color:#9cc5aa; background:#f7fcf8; box-shadow:0 6px 16px rgba(42,88,68,.08); transform:translateY(-1px); }
-      .llm-history-card:focus-visible { outline:2px solid #3e8f6c; outline-offset:2px; }
+      padding:12px 9px 12px 13px; border:1px solid #e7e8ec; border-radius:8px;
+      color:#33363d; background:#fafafa; text-align:left; cursor:pointer; transition:border-color .14s ease,background .14s ease,box-shadow .14s ease,transform .14s ease; }
+      .llm-history-card:hover { border-color:#c9ccd2; background:#f6f7f8; box-shadow:0 6px 16px rgba(17,24,39,.06); transform:translateY(-1px); }
+      .llm-history-card:focus-visible { outline:2px solid #2f795b; outline-offset:2px; }
       .llm-card-body { min-width:0; flex:1; }
       /* 删除按钮默认收敛，指针进入卡片或按钮获得键盘焦点时才显形：
          常驻显示会让整列卡片看起来像一堆危险操作。
@@ -395,7 +448,7 @@ export default defineContentScript({
          点卡片右上角会落到这个看不见的按钮上（表现为「点卡片没打开对话，反而在问要不要删」）。
          pointer-events 不影响键盘可达性，Tab 仍能聚焦到它。 */
       .llm-card-delete { display:grid; place-items:center; width:24px; height:24px; flex:0 0 auto; padding:0;
-      border:0; border-radius:6px; color:#a8b6ae; background:transparent; cursor:pointer; opacity:0; pointer-events:none; transition:opacity .14s ease,color .14s ease,background .14s ease; }
+      border:0; border-radius:6px; color:#9aa1ab; background:transparent; cursor:pointer; opacity:0; pointer-events:none; transition:opacity .14s ease,color .14s ease,background .14s ease; }
       .llm-history-card:hover .llm-card-delete,.llm-card-delete:focus-visible { opacity:1; pointer-events:auto; }
       .llm-card-delete:hover { color:#b65c4f; background:#fff0ed; }
       .llm-card-delete svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
@@ -403,68 +456,68 @@ export default defineContentScript({
          而在 shadow DOM 里弹原生 confirm 会被部分页面拦掉，所以用按钮自身表达。 */
       .llm-card-delete.is-armed { width:auto; padding:0 7px; opacity:1; color:#fff; background:#b65c4f; font-size:9px; font-weight:700; white-space:nowrap; }
       .llm-card-delete.is-armed:hover { background:#9d4a3f; }
-      .llm-card-title { display:block; overflow:hidden; color:#264d3b; font-size:12px; font-weight:680; line-height:1.45; text-overflow:ellipsis; white-space:nowrap; }
-      .llm-card-preview { display:-webkit-box; margin-top:6px; overflow:hidden; color:#82958a; font-size:10px; line-height:1.5; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
-      .llm-card-meta { display:flex; align-items:center; justify-content:space-between; margin-top:8px; color:#a0aea5; font-size:9px; }
-      .llm-history-empty { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:240px; padding:24px 25px; color:#91a199; text-align:center; }
+      .llm-card-title { display:block; overflow:hidden; color:#17181c; font-size:12px; font-weight:680; line-height:1.45; text-overflow:ellipsis; white-space:nowrap; }
+      .llm-card-preview { display:-webkit-box; margin-top:6px; overflow:hidden; color:#9aa1ab; font-size:10px; line-height:1.5; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+      .llm-card-meta { display:flex; align-items:center; justify-content:space-between; margin-top:8px; color:#9aa1ab; font-size:9px; }
+      .llm-history-empty { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:240px; padding:24px 25px; color:#9aa1ab; text-align:center; }
       .llm-history-empty[hidden] { display:none; }
-      .llm-history-empty svg { width:32px; height:32px; margin-bottom:10px; fill:none; stroke:#a9bbb0; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
-      .llm-history-empty strong { color:#587466; font-size:12px; font-weight:680; }
+      .llm-history-empty svg { width:32px; height:32px; margin-bottom:10px; fill:none; stroke:#9aa1ab; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
+      .llm-history-empty strong { color:#6b7280; font-size:12px; font-weight:680; }
       .llm-history-empty span { max-width:220px; margin-top:6px; font-size:10px; line-height:1.6; }
       .llm-compose { margin:0; padding:11px 15px 15px; border-top:1px solid #e6efe9; background:#fff; }
-      .llm-compose-box { position:relative; border:1px solid #d4e4da; border-radius:8px; background:#fbfdfb; transition:border-color .14s ease,box-shadow .14s ease; }
-      .llm-compose-box:focus-within { border-color:#80b595; box-shadow:0 0 0 3px rgba(62,143,108,.1); }
+      .llm-compose-box { position:relative; border:1px solid #d7d9df; border-radius:8px; background:#fafafa; transition:border-color .14s ease,box-shadow .14s ease; }
+      .llm-compose-box:focus-within { border-color:#2f795b; box-shadow:0 0 0 3px rgba(47,121,91,.12); }
       .llm-compose textarea,.llm-chat-compose textarea { display:block;
       width:100%; min-height:52px; max-height:128px; padding:10px 12px 5px;
-      border:0; outline:none; resize:none; overflow-y:auto; color:#29483b; background:transparent; font:12px/1.55 Inter,ui-sans-serif,sans-serif; }
-      .llm-compose textarea::placeholder,.llm-chat-compose textarea::placeholder { color:#a2b0a8; }
+      border:0; outline:none; resize:none; overflow-y:auto; color:#33363d; background:transparent; font:12px/1.55 Inter,ui-sans-serif,sans-serif; }
+      .llm-compose textarea::placeholder,.llm-chat-compose textarea::placeholder { color:#9aa1ab; }
       .llm-compose-bottom { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:3px 7px 7px 12px; }
-      .llm-compose-hint { color:#9aaa9f; font-size:9px; }
+      .llm-compose-hint { color:#9aa1ab; font-size:9px; }
       .llm-send { display:grid; place-items:center; width:28px; height:28px; padding:0; border:0; border-radius:7px; color:#fff; background:#2f795b; cursor:pointer; }
       .llm-send:hover { background:#25654b; }
       .llm-send:disabled { opacity:.45; cursor:not-allowed; }
       .llm-send svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-      .llm-send:focus-visible,.llm-chat-close:focus-visible,.llm-chat-back:focus-visible,.llm-chat-pin:focus-visible,.llm-chat-history-btn:focus-visible,.llm-card-delete:focus-visible,.llm-rail:focus-visible,.llm-sidebar-close:focus-visible { outline:2px solid #3e8f6c; outline-offset:2px; }
-      .llm-tabbar { display:flex; gap:3px; flex:0 0 auto; margin:0 15px 8px; padding:3px; border-radius:10px; background:#f0f6f2; }
+      .llm-send:focus-visible,.llm-chat-close:focus-visible,.llm-chat-back:focus-visible,.llm-chat-pin:focus-visible,.llm-chat-history-btn:focus-visible,.llm-card-delete:focus-visible,.llm-rail:focus-visible,.llm-sidebar-close:focus-visible { outline:2px solid #2f795b; outline-offset:2px; }
+      .llm-tabbar { display:flex; gap:3px; flex:0 0 auto; margin:0 15px 8px; padding:3px; border-radius:10px; background:#f1f2f4; }
       .llm-tab { display:flex; flex:1; align-items:center; justify-content:center;
       min-width:0; min-height:29px; padding:0 8px; overflow:hidden;
-      border:0; border-radius:8px; color:#7d9086; background:transparent;
+      border:0; border-radius:8px; color:#6b7280; background:transparent;
       font-size:11px; font-weight:700; white-space:nowrap; text-overflow:ellipsis; cursor:pointer; transition:color .15s ease, background .15s ease, box-shadow .15s ease; }
       .llm-tab:hover { color:#2f795b; }
-      .llm-tab.is-active { color:#19352c; background:#fff; box-shadow:0 1px 4px rgba(24,61,44,.12); }
-      .llm-tab:focus-visible { outline:2px solid #3e8f6c; outline-offset:1px; }
+      .llm-tab.is-active { color:#17181c; background:#fff; box-shadow:0 1px 4px rgba(17,24,39,.08); }
+      .llm-tab:focus-visible { outline:2px solid #2f795b; outline-offset:1px; }
       .llm-pane { display:flex; flex:1; flex-direction:column; min-height:0; }
       .llm-pane[hidden] { display:none; }
       .outline-toolbar { display:flex; align-items:center; gap:5px; flex:0 0 auto; padding:0 15px 7px; }
       .outline-search { display:flex; align-items:center; gap:4px; flex:1; min-width:0; height:28px; padding:0 7px; border:1px solid #dbe8e0; border-radius:7px; background:#fff; }
-      .outline-search:focus-within { border-color:#80b595; }
+      .outline-search:focus-within { border-color:#2f795b; }
       .outline-search svg { width:11px; height:11px; flex:0 0 auto; fill:none; stroke:#8fa298; stroke-width:2; stroke-linecap:round; }
-      .outline-search input { min-width:0; flex:1; border:0; padding:0; outline:none; color:#29483b; background:transparent; font:11px Inter,ui-sans-serif,sans-serif; }
+      .outline-search input { min-width:0; flex:1; border:0; padding:0; outline:none; color:#33363d; background:transparent; font:11px Inter,ui-sans-serif,sans-serif; }
       .outline-tool-button { display:inline-flex; align-items:center;
       justify-content:center; gap:3px; min-height:28px; flex:0 0 auto;
-      padding:0 8px; border:1px solid #d6e6dc; border-radius:7px; color:#3c6d58; background:#fff; font-size:10px; font-weight:650; white-space:nowrap; cursor:pointer; }
-      .outline-tool-button:hover { border-color:#7db394; background:#f2faf4; }
+      padding:0 8px; border:1px solid #d7d9df; border-radius:7px; color:#3c6d58; background:#fff; font-size:10px; font-weight:650; white-space:nowrap; cursor:pointer; }
+      .outline-tool-button:hover { border-color:#2f795b; background:#f6f7f8; }
       .outline-tool-button:disabled { opacity:.45; cursor:not-allowed; }
-      .outline-tool-button:focus-visible { outline:2px solid #3e8f6c; outline-offset:1px; }
+      .outline-tool-button:focus-visible { outline:2px solid #2f795b; outline-offset:1px; }
       .outline-tool-button svg { width:11px; height:11px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
       .outline-tool-icon { width:28px; padding:0; }
       .outline-context { display:flex; align-items:center; gap:5px; flex:0 0 auto; padding:0 15px 6px; }
-      .outline-home { flex:0 0 auto; padding:3px 8px; border:1px solid #d6e6dc;
+      .outline-home { flex:0 0 auto; padding:3px 8px; border:1px solid #d7d9df;
       border-radius:6px; color:#3c6d58; background:#fff; font-size:10px; font-weight:650; white-space:nowrap; cursor:pointer; }
-      .outline-home:hover { border-color:#7db394; background:#f2faf4; }
+      .outline-home:hover { border-color:#2f795b; background:#f6f7f8; }
       .outline-context-separator { color:#b6c6bc; }
       .outline-breadcrumb { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#4b6157; font-size:10px; }
       .outline-search-result { flex:0 0 auto; color:#8fa298; font-size:10px; }
-      .outline-scroll { flex:1; min-height:0; padding:4px 10px 14px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:#cadbd0 transparent; }
+      .outline-scroll { flex:1; min-height:0; padding:4px 10px 14px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:#d4d7dc transparent; }
       .outline-list { position:relative; }
       .notes-zoom-heading { padding:2px 6px 8px; color:#4b6157; font-size:11px; font-weight:700; }
       .notes-empty { padding:26px 10px; color:#91a199; font-size:11px; line-height:1.7; text-align:center; }
       .note-row { display:flex; align-items:flex-start; gap:3px; padding:1px 4px; border-radius:6px; transition:background .12s ease; }
       .note-row:hover,.note-row:focus-within { background:#f4faf6; }
       .note-row.dragging { opacity:.4; }
-      .note-row.drag-target-before { box-shadow:inset 0 2px 0 #3e8f6c; }
-      .note-row.drag-target-inside { box-shadow:inset 0 0 0 2px #3e8f6c; }
-      .note-row.drag-target-after { box-shadow:inset 0 -2px 0 #3e8f6c; }
+      .note-row.drag-target-before { box-shadow:inset 0 2px 0 #2f795b; }
+      .note-row.drag-target-inside { box-shadow:inset 0 0 0 2px #2f795b; }
+      .note-row.drag-target-after { box-shadow:inset 0 -2px 0 #2f795b; }
       .note-toggle { display:grid; place-items:center; width:16px; height:22px; flex:0 0 auto; padding:0; border:0; border-radius:4px; color:#93a79c; background:transparent; cursor:pointer; }
       .note-toggle:hover:not(:disabled) { color:#2f795b; background:#eef7f1; }
       .note-toggle:disabled { opacity:.35; cursor:default; }
@@ -473,16 +526,16 @@ export default defineContentScript({
       .note-complete { display:grid; place-items:center; width:17px; height:22px; flex:0 0 auto; padding:0; border:0; color:#93a79c; background:transparent; cursor:pointer; }
       .note-complete:hover { color:#2f795b; }
       .note-complete svg { width:12px; height:12px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
-      .note-row.completed .note-input { color:#a0aea5; text-decoration:line-through; }
+      .note-row.completed .note-input { color:#9aa1ab; text-decoration:line-through; }
       .note-bullet { display:grid; place-items:center; width:15px;
       height:22px; flex:0 0 auto; padding:0; border:0; border-radius:4px; background:transparent; cursor:pointer; touch-action:none; -webkit-user-select:none; user-select:none; }
       .note-bullet::before { content:""; width:5px; height:5px; border-radius:50%; background:#b9cbc0; transition:width .12s ease,height .12s ease,background .12s ease,box-shadow .12s ease; }
       .note-bullet:hover::before { width:9px; height:9px; background:#fff; box-shadow:inset 0 0 0 1.4px #9bbfaa; }
-      .note-bullet.is-armed::before { width:11px; height:11px; background:#f2faf4; box-shadow:inset 0 0 0 1.4px #3e8f6c; }
-      .note-bullet:focus-visible { outline:2px solid #3e8f6c; outline-offset:1px; }
+      .note-bullet.is-armed::before { width:11px; height:11px; background:#f6f7f8; box-shadow:inset 0 0 0 1.4px #2f795b; }
+      .note-bullet:focus-visible { outline:2px solid #2f795b; outline-offset:1px; }
       .note-input { min-width:0; flex:1; padding:2px 4px; border:1px solid transparent;
       border-radius:6px; outline:none; resize:none; overflow:hidden; color:#2c4b3d; background:transparent; font:12px/1.6 Inter,ui-sans-serif,sans-serif; cursor:text; }
-      .note-row.search-match .note-input { background:#f2faf4; }
+      .note-row.search-match .note-input { background:#f6f7f8; }
       .outline-list.is-dragging { -webkit-user-select:none; user-select:none; cursor:grabbing; }
       .note-drag-ghost { position:fixed; z-index:2147483647;
       max-width:240px; padding:2px 7px; overflow:hidden; border-radius:6px;
@@ -494,8 +547,8 @@ export default defineContentScript({
       .llm-chat-layer[hidden] { display:none; }
       .llm-chat-dialog { position:absolute; display:flex; flex-direction:column;
       width:420px; height:min(560px,calc(100vh - 32px)); min-width:280px; min-height:240px;
-      overflow:hidden; border:1px solid #d8e7dd; border-radius:10px;
-      background:#fff; box-shadow:0 24px 65px rgba(17,43,31,.28),0 3px 10px rgba(17,43,31,.12);
+      overflow:hidden; border:1px solid #e7e8ec; border-radius:10px;
+      background:#fff; box-shadow:0 24px 65px rgba(17,24,39,.22),0 3px 10px rgba(17,24,39,.06);
       pointer-events:auto; }
       /* 入场动画是**一次性**的：只在建窗口时挂 .is-entering，animationend 后摘掉。
          千万别把它写在 .llm-chat-dialog 的基础规则上——那样它在整个生命周期里都挂着，
@@ -503,86 +556,86 @@ export default defineContentScript({
          opacity 归 0 + translateY(8px)，表现为「每次拖完窗口都闪一下、跳一下」。 */
       .llm-chat-dialog.is-entering { animation:quickfind-llm-rise .22s cubic-bezier(.2,.8,.2,1); }
       /* 置顶窗口：抬到同层其它窗口之上，并用描边把「已置顶」画出来。 */
-      .llm-chat-dialog.is-pinned { z-index:5; border-color:#9cc5aa; box-shadow:0 26px 70px rgba(17,43,31,.34),0 0 0 2px rgba(62,143,108,.28); }
+      .llm-chat-dialog.is-pinned { z-index:5; border-color:#c9ccd2; box-shadow:0 26px 70px rgba(17,24,39,.26),0 0 0 2px rgba(23,24,28,.12); }
       .llm-chat-dialog.is-dragging { transition:none; }
       .llm-chat-dialog.is-resizing { transition:none; }
-      .llm-chat-head { display:flex; align-items:center; gap:8px; min-height:61px; padding:11px 13px; border-bottom:1px solid #e7efe9;
+      .llm-chat-head { display:flex; align-items:center; gap:8px; min-height:61px; padding:11px 13px; border-bottom:1px solid #f1f2f4;
       cursor:grab; touch-action:none; -webkit-user-select:none; user-select:none; }
       .llm-chat-dialog.is-dragging .llm-chat-head { cursor:grabbing; }
       /* 头部按钮统一外观。返回键只在历史视图里出现（用 [hidden] 收起），
          所以它不再兼作「查看历史」的入口——历史是独立的 .llm-chat-history-btn。 */
-      .llm-chat-back,.llm-chat-close,.llm-chat-pin,.llm-chat-history-btn { display:grid; place-items:center; width:28px; height:28px; padding:0; border:0; border-radius:6px; color:#789086; background:transparent; cursor:pointer; }
+      .llm-chat-back,.llm-chat-close,.llm-chat-pin,.llm-chat-history-btn { display:grid; place-items:center; width:28px; height:28px; padding:0; border:0; border-radius:6px; color:#6b7280; background:transparent; cursor:pointer; }
       .llm-chat-back[hidden],.llm-chat-history-btn[hidden] { display:none; }
       /* 头部按钮里的 svg 必须给尺寸与描边：不给的话 svg 用自身默认的 300×150 横铺，
          被 28×28 的按钮裁掉一角，图标就成了一条看不清的糊线。 */
       .llm-chat-back svg,.llm-chat-close svg,.llm-chat-pin svg,.llm-chat-history-btn svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-      .llm-chat-back:hover,.llm-chat-close:hover,.llm-chat-pin:hover,.llm-chat-history-btn:hover { color:#19352c; background:#edf5ef; }
-      .llm-chat-history-btn.is-active { color:#2f795b; background:#e6f4ec; }
-      .llm-chat-pin.is-active { color:#2f795b; background:#e6f4ec; }
+      .llm-chat-back:hover,.llm-chat-close:hover,.llm-chat-pin:hover,.llm-chat-history-btn:hover { color:#17181c; background:#f1f2f4; }
+      .llm-chat-history-btn.is-active { color:#2f795b; background:#e7e8ec; }
+      .llm-chat-pin.is-active { color:#2f795b; background:#e7e8ec; }
       .llm-chat-head-copy { min-width:0; flex:1; }
       .llm-chat-head-copy[title] { cursor:grab; }
       .llm-chat-dialog.is-dragging .llm-chat-head-copy[title] { cursor:grabbing; }
-      .llm-chat-icon { display:grid; place-items:center; width:29px; height:29px; border-radius:8px; color:#f5c56b; background:#19352c; flex:0 0 auto; }
-      .llm-chat-title { overflow:hidden; color:#234837; font-size:12px; font-weight:720; text-overflow:ellipsis; white-space:nowrap; }
-      .llm-chat-subtitle { margin-top:3px; color:#8a9c92; font-size:9px; }
+      .llm-chat-icon { display:grid; place-items:center; width:29px; height:29px; border-radius:8px; color:#f5c56b; background:#17181c; flex:0 0 auto; }
+      .llm-chat-title { overflow:hidden; color:#17181c; font-size:12px; font-weight:720; text-overflow:ellipsis; white-space:nowrap; }
+      .llm-chat-subtitle { margin-top:3px; color:#9aa1ab; font-size:9px; }
       /* 缩小/放大：右下角抓手。 */
       .llm-chat-resize { position:absolute; right:0; bottom:0; width:16px; height:16px; cursor:nwse-resize; touch-action:none; }
       .llm-chat-resize::before { content:""; position:absolute; right:3px; bottom:3px; width:7px; height:7px;
-      border-right:2px solid #b6c9bd; border-bottom:2px solid #b6c9bd; border-radius:0 0 2px 0; }
+      border-right:2px solid #c9ccd2; border-bottom:2px solid #c9ccd2; border-radius:0 0 2px 0; }
       .llm-chat-scroll .llm-md > :first-child { margin-top:0; }
       .llm-chat-scroll .llm-md > :last-child { margin-bottom:0; }
       .llm-chat-scroll .llm-md p { margin:0 0 8px; }
       .llm-chat-scroll .llm-md h1,.llm-chat-scroll .llm-md h2,.llm-chat-scroll .llm-md h3,
-      .llm-chat-scroll .llm-md h4,.llm-chat-scroll .llm-md h5,.llm-chat-scroll .llm-md h6 { margin:12px 0 6px; color:#1f4232; font-weight:720; line-height:1.35; }
+      .llm-chat-scroll .llm-md h4,.llm-chat-scroll .llm-md h5,.llm-chat-scroll .llm-md h6 { margin:12px 0 6px; color:#17181c; font-weight:720; line-height:1.35; }
       .llm-chat-scroll .llm-md h1 { font-size:16px; } .llm-chat-scroll .llm-md h2 { font-size:15px; }
       .llm-chat-scroll .llm-md h3 { font-size:13px; } .llm-chat-scroll .llm-md h4,
       .llm-chat-scroll .llm-md h5,.llm-chat-scroll .llm-md h6 { font-size:12px; }
       .llm-chat-scroll .llm-md ul,.llm-chat-scroll .llm-md ol { margin:0 0 8px; padding-left:19px; }
       .llm-chat-scroll .llm-md li { margin:3px 0; }
-      .llm-chat-scroll .llm-md code { padding:1px 4px; border-radius:4px; background:#eef4f0; font:11px/1.5 "SFMono-Regular",Consolas,"Liberation Mono",monospace; }
-      .llm-chat-scroll .llm-md pre { margin:0 0 8px; padding:9px 11px; overflow-x:auto; border:1px solid #e2ece6;
-      border-radius:7px; background:#f6faf7; }
+      .llm-chat-scroll .llm-md code { padding:1px 4px; border-radius:4px; background:#f1f2f4; font:11px/1.5 "SFMono-Regular",Consolas,"Liberation Mono",monospace; }
+      .llm-chat-scroll .llm-md pre { margin:0 0 8px; padding:9px 11px; overflow-x:auto; border:1px solid #e7e8ec;
+      border-radius:7px; background:#fafafa; }
       .llm-chat-scroll .llm-md pre code { padding:0; background:transparent; white-space:pre; }
-      .llm-chat-scroll .llm-md blockquote { margin:0 0 8px; padding:2px 0 2px 10px; border-left:3px solid #cfe0d6; color:#5c7468; }
+      .llm-chat-scroll .llm-md blockquote { margin:0 0 8px; padding:2px 0 2px 10px; border-left:3px solid #e7e8ec; color:#6b7280; }
       .llm-chat-scroll .llm-md a { color:#2f795b; text-decoration:underline; text-underline-offset:2px; }
-      .llm-chat-scroll .llm-md hr { margin:10px 0; border:0; border-top:1px solid #e2ece6; }
-      .llm-chat-scroll .llm-md strong { color:#1f4232; font-weight:720; }
+      .llm-chat-scroll .llm-md hr { margin:10px 0; border:0; border-top:1px solid #e7e8ec; }
+      .llm-chat-scroll .llm-md strong { color:#17181c; font-weight:720; }
       /* 「回到底部」：新回复到达时若用户正往上翻，不强行拽走视线。 */
       .llm-chat-jump { position:absolute; right:16px; bottom:110px; display:grid; place-items:center; width:30px; height:30px;
-      padding:0; border:1px solid #cfe0d6; border-radius:50%; color:#2f795b; background:#fff; cursor:pointer;
-      box-shadow:0 6px 16px rgba(24,61,44,.16); pointer-events:auto; }
+      padding:0; border:1px solid #e7e8ec; border-radius:50%; color:#6b7280; background:#fff; cursor:pointer;
+      box-shadow:0 6px 16px rgba(17,24,39,.1); pointer-events:auto; }
       .llm-chat-jump[hidden] { display:none; }
-      .llm-chat-jump:hover { background:#f2faf4; }
+      .llm-chat-jump:hover { background:#f6f7f8; }
       .llm-chat-jump svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
-      .llm-chat-scroll { display:flex; flex:1; flex-direction:column; gap:14px; padding:18px 15px; overflow-y:auto; background:#fcfefc; scrollbar-width:thin; scrollbar-color:#cadbd0 transparent; }
+      .llm-chat-scroll { display:flex; flex:1; flex-direction:column; gap:14px; padding:18px 15px; overflow-y:auto; background:#ffffff; scrollbar-width:thin; scrollbar-color:#d4d7dc transparent; }
       /* 类选择器上的 display 会压过 UA 的 [hidden]{display:none}（作者样式恒胜 UA 样式），
          不显式兜底的话 hidden 形同虚设——切到历史视图时对话流会与列表同时显示。 */
       .llm-chat-scroll[hidden],.llm-chat-compose[hidden] { display:none; }
       /* 窗口内的历史视图：与对话流互斥显示，复用同一片区域。 */
-      .llm-chat-history { flex:1; min-height:0; padding:10px 12px 14px; overflow-y:auto; background:#fcfefc; scrollbar-width:thin; scrollbar-color:#cadbd0 transparent; }
+      .llm-chat-history { flex:1; min-height:0; padding:10px 12px 14px; overflow-y:auto; background:#ffffff; scrollbar-width:thin; scrollbar-color:#d4d7dc transparent; }
       .llm-chat-history[hidden] { display:none; }
-      .llm-chat-history-head { display:flex; align-items:center; justify-content:space-between; padding:4px 3px 9px; color:#506d5d; font-size:11px; font-weight:700; }
-      .llm-chat-history-count { color:#9aaa9f; font-size:10px; font-weight:500; }
+      .llm-chat-history-head { display:flex; align-items:center; justify-content:space-between; padding:4px 3px 9px; color:#6b7280; font-size:11px; font-weight:700; }
+      .llm-chat-history-count { color:#9aa1ab; font-size:10px; font-weight:500; }
       .llm-chat-history-list { display:flex; flex-direction:column; gap:8px; }
-      .llm-chat-history-empty { display:flex; align-items:center; justify-content:center; min-height:200px; padding:20px; color:#91a199; text-align:center; font-size:10px; line-height:1.6; }
+      .llm-chat-history-empty { display:flex; align-items:center; justify-content:center; min-height:200px; padding:20px; color:#9aa1ab; text-align:center; font-size:10px; line-height:1.6; }
       .llm-message { display:flex; flex-direction:column; max-width:88%; gap:5px; }
       .llm-message.user { align-self:flex-end; align-items:flex-end; }
       .llm-message.assistant { align-self:flex-start; align-items:flex-start; }
-      .llm-message-label { color:#91a198; font-size:9px; font-weight:650; }
-      .llm-message-bubble { padding:10px 12px; border:1px solid #e0ebe4;
-      border-radius:9px; color:#385448; background:#fff; font-size:12px; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
+      .llm-message-label { color:#9aa1ab; font-size:9px; font-weight:650; }
+      .llm-message-bubble { padding:10px 12px; border:1px solid #e7e8ec;
+      border-radius:9px; color:#33363d; background:#fff; font-size:12px; line-height:1.65; white-space:pre-wrap; overflow-wrap:anywhere; }
       /* 助手气泡里是渲染后的 Markdown，块级元素自带间距，外层不再整体 pre-wrap。 */
       .llm-message.assistant .llm-message-bubble { white-space:normal; }
-      .llm-message.user .llm-message-bubble { border-color:#d3e9da; color:#244e39; background:#eaf7ee; border-bottom-right-radius:3px; }
+      .llm-message.user .llm-message-bubble { border-color:#e7e8ec; color:#17181c; background:#f1f2f4; border-bottom-right-radius:3px; }
       .llm-message.assistant .llm-message-bubble { border-bottom-left-radius:3px; }
-      .llm-message.pending .llm-message-bubble { color:#82958a; }
+      .llm-message.pending .llm-message-bubble { color:#9aa1ab; }
       .llm-typing { display:inline-flex; align-items:center; gap:3px; height:14px; }
-      .llm-typing i { width:4px; height:4px; border-radius:50%; background:#7da58b; animation:quickfind-llm-dot 1s ease-in-out infinite; }
+      .llm-typing i { width:4px; height:4px; border-radius:50%; background:#9aa1ab; animation:quickfind-llm-dot 1s ease-in-out infinite; }
       .llm-typing i:nth-child(2) { animation-delay:.15s; }.llm-typing i:nth-child(3) { animation-delay:.3s; }
-      .llm-chat-compose { padding:10px 12px 12px; border-top:1px solid #e5eee8; background:#fff; }
-      .llm-chat-compose .llm-compose-box { background:#fbfdfb; }
+      .llm-chat-compose { padding:10px 12px 12px; border-top:1px solid #f1f2f4; background:#fff; }
+      .llm-chat-compose .llm-compose-box { background:#fafafa; }
       .llm-chat-compose .llm-compose-bottom { padding-bottom:6px; }
-      .llm-chat-footer-note { padding:0 4px 7px; color:#a0aea5; font-size:9px; }
+      .llm-chat-footer-note { padding:0 4px 7px; color:#9aa1ab; font-size:9px; }
       @keyframes quickfind-llm-pulse { 0%,100%{opacity:.55}50%{opacity:1} }
       @keyframes quickfind-llm-rise { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
       @keyframes quickfind-llm-dot { 0%,80%,100%{opacity:.35;transform:translateY(0)}40%{opacity:1;transform:translateY(-2px)} }
@@ -592,66 +645,70 @@ export default defineContentScript({
       @media (max-width:600px) { .llm-sidebar { width:calc(100vw - 12px);
       } .llm-chat-dialog { width:calc(100vw - 16px); } .llm-history-wrap { padding-left:12px;padding-right:12px; } }
     </style>
-    <button class="quickfind-trigger" type="button" aria-label="使用搜索引擎搜索选中文字" aria-expanded="false" title="搜索选中文字">
+    <button class="quickfind-trigger" type="button" aria-label="使用搜索引擎搜索选中文字" data-i18n-aria-label="使用搜索引擎搜索选中文字" aria-expanded="false" title="搜索选中文字" data-i18n-title="搜索选中文字">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
     </button>
-    <section class="quickfind-panel" role="dialog" aria-label="搜索引擎列表">
-      <div class="panel-drag-handle" role="button" tabindex="0" aria-label="长按拖动搜索列表" title="长按拖动搜索列表"></div>
-      <div class="panel-head"><div class="query-row"><textarea class="query-input" rows="1" aria-label="编辑搜索内容" autocomplete="off"></textarea><button class="query-expand" type="button" aria-label="展开多行输入" aria-expanded="false" title="展开多行输入"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5"></path></svg></button></div></div>
+    <section class="quickfind-panel" role="dialog" aria-label="搜索引擎列表" data-i18n-aria-label="搜索引擎列表">
+      <div class="panel-drag-handle" role="button" tabindex="0" aria-label="长按拖动搜索列表" data-i18n-aria-label="长按拖动搜索列表" title="长按拖动搜索列表" data-i18n-title="长按拖动搜索列表"></div>
+      <div class="panel-head"><div class="query-row"><textarea class="query-input" rows="1" aria-label="编辑搜索内容" data-i18n-aria-label="编辑搜索内容" autocomplete="off"></textarea><button class="query-expand" type="button" aria-label="展开多行输入" data-i18n-aria-label="展开多行输入" aria-expanded="false" title="展开多行输入" data-i18n-title="展开多行输入"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5"></path></svg></button></div></div>
       <div class="engine-list"></div>
       <div class="hidden-engine-list" hidden></div>
       <div class="group-engine-list" hidden></div>
     </section>
-    <div class="llm-dock" aria-label="右侧 LLM 对话">
-      <button class="llm-rail" type="button" aria-label="展开 LLM 对话" aria-expanded="false" title="展开 LLM 对话"></button>
-      <aside class="llm-sidebar" aria-label="LLM 聊天历史" aria-hidden="true">
+    <div class="llm-dock" aria-label="右侧 LLM 对话" data-i18n-aria-label="右侧 LLM 对话">
+      ${PAGE_SIDEBAR_ENABLED ? `
+      <button class="llm-rail" type="button" aria-label="展开 LLM 对话" data-i18n-aria-label="展开 LLM 对话" aria-expanded="false" title="展开 LLM 对话" data-i18n-title="展开 LLM 对话"></button>
+      <aside class="llm-sidebar" aria-label="LLM 聊天历史" data-i18n-aria-label="LLM 聊天历史" aria-hidden="true">
         <header class="llm-sidebar-head">
           <span class="llm-brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6.5 12 3l7 3.5v7L12 17l-7-3.5Z"></path><path d="m8.5 8.5 3.5 1.8 3.5-1.8M12 10.3V17"></path></svg></span>
-          <div><p class="llm-kicker">QUICKFIND / AI</p><h2 class="llm-title">随心问</h2></div>
-          <button class="llm-sidebar-close" type="button" aria-label="收起 LLM 面板" title="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"></path></svg></button>
+          <div><p class="llm-kicker">QUICKFIND / AI</p><h2 class="llm-title" data-i18n="随心问">随心问</h2></div>
+          <button class="llm-sidebar-close" type="button" aria-label="收起 LLM 面板" data-i18n-aria-label="收起 LLM 面板" title="收起" data-i18n-title="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"></path></svg></button>
         </header>
-        <div class="llm-tabbar" role="tablist" aria-label="面板功能">
-          <button class="llm-tab is-active" type="button" role="tab" data-tab="chat" aria-selected="true" aria-controls="llm-pane-chat" title="随选随问的 AI 对话">随心问</button>
-          <button class="llm-tab" type="button" role="tab" data-tab="outline" aria-selected="false" aria-controls="llm-pane-outline" title="无限层级的大纲笔记">无限大纲笔记</button>
+        <div class="llm-tabbar" role="tablist" aria-label="面板功能" data-i18n-aria-label="面板功能">
+          <button class="llm-tab is-active" type="button" role="tab" data-tab="chat" aria-selected="true" aria-controls="llm-pane-chat" title="随选随问的 AI 对话" data-i18n-title="随选随问的 AI 对话" data-i18n="随心问">随心问</button>
+          <button class="llm-tab" type="button" role="tab" data-tab="outline" aria-selected="false" aria-controls="llm-pane-outline" title="无限层级的大纲笔记" data-i18n-title="无限层级的大纲笔记" data-i18n="无限大纲笔记">无限大纲笔记</button>
         </div>
-        <div class="llm-pane" id="llm-pane-chat" data-pane="chat" role="tabpanel" aria-label="随心问">
-          <div class="llm-status-row"><span class="llm-status-dot" aria-hidden="true"></span><span class="llm-status-text">正在读取配置…</span><button class="llm-new-chat" type="button" title="新建对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg><span>新对话</span></button></div>
-          <div class="llm-history-wrap"><div class="llm-history-heading"><span>最近对话</span><span class="llm-history-count"></span></div><div class="llm-history-list"></div><div class="llm-history-empty" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14v10H9l-4 3v-13Z"></path><path d="M8 9h8M8 12h5"></path></svg><strong>从一个问题开始</strong><span>你的对话会保存在这里，下一次打开可以继续。</span></div></div>
-          <form class="llm-compose" novalidate><div class="llm-compose-box"><textarea class="llm-sidebar-input" rows="1" aria-label="输入问题" placeholder="问点什么…"></textarea><div class="llm-compose-bottom"><span class="llm-compose-hint">Enter 发送 · Shift+Enter 换行</span><button class="llm-send" type="submit" aria-label="发送问题" title="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8-3-8Z"></path><path d="M7 12h13"></path></svg></button></div></div></form>
+        <div class="llm-pane" id="llm-pane-chat" data-pane="chat" role="tabpanel" aria-label="随心问" data-i18n-aria-label="随心问">
+          <div class="llm-status-row"><span class="llm-status-dot" aria-hidden="true"></span><span class="llm-status-text"></span><button class="llm-new-chat" type="button" title="新建对话" data-i18n-title="新建对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg><span data-i18n="新对话">新对话</span></button></div>
+          <div class="llm-history-wrap"><div class="llm-history-heading"><span data-i18n="最近对话">最近对话</span><span class="llm-history-count"></span></div><div class="llm-history-list"></div><div class="llm-history-empty" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14v10H9l-4 3v-13Z"></path><path d="M8 9h8M8 12h5"></path></svg><strong data-i18n="从一个问题开始">从一个问题开始</strong><span data-i18n="你的对话会保存在这里，下一次打开可以继续。">你的对话会保存在这里，下一次打开可以继续。</span></div></div>
+          <form class="llm-compose" novalidate><div class="llm-compose-box"><textarea class="llm-sidebar-input" rows="1" aria-label="输入问题" data-i18n-aria-label="输入问题" placeholder="问点什么…" data-i18n-placeholder="问点什么…"></textarea><div class="llm-compose-bottom"><span class="llm-compose-hint" data-i18n="Enter 发送 · Shift+Enter 换行">Enter 发送 · Shift+Enter 换行</span><button class="llm-send" type="submit" aria-label="发送问题" data-i18n-aria-label="发送问题" title="发送" data-i18n-title="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8-3-8Z"></path><path d="M7 12h13"></path></svg></button></div></div></form>
         </div>
-        <div class="llm-pane" id="llm-pane-outline" data-pane="outline" role="tabpanel" aria-label="无限大纲笔记" hidden>
+        <div class="llm-pane" id="llm-pane-outline" data-pane="outline" role="tabpanel" aria-label="无限大纲笔记" data-i18n-aria-label="无限大纲笔记" hidden>
           <div class="outline-toolbar">
-            <label class="outline-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.5"></circle><path d="m16 16 4 4"></path></svg><input class="outline-search-input" type="search" placeholder="搜索笔记" aria-label="搜索笔记" /></label>
-            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="undo" title="撤销（Ctrl/⌘+Z）" aria-label="撤销" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 4 12l5 5"></path><path d="M4 12h9a6 6 0 0 1 6 6v1"></path></svg></button>
-            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="redo" title="重做（Ctrl/⌘+Shift+Z）" aria-label="重做" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 7 5 5-5 5"></path><path d="M20 12h-9a6 6 0 0 0-6 6v1"></path></svg></button>
-            <button class="outline-tool-button" type="button" data-outline-action="add-note" title="新建项目"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg><span>新建</span></button>
-            <button class="outline-tool-button" type="button" data-outline-action="insert-selection" title="把页面上选中的文字加入笔记">插入</button>
+            <label class="outline-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.5"></circle><path d="m16 16 4 4"></path></svg><input class="outline-search-input" type="search" placeholder="搜索笔记" data-i18n-placeholder="搜索笔记" aria-label="搜索笔记" data-i18n-aria-label="搜索笔记" /></label>
+            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="undo" title="撤销（Ctrl/⌘+Z）" data-i18n-title="撤销（Ctrl/⌘+Z）" aria-label="撤销" data-i18n-aria-label="撤销" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 4 12l5 5"></path><path d="M4 12h9a6 6 0 0 1 6 6v1"></path></svg></button>
+            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="redo" title="重做（Ctrl/⌘+Shift+Z）" data-i18n-title="重做（Ctrl/⌘+Shift+Z）" aria-label="重做" data-i18n-aria-label="重做" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 7 5 5-5 5"></path><path d="M20 12h-9a6 6 0 0 0-6 6v1"></path></svg></button>
+            <button class="outline-tool-button" type="button" data-outline-action="add-note" title="新建项目" data-i18n-title="新建项目"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg><span data-i18n="新建">新建</span></button>
+            <button class="outline-tool-button" type="button" data-outline-action="insert-selection" title="把页面上选中的文字加入笔记" data-i18n-title="把页面上选中的文字加入笔记" data-i18n="插入">插入</button>
           </div>
           <div class="outline-context">
-            <button class="outline-home" type="button" data-outline-action="home" aria-label="返回根目录" title="返回根目录">根目录</button>
+            <button class="outline-home" type="button" data-outline-action="home" aria-label="返回根目录" data-i18n-aria-label="返回根目录" title="返回根目录" data-i18n-title="返回根目录" data-i18n="根目录">根目录</button>
             <span class="outline-context-separator" aria-hidden="true">/</span>
             <div class="outline-breadcrumb" aria-live="polite">根目录</div>
             <span class="outline-search-result" aria-live="polite"></span>
-            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="expand" title="展开全部" aria-label="展开全部"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></button>
-            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="collapse" title="收起全部" aria-label="收起全部"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"></path></svg></button>
+            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="expand" title="展开全部" data-i18n-title="展开全部" aria-label="展开全部" data-i18n-aria-label="展开全部"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></button>
+            <button class="outline-tool-button outline-tool-icon" type="button" data-outline-action="collapse" title="收起全部" data-i18n-title="收起全部" aria-label="收起全部" data-i18n-aria-label="收起全部"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"></path></svg></button>
           </div>
-          <div class="outline-scroll"><div class="outline-list" role="tree" aria-label="大纲笔记"></div></div>
+          <div class="outline-scroll"><div class="outline-list" role="tree" aria-label="大纲笔记" data-i18n-aria-label="大纲笔记"></div></div>
         </div>
       </aside>
+      ` : ''}
       <!-- 无蒙版：容器只负责定位与层叠，窗口由 createLlmChatWindow 动态挂进来，可同时开多个。 -->
       <div class="llm-chat-layer" hidden></div>
       <template class="llm-chat-window-template">
-        <section class="llm-chat-dialog" role="dialog" aria-label="LLM 对话">
-          <header class="llm-chat-head"><button class="llm-chat-back" type="button" aria-label="返回对话" title="返回对话" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"></path></svg></button><span class="llm-chat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6.5 12 3l7 3.5v7L12 17l-7-3.5Z"></path><path d="m8.5 8.5 3.5 1.8 3.5-1.8M12 10.3V17"></path></svg></span><div class="llm-chat-head-copy"><div class="llm-chat-title">新对话</div><div class="llm-chat-subtitle">LLM 助手</div></div><button class="llm-chat-history-btn" type="button" aria-label="查看历史会话" title="历史会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path><path d="M12 7v5l3 2"></path></svg></button><button class="llm-chat-pin" type="button" aria-label="置顶窗口" aria-pressed="false" title="置顶窗口"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6l-1 6 3.5 3.5H5.5L9 10Z"></path><path d="M12 13.5V20"></path></svg></button><button class="llm-chat-close" type="button" aria-label="关闭对话" title="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></header>
+        <section class="llm-chat-dialog" role="dialog" aria-label="LLM 对话" data-i18n-aria-label="LLM 对话">
+          <header class="llm-chat-head"><button class="llm-chat-back" type="button" aria-label="返回对话" data-i18n-aria-label="返回对话" title="返回对话" data-i18n-title="返回对话" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"></path></svg></button><span class="llm-chat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6.5 12 3l7 3.5v7L12 17l-7-3.5Z"></path><path d="m8.5 8.5 3.5 1.8 3.5-1.8M12 10.3V17"></path></svg></span><div class="llm-chat-head-copy"><div class="llm-chat-title" data-i18n="新对话">新对话</div><div class="llm-chat-subtitle" data-i18n="LLM 助手">LLM 助手</div></div><button class="llm-chat-history-btn" type="button" aria-label="查看历史会话" data-i18n-aria-label="查看历史会话" title="历史会话" data-i18n-title="历史会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v5h5"></path><path d="M12 7v5l3 2"></path></svg></button><button class="llm-chat-pin" type="button" aria-label="置顶窗口" data-i18n-aria-label="置顶窗口" aria-pressed="false" title="置顶窗口" data-i18n-title="置顶窗口"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6l-1 6 3.5 3.5H5.5L9 10Z"></path><path d="M12 13.5V20"></path></svg></button><button class="llm-chat-close" type="button" aria-label="关闭对话" data-i18n-aria-label="关闭对话" title="关闭" data-i18n-title="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></header>
           <div class="llm-chat-scroll" aria-live="polite"></div>
-          <div class="llm-chat-history" hidden><div class="llm-chat-history-head"><span>最近对话</span><span class="llm-chat-history-count"></span></div><div class="llm-chat-history-list"></div></div>
-          <button class="llm-chat-jump" type="button" aria-label="回到底部" title="回到底部" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"></path></svg></button>
-          <form class="llm-chat-compose" novalidate><div class="llm-chat-footer-note">回答由你配置的模型生成</div><div class="llm-compose-box"><textarea class="llm-chat-input" rows="1" aria-label="继续提问" placeholder="继续追问…"></textarea><div class="llm-compose-bottom"><span class="llm-compose-hint">Enter 发送 · Shift+Enter 换行</span><button class="llm-send" type="submit" aria-label="发送消息" title="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8-3-8Z"></path><path d="M7 12h13"></path></svg></button></div></div></form>
-          <div class="llm-chat-resize" role="separator" aria-label="调整窗口大小" title="拖动调整大小"></div>
+          <div class="llm-chat-history" hidden><div class="llm-chat-history-head"><span data-i18n="最近对话">最近对话</span><span class="llm-chat-history-count"></span></div><div class="llm-chat-history-list"></div></div>
+          <button class="llm-chat-jump" type="button" aria-label="回到底部" data-i18n-aria-label="回到底部" title="回到底部" data-i18n-title="回到底部" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"></path></svg></button>
+          <form class="llm-chat-compose" novalidate><div class="llm-chat-footer-note" data-i18n="回答由你配置的模型生成">回答由你配置的模型生成</div><div class="llm-compose-box"><textarea class="llm-chat-input" rows="1" aria-label="继续提问" data-i18n-aria-label="继续提问" placeholder="继续追问…" data-i18n-placeholder="继续追问…"></textarea><div class="llm-compose-bottom"><span class="llm-compose-hint" data-i18n="Enter 发送 · Shift+Enter 换行">Enter 发送 · Shift+Enter 换行</span><button class="llm-send" type="submit" aria-label="发送消息" data-i18n-aria-label="发送消息" title="发送" data-i18n-title="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 16 8-16 8 3-8-3-8Z"></path><path d="M7 12h13"></path></svg></button></div></div></form>
+          <div class="llm-chat-resize" role="separator" aria-label="调整窗口大小" data-i18n-aria-label="调整窗口大小" title="拖动调整大小" data-i18n-title="拖动调整大小"></div>
         </section>
       </template>
     </div>
   `;
+  // 模板里的静态文案统一带 data-i18n，设置读回后再按真实语言刷一次（见 loadSettings）。
+  applyI18n(shadow);
 
   const trigger = shadow.querySelector('.quickfind-trigger');
   const panel = shadow.querySelector('.quickfind-panel');
@@ -699,10 +756,13 @@ export default defineContentScript({
       engineOrder: Array.isArray(source.engineOrder) ? source.engineOrder : DEFAULT_SETTINGS.engineOrder,
       sources: Array.isArray(source.sources) ? source.sources : DEFAULT_SETTINGS.sources,
       groups: Array.isArray(source.groups) ? source.groups : DEFAULT_SETTINGS.groups,
+      // 特殊功能按钮的显示设置（目前只有仅图标）：收敛与读取都在 shared/settings-store.ts。
+      specialActions: source.specialActions && typeof source.specialActions === 'object' ? source.specialActions : {},
       sourceConfigVersion: Number(source.sourceConfigVersion) || 0,
       pinnedSearch: source.pinnedSearch && typeof source.pinnedSearch === 'object' ? source.pinnedSearch : DEFAULT_SETTINGS.pinnedSearch,
       searchHistory: Array.isArray(source.searchHistory) ? source.searchHistory : [],
       llm: normalizeLlmConfig(source.llm),
+      language: normalizeLocale(source.language),
       triggerMode: source.triggerMode === 'hover' ? 'hover' : 'click',
       editableTriggerMode: ['click', 'hover', 'none'].includes(source.editableTriggerMode) ? source.editableTriggerMode : DEFAULT_SETTINGS.editableTriggerMode,
       defaultGroupCount: Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Math.round(Number(source.defaultGroupCount ?? source.defaultVisibleCount ?? DEFAULT_SETTINGS.defaultGroupCount) || DEFAULT_SETTINGS.defaultGroupCount))),
@@ -770,37 +830,37 @@ export default defineContentScript({
     return config.enabled !== false && Boolean(config.endpoint && config.model && (config.apiKey || localEndpoint));
   }
 
-  function syncLlmConfigStatus(kind) {
+  function syncLlmConfigStatus(kind = '') {
     if (!llmStatusDot || !llmStatusText) return;
     const config = normalizeLlmConfig(settings?.llm);
     llmStatusDot.classList.remove('ready', 'busy', 'error');
     if (kind === 'busy') {
       llmStatusDot.classList.add('busy');
-      llmStatusText.textContent = '正在思考…';
+      llmStatusText.textContent = t('正在思考…');
       return;
     }
     if (kind === 'error') {
       llmStatusDot.classList.add('error');
-      llmStatusText.textContent = '请求未完成';
+      llmStatusText.textContent = t('请求未完成');
       return;
     }
     if (config.enabled === false) {
-      llmStatusText.textContent = 'LLM 已关闭';
+      llmStatusText.textContent = t('LLM 已关闭');
       return;
     }
     if (!config.endpoint || !config.model || !config.apiKey) {
-      llmStatusText.textContent = '待配置 API Key';
+      llmStatusText.textContent = t('待配置 API Key');
       return;
     }
     llmStatusDot.classList.add('ready');
-    llmStatusText.textContent = `${config.model} · 已配置`;
+    llmStatusText.textContent = t('{n} · 已配置', { n: config.model });
   }
 
   function formatLlmTime(timestamp) {
     const value = Number(timestamp);
     if (!Number.isFinite(value)) return '';
     try {
-      return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+      return new Intl.DateTimeFormat(getLocale(), { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
     } catch { return ''; }
   }
 
@@ -857,22 +917,22 @@ export default defineContentScript({
     body.className = 'llm-card-body';
     const title = document.createElement('strong');
     title.className = 'llm-card-title';
-    title.textContent = shortenLlmText(firstMessage(conversation, 'user'), 72) || '未命名对话';
+    title.textContent = shortenLlmText(firstMessage(conversation, 'user'), 72) || t('未命名对话');
     const preview = document.createElement('span');
     preview.className = 'llm-card-preview';
-    preview.textContent = shortenLlmText(markdownToPlainText(firstMessage(conversation, 'assistant')), 118) || '等待 LLM 回复…';
+    preview.textContent = shortenLlmText(markdownToPlainText(firstMessage(conversation, 'assistant')), 118) || t('等待 LLM 回复…');
     const meta = document.createElement('span');
     meta.className = 'llm-card-meta';
     const count = conversation.messages.filter((message) => message.role === 'user').length;
-    meta.textContent = `${formatLlmTime(conversation.updatedAt)}  ·  ${count} 次提问`;
+    meta.textContent = `${formatLlmTime(conversation.updatedAt)}  ·  ${countText(count, '1 次提问', '{n} 次提问')}`;
     body.append(title, preview, meta);
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'llm-card-delete';
     const DELETE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"></path></svg>';
     del.innerHTML = DELETE_ICON;
-    del.setAttribute('aria-label', '删除这段对话');
-    del.setAttribute('title', '删除这段对话');
+    del.setAttribute('aria-label', t('删除这段对话'));
+    del.setAttribute('title', t('删除这段对话'));
     // 删除走两步：第一下只「上膛」并换成「确认删除」，再点一下才真删。
     // 点击不能让卡片收到（否则会顺手打开这段对话），所以这里都要拦住传播。
     let armed = false;
@@ -880,16 +940,16 @@ export default defineContentScript({
       armed = false;
       del.classList.remove('is-armed');
       del.innerHTML = DELETE_ICON;
-      del.setAttribute('aria-label', '删除这段对话');
-      del.setAttribute('title', '删除这段对话');
+      del.setAttribute('aria-label', t('删除这段对话'));
+      del.setAttribute('title', t('删除这段对话'));
     };
     del.addEventListener('click', (event) => {
       event.stopPropagation();
       if (!armed) {
         armed = true;
         del.classList.add('is-armed');
-        del.textContent = '确认删除';
-        del.setAttribute('aria-label', '确认删除这段对话');
+        del.textContent = t('确认删除');
+        del.setAttribute('aria-label', t('确认删除这段对话'));
         return;
       }
       deleteLlmConversation(conversation.id);
@@ -911,11 +971,11 @@ export default defineContentScript({
     const conversations = llmConversations.slice().sort((a, b) => b.updatedAt - a.updatedAt);
     // 内容没有变化时不要重建 DOM：重建会毁掉正在按下（mousedown 之后、mouseup 之前）
     // 的那张卡片，浏览器因此不会派发 click 事件，历史对话就点不动了。
-    const signature = JSON.stringify(conversations);
+    const signature = getLocale() + JSON.stringify(conversations);
     if (signature === llmHistorySignature) return;
     llmHistorySignature = signature;
     llmHistoryList.replaceChildren();
-    if (llmHistoryCount) llmHistoryCount.textContent = conversations.length ? `${conversations.length} 条` : '';
+    if (llmHistoryCount) llmHistoryCount.textContent = conversations.length ? t('{n} 条', { n: conversations.length }) : '';
     if (llmHistoryEmpty) llmHistoryEmpty.hidden = conversations.length > 0;
     conversations.forEach((conversation) => {
       llmHistoryList.append(createLlmHistoryCard(conversation, () => openLlmConversation(conversation)));
@@ -942,7 +1002,7 @@ export default defineContentScript({
     // 直接读 .hidden 每引用一次就记一个类型错误（见 README 的记账口径）。
     const dock = llmDock as HTMLElement | null;
     if (!dock) return;
-    const sidebarAvailable = settings.llmDockVisible !== false;
+    const sidebarAvailable = PAGE_SIDEBAR_ENABLED && settings.llmDockVisible !== false;
     const chatOpen = llmChatWindows.length > 0;
     dock.classList.toggle('is-chat-only', !sidebarAvailable);
     dock.hidden = !(sidebarAvailable || chatOpen);
@@ -984,6 +1044,9 @@ export default defineContentScript({
    */
   function setLlmDockOpen(open: boolean, options: { pinned?: boolean } = {}) {
     if (!llmDock) return;
+    // 侧栏已下线（shared/features.ts）：滑杆与面板都不在 DOM 里，任何展开请求都到此为止。
+    // 对话窗口（showLlmChatLayer）不走这里，它自己负责宿主的显隐。
+    if (!PAGE_SIDEBAR_ENABLED) return;
     // 侧栏不可用时不允许展开侧栏。但对话窗口（showLlmChatLayer）与侧栏共用一个宿主，
     // 它的显示不受「随心问」开关约束——「问 ai」在关掉侧栏的配置下依然要能弹出来。
     if (open && settings.llmDockVisible === false && !llmChatWindows.length) return;
@@ -998,7 +1061,7 @@ export default defineContentScript({
     llmDockOpen = nextOpen;
     llmDock.classList.toggle('is-open', nextOpen);
     llmRail?.setAttribute('aria-expanded', String(nextOpen));
-    llmRail?.setAttribute('aria-label', nextOpen ? '收起 QuickFind 面板' : '展开 QuickFind 面板');
+    llmRail?.setAttribute('aria-label', nextOpen ? t('收起 QuickFind 面板') : t('展开 QuickFind 面板'));
     if (llmSidebar) llmSidebar.setAttribute('aria-hidden', String(!nextOpen));
     if (!nextOpen) return;
     if (llmActiveTab === 'outline') {
@@ -1136,6 +1199,10 @@ export default defineContentScript({
    * 变成「松手瞬间被拽回来」，用户看到的就是一次突兀的跳变，正是「一闪」的来源之一。
    */
   function clampLlmWindowRect(root: HTMLElement) {
+    // 还没进布局时 offsetWidth/offsetLeft 恒为 0，按下面的公式会被算成「0×0 放在左上角」，
+    // 于是把窗口压到最小值并贴到 (0,0)。层/宿主此刻可能还藏着（例如侧栏关掉时的
+    // 「问 ai」路径），这里先放过：等真正可见后拖动、缩放或 applyLlmWindowGeometry 会再夹一次。
+    if (!root.offsetWidth || !root.offsetHeight) return false;
     const headHeight = 61; // .llm-chat-head 的 min-height，标题栏必须留在视口里才抓得住
     const margin = 8;
     const width = Math.max(280, Math.min(root.offsetWidth, window.innerWidth - margin * 2));
@@ -1239,6 +1306,19 @@ export default defineContentScript({
     });
   }
 
+  /**
+   * 助手回复渲染出的 HTML 缓存。
+   *
+   * renderLlmChatWindow 每次都整表重建——消息列表不长，重建换来的是「用户往上翻时不会被
+   * 新回复拽回底部」这类行为上的简单性。代价是每次重建都要把历史里每条助手回复的 Markdown
+   * 重新解析一遍，而一次问答至少触发两次重建（发出去、回回来）。这里按消息对象记住上次的
+   * 渲染结果，内容没变就直接复用字符串，长对话下省掉的是 O(历史条数) 的重复解析。
+   *
+   * 用 WeakMap：消息对象就是 conversation.messages 里的那一个，随会话一起被回收，
+   * 不需要自己维护失效。
+   */
+  const llmMessageHtmlCache = new WeakMap<object, { content: string; html: string }>();
+
   /** 在窗口区域里渲染对话流（Markdown）。用户消息保持纯文本，助手回复按 Markdown 排版。 */
   function renderLlmChatWindow(win) {
     const scroll = win?.scroll as HTMLElement | null;
@@ -1252,7 +1332,7 @@ export default defineContentScript({
       row.className = `llm-message ${message.role}`;
       const label = document.createElement('span');
       label.className = 'llm-message-label';
-      label.textContent = message.role === 'user' ? '你' : 'LLM';
+      label.textContent = message.role === 'user' ? t('你') : 'LLM';
       const bubble = document.createElement('div');
       bubble.className = 'llm-message-bubble';
       if (message.role === 'user') {
@@ -1261,7 +1341,14 @@ export default defineContentScript({
         // 助手回复渲染 Markdown。渲染器只输出自己产生的标签（见 shared/markdown.ts 的安全边界）。
         const body = document.createElement('div');
         body.className = 'llm-md';
-        body.innerHTML = renderMarkdown(message.content);
+        const cached = llmMessageHtmlCache.get(message);
+        if (cached && cached.content === message.content) {
+          body.innerHTML = cached.html;
+        } else {
+          const html = renderMarkdown(message.content);
+          llmMessageHtmlCache.set(message, { content: message.content, html });
+          body.innerHTML = html;
+        }
         bubble.append(body);
       }
       row.append(label, bubble);
@@ -1275,7 +1362,7 @@ export default defineContentScript({
       label.textContent = 'LLM';
       const bubble = document.createElement('div');
       bubble.className = 'llm-message-bubble';
-      bubble.innerHTML = '<span class="llm-typing" aria-label="正在生成回复"><i></i><i></i><i></i></span>';
+      bubble.innerHTML = '<span class="llm-typing" aria-label="' + t('正在生成回复') + '"><i></i><i></i><i></i></span>';
       row.append(label, bubble);
       scroll.append(row);
     }
@@ -1299,12 +1386,12 @@ export default defineContentScript({
     if (!list) return;
     const conversations = llmConversations.slice().sort((a, b) => b.updatedAt - a.updatedAt);
     const count = win.historyCount as HTMLElement | null;
-    if (count) count.textContent = conversations.length ? `${conversations.length} 条` : '';
+    if (count) count.textContent = conversations.length ? t('{n} 条', { n: conversations.length }) : '';
     list.replaceChildren();
     if (!conversations.length) {
       const empty = document.createElement('div');
       empty.className = 'llm-chat-history-empty';
-      empty.textContent = '还没有历史对话。提一个问题，它会出现在这里。';
+      empty.textContent = t('还没有历史对话。提一个问题，它会出现在这里。');
       list.append(empty);
       return;
     }
@@ -1328,7 +1415,7 @@ export default defineContentScript({
     // 进入历史由独立的 .llm-chat-history-btn 负责，按钮高亮表示当前正处在历史里。
     if (win.back) win.back.hidden = !inHistory;
     if (win.historyButton) win.historyButton.classList.toggle('is-active', inHistory);
-    if (win.title) win.title.textContent = inHistory ? '历史对话' : (shortenLlmText(firstMessage(win.conversation, 'user'), 42) || '新对话');
+    if (win.title) win.title.textContent = inHistory ? t('历史对话') : (shortenLlmText(firstMessage(win.conversation, 'user'), 42) || t('新对话'));
     if (inHistory) renderLlmChatHistory(win);
     updateLlmChatJump(win);
   }
@@ -1384,6 +1471,9 @@ export default defineContentScript({
     win.pin?.setAttribute('aria-pressed', String(Boolean(win.pinned)));
     win.pin?.classList.toggle('is-active', Boolean(win.pinned));
     layer.append(root);
+    // 模板里的静态文案带 data-i18n，克隆后要按当前语言刷一次；标题与副标题随后由
+    // syncLlmChatWindowChrome 用 t() 覆盖。
+    applyI18n(root);
     // 量之前必须让层可见。`hidden` 的容器里 offsetWidth/offsetLeft 恒为 0，
     // 几何会被算成「0×0 放在左上角」，窗口于是缩到最小值并贴到 (0,0)。
     layer.hidden = false;
@@ -1434,8 +1524,8 @@ export default defineContentScript({
   /** 顶部标题与副标题随会话内容刷新。 */
   function syncLlmChatWindowChrome(win) {
     if (!win) return;
-    if (win.title && win.state !== 'history') win.title.textContent = shortenLlmText(firstMessage(win.conversation, 'user'), 42) || '新对话';
-    if (win.subtitle) win.subtitle.textContent = `${normalizeLlmConfig(settings?.llm).model || 'LLM'} · 对话中`;
+    if (win.title && win.state !== 'history') win.title.textContent = shortenLlmText(firstMessage(win.conversation, 'user'), 42) || t('新对话');
+    if (win.subtitle) win.subtitle.textContent = t('{n} · 对话中', { n: normalizeLlmConfig(settings?.llm).model || 'LLM' });
   }
 
   /** 关一个窗口。关掉最后一个时，整层与宿主一并收干净（含 top layer）。 */
@@ -1516,6 +1606,7 @@ export default defineContentScript({
 
   /** 侧栏「新对话」：只清侧栏输入，不碰已打开的窗口。 */
   function startNewLlmConversation() {
+    if (!llmSidebarInput) return;
     llmSidebarInput.value = '';
     resizeLlmTextarea(llmSidebarInput);
     renderLlmHistory();
@@ -1548,28 +1639,28 @@ export default defineContentScript({
     return fetch(resolveLlmEndpoint(config.endpoint), { method: 'POST', headers, body: JSON.stringify({ model: config.model, messages, temperature: 0.7, stream: false }), signal: controller.signal }).then(async (response) => {
       let payload = null;
       try { payload = await response.json(); } catch { /* retain status-based error */ }
-      if (!response.ok) throw new Error(payload?.error?.message || payload?.message || `请求失败（${response.status}）`);
+      if (!response.ok) throw new Error(payload?.error?.message || payload?.message || t('请求失败（{n}）', { n: response.status }));
       const content = payload?.choices?.[0]?.message?.content;
-      if (typeof content !== 'string' || !content.trim()) throw new Error('接口返回了空回复。');
+      if (typeof content !== 'string' || !content.trim()) throw new Error(t('接口返回了空回复。'));
       return content.trim();
     }).catch((error) => {
       // AbortError 的原生文案（"signal is aborted without reason"）对用户没有意义。
-      if (error?.name === 'AbortError') throw new Error(`请求超时（超过 ${Math.round(LLM_TIMEOUT_MS / 1000)} 秒未响应）。`);
+      if (error?.name === 'AbortError') throw new Error(t('请求超时（超过 {n} 秒未响应）。', { n: Math.round(LLM_TIMEOUT_MS / 1000) }));
       throw error;
     }).finally(() => window.clearTimeout(timer));
   }
 
   function requestLlmResponse(conversation) {
     const config = normalizeLlmConfig(settings?.llm);
-    if (!llmHasConfig()) return Promise.reject(new Error('请先在设置页填写 API 地址和模型。'));
+    if (!llmHasConfig()) return Promise.reject(new Error(t('请先在设置页填写 API 地址和模型。')));
     const messages = buildLlmMessages(conversation);
     if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
       return new Promise((resolve, reject) => {
         try {
-          chrome.runtime.sendMessage({ type: 'quickfind-llm-chat', config, messages }, (response) => {
+          chrome.runtime.sendMessage({ type: 'quickfind-llm-chat', config, messages, language: getLocale() }, (response) => {
             const runtimeError = chrome.runtime.lastError;
-            if (runtimeError) { reject(new Error(runtimeError.message || '无法连接到扩展后台。')); return; }
-            if (!response?.ok) { reject(new Error(response?.error || '接口请求失败。')); return; }
+            if (runtimeError) { reject(new Error(runtimeError.message || t('无法连接到扩展后台。'))); return; }
+            if (!response?.ok) { reject(new Error(response?.error || t('接口请求失败。'))); return; }
             resolve(String(response.content || '').trim());
           });
         } catch (error) { reject(error); }
@@ -1613,7 +1704,7 @@ export default defineContentScript({
       conversation.updatedAt = Date.now();
       syncLlmConfigStatus();
     } catch (error) {
-      conversation.messages.push({ role: 'assistant', content: `请求失败：${error?.message || '无法连接到 API。'}` });
+      conversation.messages.push({ role: 'assistant', content: t('请求失败：{n}', { n: error?.message || t('无法连接到 API。') }) });
       conversation.updatedAt = Date.now();
       syncLlmConfigStatus('error');
     } finally {
@@ -1631,7 +1722,7 @@ export default defineContentScript({
   /** 侧栏输入框发的消息：没有窗口就开一个，有窗口就投给最上面那个。 */
   function sendLlmMessageFromSidebar(value) {
     const text = String(value || '').trim();
-    if (!text) return;
+    if (!text || !llmSidebarInput) return;
     const target = llmChatWindows.length ? llmChatWindows[llmChatWindows.length - 1] : createLlmChatWindow(null);
     if (!target) return;
     showLlmChatLayer();
@@ -1644,7 +1735,7 @@ export default defineContentScript({
   const NOTES_KEY = NOTES_STORAGE_KEY;
   const NOTES_LEGACY_KEY = LEGACY_NOTES_STORAGE_KEY;
   const OUTLINE_TAB_KEY = 'quickfind-outline-tab';
-  const OUTLINE_TITLES = { chat: '随心问', outline: '无限大纲笔记' };
+  const OUTLINE_TITLES = { chat: t('随心问'), outline: t('无限大纲笔记') };
   const NOTES_HISTORY_LIMIT = 100;
   let notesState = createEmptyNotes();
   let notesLoaded = false;
@@ -1704,7 +1795,7 @@ export default defineContentScript({
     const state = createEmptyNotes();
     const now = Date.now();
     (Array.isArray(legacyNotes) ? legacyNotes : []).forEach((note, index) => {
-      const title = String(note?.title || '').trim() || `未命名笔记 ${index + 1}`;
+      const title = String(note?.title || '').trim() || t('未命名笔记 {n}', { n: index + 1 });
       const item = { id: noteId(), parentId: 'root', children: [], text: title, collapsed: false, completed: false, createdAt: now, updatedAt: now };
       state.nodes[item.id] = item;
       state.nodes.root.children.push(item.id);
@@ -1843,14 +1934,14 @@ export default defineContentScript({
     hitRoot: () => shadow,
     overlayRoot: () => shadow,
     scrollContainer: () => shadow.querySelector('.outline-scroll') as HTMLElement | null,
-    ghostText: (id) => String(noteById(id)?.text || '').trim() || '未命名项目',
+    ghostText: (id) => String(noteById(id)?.text || '').trim() || t('未命名项目'),
     canDropOn: (sourceId, targetId) => targetId !== sourceId && !isNoteDescendant(targetId, sourceId),
     onDrop: (sourceId, targetId, zone) => moveNote(sourceId, targetId, zone)
   });
 
   function renderNotes(focusId = null, focusSelection = null) {
     if (!outlineList) return;
-    if (!notesLoaded) { outlineList.textContent = '正在加载笔记…'; return; }
+    if (!notesLoaded) { outlineList.textContent = t('正在加载笔记…'); return; }
     const focusRestoreToken = ++notesFocusRestoreToken;
     // Rebuilding the list replaces the textarea, so carry its selection across the render.
     let selection = focusSelection;
@@ -1867,64 +1958,84 @@ export default defineContentScript({
     outlineList.replaceChildren();
     if (outlineSearchResult) {
       const matchCount = query ? outlineCountMatches(notesState, notesZoomRootId, query) : 0;
-      outlineSearchResult.textContent = query ? ('找到 ' + matchCount + ' 项') : '';
+      outlineSearchResult.textContent = query ? t('找到 {n} 项', { n: matchCount }) : '';
     }
     if (visible.scopeRoot && visible.scopeRoot.id !== 'root') {
       const heading = document.createElement('div');
       heading.className = 'notes-zoom-heading';
-      heading.textContent = visible.scopeRoot.text.trim() || '未命名项目';
+      heading.textContent = visible.scopeRoot.text.trim() || t('未命名项目');
       outlineList.append(heading);
     }
     if (!visible.ids.length) {
       const empty = document.createElement('div');
       empty.className = 'notes-empty';
-      empty.textContent = query ? '没有匹配的笔记' : (visible.scopeRoot?.id === 'root' ? '还没有笔记项目，点击“新建”开始。' : '这个项目还没有子项目，按 Enter 新建。');
+      empty.textContent = query ? t('没有匹配的笔记') : (visible.scopeRoot?.id === 'root' ? t('还没有笔记项目，点击“新建”开始。') : t('这个项目还没有子项目，按 Enter 新建。'));
       outlineList.append(empty);
-    } else visible.ids.forEach((id) => {
-      const node = noteById(id);
-      const row = document.createElement('div');
-      row.className = 'note-row' + (node.completed ? ' completed' : '') + (query && node.text.toLocaleLowerCase().includes(query) ? ' search-match' : '');
-      row.dataset.noteId = id;
-      row.setAttribute('role', 'treeitem');
-      row.setAttribute('aria-level', String(noteDepth(id, visible.scopeRoot?.id || 'root') + 1));
-      row.setAttribute('aria-expanded', node.children.length ? String(!node.collapsed) : 'false');
-      row.style.paddingLeft = (6 + noteDepth(id, visible.scopeRoot?.id || 'root') * 18) + 'px';
-      const toggle = document.createElement('button');
-      toggle.type = 'button';
-      toggle.className = 'note-toggle' + (node.collapsed ? ' collapsed' : '');
-      toggle.disabled = !node.children.length;
-      toggle.setAttribute('aria-label', node.children.length ? (node.collapsed ? '展开项目' : '收起项目') : '没有子项目');
-      toggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 6 5-6"></path></svg>';
-      toggle.addEventListener('click', () => { if (!node.children.length) return;
-      const before = cloneNotesState(); node.collapsed = !node.collapsed; pushNotesHistory(before); node.updatedAt = Date.now(); scheduleNotesSave(); renderNotes(id); });
-      const complete = document.createElement('button');
-      complete.type = 'button';
-      complete.className = 'note-complete';
-      complete.setAttribute('aria-label', node.completed ? '标记未完成' : '标记完成');
-      complete.title = node.completed ? '标记未完成' : '标记完成';
-      complete.innerHTML = node.completed ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>' : '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle></svg>';
-      complete.addEventListener('click', () => { const before = cloneNotesState();
-      node.completed = !node.completed; node.updatedAt = Date.now(); pushNotesHistory(before); scheduleNotesSave(); renderNotes(id); });
-      const bullet = document.createElement('button');
-      bullet.type = 'button';
-      bullet.className = 'note-bullet';
-      bullet.setAttribute('aria-label', '专注此项目');
-      const input = document.createElement('textarea');
-      input.className = 'note-input';
-      input.rows = 1;
-      input.value = node.text;
-      input.setAttribute('aria-label', '大纲项目');
-      input.dataset.noteId = id;
-      input.addEventListener('input', () => { beginNotesHistory(id); node.text = input.value; node.updatedAt = Date.now(); resizeNoteInput(input); updateNotesBreadcrumb(id); scheduleNotesSave(); });
-      input.addEventListener('focus', () => { notesActiveId = id; notesTypingHistoryId = null; notesTypingBeforeState = cloneNotesState(); updateNotesBreadcrumb(id); });
-      input.addEventListener('keydown', (event) => handleNoteKeydown(event, id, input));
-      row.append(toggle, complete, bullet, input);
-      // 圆点：单击进入专注，按住不动才进入拖动。见 shared/note-drag.ts。
-      bullet.addEventListener('pointerdown', (event) => noteDrag.press(event, id, row, bullet));
-      bullet.addEventListener('click', () => { if (noteDrag.shouldIgnoreClick()) return; zoomIntoNote(id); });
-      outlineList.append(row);
-      resizeNoteInput(input);
-    });
+    } else {
+      // 先把整表建在 DocumentFragment 里，最后一次性挂上。
+      //
+      // 原先是「append 一行 → 立刻量这行的高度」，而量高度读的是 scrollHeight：
+      // 每读一次都要把「已挂上去的全部行」重排一遍，于是挂 n 行就是 n 次强制布局，
+      // 代价随行数平方增长。笔记的定位是无限大纲，行数只会多不会少。
+      const fragment = document.createDocumentFragment();
+      const inputs: HTMLTextAreaElement[] = [];
+      visible.ids.forEach((id) => {
+        const node = noteById(id);
+        // 深度只算一次：它沿 parentId 向上走，原先每行要算两遍（aria-level 与缩进各一遍）。
+        const depth = noteDepth(id, visible.scopeRoot?.id || 'root');
+        const row = document.createElement('div');
+        row.className = 'note-row' + (node.completed ? ' completed' : '') + (query && node.text.toLocaleLowerCase().includes(query) ? ' search-match' : '');
+        row.dataset.noteId = id;
+        row.setAttribute('role', 'treeitem');
+        row.setAttribute('aria-level', String(depth + 1));
+        row.setAttribute('aria-expanded', node.children.length ? String(!node.collapsed) : 'false');
+        row.style.paddingLeft = (6 + depth * 18) + 'px';
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'note-toggle' + (node.collapsed ? ' collapsed' : '');
+        toggle.disabled = !node.children.length;
+        toggle.setAttribute('aria-label', node.children.length ? (node.collapsed ? t('展开项目') : t('收起项目')) : t('没有子项目'));
+        toggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 6 5-6"></path></svg>';
+        toggle.addEventListener('click', () => { if (!node.children.length) return;
+        const before = cloneNotesState(); node.collapsed = !node.collapsed; pushNotesHistory(before); node.updatedAt = Date.now(); scheduleNotesSave(); renderNotes(id); });
+        const complete = document.createElement('button');
+        complete.type = 'button';
+        complete.className = 'note-complete';
+        complete.setAttribute('aria-label', node.completed ? t('标记未完成') : t('标记完成'));
+        complete.title = node.completed ? t('标记未完成') : t('标记完成');
+        complete.innerHTML = node.completed ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>' : '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle></svg>';
+        complete.addEventListener('click', () => { const before = cloneNotesState();
+        node.completed = !node.completed; node.updatedAt = Date.now(); pushNotesHistory(before); scheduleNotesSave(); renderNotes(id); });
+        const bullet = document.createElement('button');
+        bullet.type = 'button';
+        bullet.className = 'note-bullet';
+        bullet.setAttribute('aria-label', t('专注此项目'));
+        const input = document.createElement('textarea');
+        input.className = 'note-input';
+        input.rows = 1;
+        input.value = node.text;
+        input.setAttribute('aria-label', t('大纲项目'));
+        input.dataset.noteId = id;
+        input.addEventListener('input', () => { beginNotesHistory(id); node.text = input.value; node.updatedAt = Date.now(); resizeNoteInput(input); updateNotesBreadcrumb(id); scheduleNotesSave(); });
+        input.addEventListener('focus', () => { notesActiveId = id; notesTypingHistoryId = null; notesTypingBeforeState = cloneNotesState(); updateNotesBreadcrumb(id); });
+        input.addEventListener('keydown', (event) => handleNoteKeydown(event, id, input));
+        row.append(toggle, complete, bullet, input);
+        // 圆点：单击进入专注，按住不动才进入拖动。见 shared/note-drag.ts。
+        bullet.addEventListener('pointerdown', (event) => noteDrag.press(event, id, row, bullet));
+        bullet.addEventListener('click', () => { if (noteDrag.shouldIgnoreClick()) return; zoomIntoNote(id); });
+        fragment.append(row);
+        inputs.push(input);
+      });
+      // 用 append 而不是 replaceChildren：上面可能已经插入了专注视图的标题行，
+      // replaceChildren 会把它一起清掉（列表开头已经 replaceChildren 过，这里只做追加）。
+      outlineList.append(fragment);
+      // 自适应高度统一放到挂载之后、且按「先全部写、再全部读、最后再全部写」三段走：
+      // 中间那次读会触发唯一一次布局，后面的读都命中缓存。逐行「写→读」的话，
+      // 每行都会把整表重排一遍。
+      inputs.forEach((input) => { input.style.height = 'auto'; });
+      const heights = inputs.map((input) => Math.max(24, input.scrollHeight));
+      inputs.forEach((input, index) => { input.style.height = heights[index] + 'px'; });
+    }
     updateNotesBreadcrumb(notesActiveId);
     if (focusId) {
       focusNote(focusId, selection);
@@ -1940,12 +2051,12 @@ export default defineContentScript({
     if (!outlineBreadcrumb) return;
     const zoomPath = notePath(notesZoomRootId);
     const path = notesZoomRootId !== 'root' ? zoomPath : notePath(id || notesActiveId);
-    outlineBreadcrumb.textContent = path.length ? path.join(' / ') : '根目录';
+    outlineBreadcrumb.textContent = path.length ? path.join(' / ') : t('根目录');
     if (outlineHomeButton) {
       const atRoot = notesZoomRootId === 'root';
-      outlineHomeButton.textContent = atRoot ? '根目录' : '返回上级';
-      outlineHomeButton.setAttribute('aria-label', atRoot ? '返回根目录' : '返回上级');
-      outlineHomeButton.title = atRoot ? '返回根目录' : '返回上级';
+      outlineHomeButton.textContent = atRoot ? t('根目录') : t('返回上级');
+      outlineHomeButton.setAttribute('aria-label', atRoot ? t('返回根目录') : t('返回上级'));
+      outlineHomeButton.title = atRoot ? t('返回根目录') : t('返回上级');
     }
   }
 
@@ -2072,7 +2183,7 @@ export default defineContentScript({
     if (!outlineInsertSelection) return;
     const hasText = Boolean(String(selectedText || '').trim());
     outlineInsertSelection.disabled = !hasText;
-    outlineInsertSelection.title = hasText ? '把页面上选中的文字加入笔记' : '先在页面上选中一段文字';
+    outlineInsertSelection.title = hasText ? t('把页面上选中的文字加入笔记') : t('先在页面上选中一段文字');
   }
 
   /**
@@ -2123,6 +2234,8 @@ export default defineContentScript({
 
   /** 存完之后把结果摆到眼前：切到大纲页并展开侧栏；选项页把侧栏整个关掉时不打扰。 */
   function showOutlineNotes(): void {
+    // 笔记模块已下线：没有可展开的侧栏页，也不必再切标签。
+    if (!OUTLINE_NOTES_ENABLED) return;
     if (!llmDock || (llmDock as HTMLElement).hidden) return;
     if (llmActiveTab !== 'outline') setLlmTab('outline');
     // 用户点了「笔记」按钮才有这次展示，按主动展开处理，别让它随即被自动收起。
@@ -2186,7 +2299,9 @@ export default defineContentScript({
       // 有对话窗口开着时不自动收侧栏：窗口可能正被拖动，收起侧栏会让层高变化、手感发飘。
       if (!llmDock.classList.contains('is-open') || llmChatWindows.length) return;
       const pointInside = (rect) => rect && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
-      if (pointInside(llmRail.getBoundingClientRect()) || pointInside(llmSidebar.getBoundingClientRect())) {
+      const railRect = llmRail?.getBoundingClientRect();
+      const sidebarRect = llmSidebar?.getBoundingClientRect();
+      if (pointInside(railRect) || pointInside(sidebarRect)) {
         if (llmCloseTimer) { window.clearTimeout(llmCloseTimer); llmCloseTimer = null; }
       } else scheduleLlmDockClose();
     }, true);
@@ -2238,7 +2353,7 @@ export default defineContentScript({
     });
     if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) chrome.storage.onChanged.addListener(handleNotesStorageChange);
     document.addEventListener('selectionchange', syncOutlineInsertButton);
-    if (typeof chrome !== 'undefined' && chrome.storage?.local?.get) {
+    if (PAGE_SIDEBAR_ENABLED && typeof chrome !== 'undefined' && chrome.storage?.local?.get) {
       chrome.storage.local.get(OUTLINE_TAB_KEY, (stored) => setLlmTab(stored?.[OUTLINE_TAB_KEY] === 'outline' ? 'outline' : 'chat', { persist: false }));
     } else setLlmTab('chat', { persist: false });
     loadLlmConversations();
@@ -2295,6 +2410,36 @@ export default defineContentScript({
     window.addEventListener(type, keepPanelSearchKeysInOverlay, true);
   });
 
+  /**
+   * 语言切换的唯一生效点（页面侧）。
+   *
+   * 静态模板带 data-i18n，交给 applyI18n；动态文案（引擎按钮、常驻栏、历史卡片、
+   * 对话窗口）必须重画——它们的内容是渲染时拼出来的。
+   */
+  function applyInterfaceLanguage() {
+    setLocale(settings?.language);
+    applyI18n(shadow);
+    if (pinnedHost?.shadowRoot) applyI18n(pinnedHost.shadowRoot);
+    syncLlmConfigStatus();
+    renderLlmHistory();
+    llmChatWindows.forEach((win) => {
+      if (win.state === 'history') renderLlmChatHistory(win);
+      // 标题也要按当前视图重算：历史视图里它显示「历史对话」，不能被 data-i18n 的
+      // 「新对话」覆盖掉。
+      if (win.title) win.title.textContent = win.state === 'history'
+        ? t('历史对话')
+        : (shortenLlmText(firstMessage(win.conversation, 'user'), 42) || t('新对话'));
+      if (win.subtitle) win.subtitle.textContent = t('{n} · 对话中', { n: normalizeLlmConfig(settings?.llm).model || 'LLM' });
+      if (win.scroll) renderLlmChatWindow(win);
+    });
+    if (panelOpen) renderEngines();
+    // 这两处标题由状态决定，data-i18n 只会写静态版本，切语言后要按当前状态补一次。
+    queryExpand.title = t(expanded ? '收起多行输入' : '展开多行输入');
+    syncOutlineInsertButton();
+    syncPinnedOpenModeButton();
+    mountPinnedBar();
+  }
+
   function loadSettings() {
     // 没有 storage 就没有真实配置可等，直接放行，别把常驻栏永久锁在「不可见」。
     if (!storageAvailable()) { pinnedSettingsReady = true; return; }
@@ -2303,9 +2448,10 @@ export default defineContentScript({
       invalidatePinnedCache();
       // 先立标志再挂载：mountPinnedBar 会检查它，顺序反了等于什么都没挡。
       pinnedSettingsReady = true;
+      // 语言先落地：后面的状态文案与列表都按当前语言生成。
+      applyInterfaceLanguage();
       setLlmDockVisible(settings.llmDockVisible);
       trigger.classList.toggle('disabled', !settings.enabled);
-      syncLlmConfigStatus();
       loadLlmConversations();
       mountPinnedBar();
     });
@@ -2313,7 +2459,7 @@ export default defineContentScript({
       if (area !== 'sync') return;
       // 只在这几个键变化时失效常驻栏缓存。搜索历史（changes.searchHistory）不在其中：
       // 它每次搜索都会变，而站点解析不读它，跟着失效会让每个标签页都白算一遍。
-      if (changes.pinnedSearch || changes.sources || changes.groups ||
+      if (changes.pinnedSearch || changes.sources || changes.groups || changes.specialActions ||
       changes.engines || changes.iconOnly || changes.customEngines || changes.engineOrder || changes.sourceConfigVersion) invalidatePinnedCache();
       if (changes.enabled) settings.enabled = changes.enabled.newValue !== false;
       if (changes.engines) settings.engines = { ...DEFAULT_SETTINGS.engines, ...(changes.engines.newValue || {}) };
@@ -2322,9 +2468,14 @@ export default defineContentScript({
       if (changes.engineOrder) settings.engineOrder = Array.isArray(changes.engineOrder.newValue) ? changes.engineOrder.newValue : DEFAULT_SETTINGS.engineOrder;
       if (changes.sources) settings.sources = Array.isArray(changes.sources.newValue) ? changes.sources.newValue : [];
       if (changes.groups) settings.groups = Array.isArray(changes.groups.newValue) ? changes.groups.newValue : [];
+      if (changes.specialActions) settings.specialActions = changes.specialActions.newValue && typeof changes.specialActions.newValue === 'object' ? changes.specialActions.newValue : {};
+      if (changes.language) {
+        settings.language = normalizeLocale(changes.language.newValue);
+        applyInterfaceLanguage();
+      }
       if (changes.sourceConfigVersion) settings.sourceConfigVersion = Number(changes.sourceConfigVersion.newValue) || 0;
       if (changes.pinnedSearch) settings.pinnedSearch = changes.pinnedSearch.newValue && typeof changes.pinnedSearch.newValue === 'object' ? changes.pinnedSearch.newValue : {};
-      if (changes.enabled || changes.pinnedSearch || changes.sources || changes.groups || changes.engines || changes.iconOnly || changes.customEngines || changes.engineOrder) mountPinnedBar();
+      if (changes.enabled || changes.pinnedSearch || changes.sources || changes.groups || changes.specialActions || changes.engines || changes.iconOnly || changes.customEngines || changes.engineOrder) mountPinnedBar();
       if ((changes.pinnedSearch || changes.enabled) && !pinnedBarCollapsed) {
         const currentPinnedSite = getPinnedSite();
         if (currentPinnedSite) schedulePinnedBarCollapse(currentPinnedSite);
@@ -2354,6 +2505,8 @@ export default defineContentScript({
       trigger.classList.toggle('disabled', !settings.enabled);
       if (!settings.enabled) {
         cancelTriggerHoverOpen();
+        // 扩展整个关掉了：两套 UI 的菜单都没有依附对象，一并无条件收掉。
+        closeOpenModeMenu();
         setPinnedHostVisible(false);
         panelOpen = false;
         trigger.setAttribute('aria-expanded', 'false');
@@ -2362,12 +2515,18 @@ export default defineContentScript({
       if (panelOpen) {
         renderEngines();
         positionPanel();
+        positionHiddenEngineList();
       }
     });
   }
 
   function hideAll() {
+    // 只关浮层自己那套里的菜单：常驻栏的同类菜单由它自己的收起路径负责。
+    // 无条件关会误伤——右键常驻栏图标之后，一次与本菜单无关的 mouseup 也会走到这里
+    // （见 closeOpenModeMenuIn 的说明）。
+    closeOpenModeMenuIn(shadow);
     if (selectionShowTimer) { window.clearTimeout(selectionShowTimer); selectionShowTimer = null; }
+    if (selectionWatchTimer) { window.clearInterval(selectionWatchTimer); selectionWatchTimer = null; }
     cancelTriggerHoverOpen();
     panelOpen = false;
     expanded = false;
@@ -2377,7 +2536,7 @@ export default defineContentScript({
     panel.classList.remove('visible');
     queryRow.classList.remove('expanded');
     queryExpand.setAttribute('aria-expanded', 'false');
-    queryExpand.title = '展开多行输入';
+    queryExpand.title = t('展开多行输入');
     selectedText = '';
     selectedRange = null;
     selectedInput = null;
@@ -2502,6 +2661,61 @@ export default defineContentScript({
     return found;
   }
 
+  /**
+   * 这段几何形状的选区，用户此刻在屏幕上看得见吗？
+   *
+   * 「有选区」与「用户看得见选区」是两件事，而触发点该由后者决定：选区可以被脚本造在
+   * 任何地方——离屏的 textarea / div（页面「复制到剪贴板」的常见手法就是 select() 一个
+   * 藏在 -9999px 的元素，一个字都不在屏幕上）、滚出视口的段落、opacity:0 的隐藏文字。
+   * 这些选区一旦照样弹图标，用户看到的就是「明明没选中任何文字，图标却冒出来」，
+   * 而且 positionTrigger 还会把它夹到视口边上，位置和任何文字都对不上。
+   *
+   * 下限 2×6px 挡的是 sr-only 那一类：clip:rect(0,0,0,0) + 1×1 的文本框，几何上「在视口里」，
+   * 但只有 1 个像素，屏幕上同样什么都看不见。
+   */
+  function rectIsVisibleOnScreen(rect: any) {
+    if (!rect) return false;
+    if (!(rect.width >= 2 && rect.height >= 6)) return false;
+    return rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;
+  }
+
+  /** 选区里是否至少有一行落在视口内。跨多行的选区（整页 Ctrl+A）只要有一行可见就算看得见。 */
+  function rangeHasVisibleRect(range: any) {
+    if (!range) return false;
+    let rects: any;
+    try { rects = range.getClientRects(); } catch { return false; }
+    for (const rect of rects) if (rectIsVisibleOnScreen(rect)) return true;
+    return false;
+  }
+
+  /** 选区所在的元素：文本节点向上取父元素。 */
+  function rangeOwnerElement(range: any) {
+    const node: any = range?.startContainer;
+    if (!node) return null;
+    return node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  }
+
+  /**
+   * 选区所在的元素是否真的被渲染出来。
+   *
+   * 只看几何不够：opacity:0 / visibility:hidden 的元素仍然有布局盒，矩形完全正常，
+   * 屏幕上却没有字。checkVisibility 覆盖这两种；拿不到这个 API 时按「可见」放行，
+   * 不让能力缺失反过来把正常选区挡掉。
+   */
+  function elementIsVisibleOnScreen(element: any) {
+    if (!element || typeof element.checkVisibility !== 'function') return true;
+    try { return element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }); } catch { return true; }
+  }
+
+  /** 当前选区内屏幕上真的看得见吗（几何 + 元素可见性）。 */
+  function liveSelectionIsOnScreen(live: any) {
+    if (!live || !elementIsVisibleOnScreen(live.element)) return false;
+    // 输入框的选区只有一段几何，直接判它。
+    if (live.inputSelection) return rectIsVisibleOnScreen(live.rect);
+    // 文档 / contenteditable / 影子根的选区可能跨很多行：只要有一行在视口里就算看得见。
+    return rangeHasVisibleRect(live.range) || rectIsVisibleOnScreen(live.rect);
+  }
+
   function positionTrigger(rect) {
     const triggerSize = 25;
     const left = Math.max(8, Math.min(window.innerWidth - triggerSize - 8, rect.right + 9));
@@ -2540,7 +2754,7 @@ export default defineContentScript({
   function setQueryRowExpanded(expanded: any) {
     queryRow.classList.toggle('expanded', expanded);
     queryExpand.setAttribute('aria-expanded', String(expanded));
-    const label = expanded ? '收起多行输入' : '展开多行输入';
+    const label = expanded ? t('收起多行输入') : t('展开多行输入');
     queryExpand.setAttribute('aria-label', label);
     queryExpand.setAttribute('title', label);
   }
@@ -2597,11 +2811,6 @@ export default defineContentScript({
     try { textarea.select(); return document.execCommand('copy'); }
     catch { return false; }
     finally { textarea.remove(); }
-  }
-
-  /** 特殊功能按钮的悬浮提示按动作给出，缺省回落到名字——只有「复制」时它才等于「XX搜索内容」。 */
-  function getSpecialActionTitle(entry: { specialTitle?: string; name?: string }): string {
-    return String(entry?.specialTitle || entry?.name || '');
   }
 
   function getSearchUrl(engine, query) {
@@ -2786,7 +2995,7 @@ export default defineContentScript({
       const currentHost = hostname.replace(/^www\./, '');
       site = getDynamicPinnedSites().find((candidate) => enabledSites.has(candidate.id) &&
       (currentHost === String(candidate.host || '').replace(/^www\./, '') || currentHost.endsWith('.' + String(candidate.host || '').replace(/^www\./, '')))) || {
-        id: 'all-sites', name: '当前站点', host: hostname, path: '/',
+        id: 'all-sites', name: t('当前站点'), host: hostname, path: '/',
         pathPrefix: '', pathSuffix: '', pathHasMarker: false, queryKeys: [], selector: GENERIC_PINNED_INPUT_SELECTOR, selectorConfigured: false, categorySelectors: [], dynamic: true, loose: true
       };
     }
@@ -2855,6 +3064,108 @@ export default defineContentScript({
       return;
     }
     window.open(url, '_blank', 'noopener,noreferrer');
+  }
+
+  /**
+   * 关掉「打开方式」菜单。
+   *
+   * 菜单是挂在浮层同一 shadow root 里的临时节点：菜单开着时浮层重绘、页面滚动、
+   * 用户按 Esc 或点了别处，都要把它收掉，否则它会留在原地且失去被选中的对象。
+   */
+  function closeOpenModeMenu() {
+    if (!openModeMenu) return;
+    const { element, cleanup } = openModeMenu;
+    openModeMenu = null;
+    cleanup();
+    element.remove();
+  }
+
+  /**
+   * 只关掉开在 root 这一套 UI 里的菜单。
+   *
+   * 为什么必须区分归属：同一个菜单有两个入口——选中文字浮层（host 的 shadow root）与
+   * 常驻搜索栏（pinned host 的 shadow root）。两套 UI 各有自己的收尾（hideAll、
+   * 常驻栏收起），那些收尾只该带走自己那一套里的菜单。此前它们都无条件调
+   * closeOpenModeMenu()，于是出现「右击常驻栏图标，菜单出现一下马上消失」：
+   *
+   *   右键按下/抬起（button=2）同样走 document 上的 mousedown/mouseup 监听，
+   *   而常驻栏不在 eventInsideOverlay(event) 的范围内 —— 于是 mouseup 照样排定
+   *   scheduleSelectionDisplay()，selectionTriggerDelay 之后 showForSelection()
+   *   发现没有选区就调 hideAll()，hideAll 顺手把刚弹出的常驻栏菜单拆了。
+   *   实测消失时刻与 selectionTriggerDelay 严格同步（默认 200ms）。
+   *
+   * root 为空时退化成「无条件关闭」，供「整个扩展 UI 停用」这类收尾使用。
+   */
+  function closeOpenModeMenuIn(root: any) {
+    if (!openModeMenu) return;
+    if (root && openModeMenu.root !== root) return;
+    closeOpenModeMenu();
+  }
+
+  /**
+   * 右键搜索源图标时弹出的「本标签打开 / 新建标签打开」菜单。
+   *
+   * 为什么做成按次选择而不是又一个全局开关：常驻栏已有「新标签/本页」的默认开关，
+   * 但用户经常只是一次性想换个地方打开（比如在结果页里连着换词搜索，不想开一堆标签）。
+   * 菜单只负责显示与回调，具体怎么开由调用方传进来的 run 决定。
+   *
+   * root 传事件源的 shadow root：菜单必须和触发它的按钮同处一个 shadow tree，
+   * 否则样式（宿主 all:initial）与层级都对不上。
+   */
+  function showOpenModeMenu(root, point, choices) {
+    if (!root) return;
+    closeOpenModeMenu();
+    const menu = document.createElement('div');
+    menu.className = 'qf-open-menu';
+    menu.setAttribute('role', 'menu');
+    choices.forEach((choice) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'qf-open-menu-item';
+      item.setAttribute('role', 'menuitem');
+      item.textContent = choice.label;
+      item.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeOpenModeMenu();
+        choice.run();
+      });
+      menu.append(item);
+    });
+    root.append(menu);
+    // 先量尺寸再夹进视口：贴着窗口右下角右键时，菜单要向回缩而不是被裁掉。
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, point.x));
+    const top = Math.max(8, Math.min(window.innerHeight - rect.height - 8, point.y));
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+    const onPointerDown = (event) => {
+      if (typeof event.composedPath === 'function' && event.composedPath().includes(menu)) return;
+      closeOpenModeMenu();
+    };
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeOpenModeMenu();
+    };
+    const onViewportChange = () => closeOpenModeMenu();
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('scroll', onViewportChange, true);
+    window.addEventListener('resize', onViewportChange);
+    openModeMenu = {
+      element: menu,
+      // 归属哪套 shadow tree：收尾时据此判断「该不该由我来关」（见 closeOpenModeMenuIn）。
+      root,
+      cleanup: () => {
+        document.removeEventListener('pointerdown', onPointerDown, true);
+        document.removeEventListener('keydown', onKeyDown, true);
+        window.removeEventListener('scroll', onViewportChange, true);
+        window.removeEventListener('resize', onViewportChange);
+      }
+    };
+    menu.querySelector('.qf-open-menu-item')?.focus({ preventScroll: true });
   }
 
   function getPinnedEntries() {
@@ -2933,14 +3244,14 @@ export default defineContentScript({
         /* popover 的 UA 默认样式（inset:0 / margin:auto / border / padding / overflow:auto）
            必须逐项压掉，否则宿主被拉成整屏还带默认边框。只声明属性是为了拿 top layer。 */
         :host([popover]){position:fixed;inset:auto;margin:0;padding:0;border:0;overflow:visible;background:transparent;max-width:none;max-height:none}
-        .bar{--pinned-bar-border-size:1px;box-sizing:border-box;display:block;width:max-content;max-width:calc(100vw - 20px);height:var(--pinned-bar-height,auto);border:var(--pinned-bar-border-size) solid rgba(255,255,255,.7);border-radius:0 0 7px 7px;background:rgba(250,253,251,.96);box-shadow:0 10px 24px rgba(20,53,40,.16),0 2px 4px rgba(20,53,40,.07);backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);overflow:hidden;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:auto;transform:translateY(0);transition:height .22s cubic-bezier(.2,.8,.2,1),transform .22s cubic-bezier(.2,.8,.2,1),border-width .22s cubic-bezier(.2,.8,.2,1),box-shadow .18s ease;will-change:height,transform}
+        .bar{--pinned-bar-border-size:1px;box-sizing:border-box;display:block;width:max-content;max-width:calc(100vw - 20px);height:var(--pinned-bar-height,auto);border:var(--pinned-bar-border-size) solid rgba(17,24,39,.08);border-radius:0 0 7px 7px;background:rgba(255,255,255,.96);box-shadow:0 10px 24px rgba(17,24,39,.14),0 2px 4px rgba(17,24,39,.05);backdrop-filter:blur(14px) saturate(1.1);-webkit-backdrop-filter:blur(14px) saturate(1.1);overflow:hidden;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:auto;transform:translateY(0);transition:height .22s cubic-bezier(.2,.8,.2,1),transform .22s cubic-bezier(.2,.8,.2,1),border-width .22s cubic-bezier(.2,.8,.2,1),box-shadow .18s ease;will-change:height,transform}
         .bar-content{display:flex;flex-direction:column;align-items:stretch;gap:3px;padding:3px 5px 4px}
         :host(.is-collapsed) .bar{height:0;border-width:0;box-shadow:none;transform:translateY(-7px);pointer-events:none}
         .pinned-query-row{display:flex;flex:0 0 auto;gap:3px;width:100%;min-width:180px;max-width:calc(100vw - 34px)}
-        .pinned-query{flex:1 1 auto;width:0;height:24px;min-width:0;padding:2px 7px;border:1px solid #d8e5dc;border-radius:5px;outline:none;color:#29483b;background:rgba(255,255,255,.9);font:11px/17px Inter,ui-sans-serif,sans-serif}
-        .pinned-query:focus{border-color:#6eaf8d;box-shadow:0 0 0 2px rgba(62,143,108,.12)}
-        .pinned-open-mode{display:grid;place-items:center;flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #d8e5dc;border-radius:5px;color:#789087;background:#fff;cursor:pointer}
-        .pinned-open-mode:hover{border-color:#93bda6;color:#2f795b;background:#f4faf6}.pinned-open-mode[aria-pressed="true"]{border-color:#8fbea4;color:#2f795b;background:#e6f4eb}.pinned-open-mode:focus-visible{outline:2px solid #3e8f6c;outline-offset:2px}
+        .pinned-query{flex:1 1 auto;width:0;height:24px;min-width:0;padding:2px 7px;border:1px solid #d7d9df;border-radius:5px;outline:none;color:#17181c;background:#fff;font:11px/17px Inter,ui-sans-serif,sans-serif}
+        .pinned-query:focus{border-color:#2f795b;box-shadow:0 0 0 2px rgba(47,121,91,.12)}
+        .pinned-open-mode{display:grid;place-items:center;flex:0 0 auto;width:24px;height:24px;padding:0;border:1px solid #d7d9df;border-radius:5px;color:#8a9099;background:#fff;cursor:pointer}
+        .pinned-open-mode:hover{border-color:#c9ccd2;color:#17181c;background:#f6f7f8}.pinned-open-mode[aria-pressed="true"]{border-color:#2f795b;color:#2f795b;background:#f4f6f5}.pinned-open-mode:focus-visible{outline:2px solid #2f795b;outline-offset:2px}
         .pinned-open-mode svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
         /* 收起态的展开热区。视觉上仍是一条细把手，但命中范围必须够大：
            此前热区只有 78x9，鼠标不经它直接移到下方图标位置时栏不会展开，
@@ -2952,34 +3263,40 @@ export default defineContentScript({
            点击直接穿透给页面——这正是「点搜索图标没反应」的来源。
            加宽到整个宿主宽度、加高到 24px，并去掉自身描边与底色，
            可见部分交给 ::before 那条 30x2 的胶囊。 */
-        .reveal-handle{display:grid;place-items:center;width:52px;margin:0 auto;height:24px;padding:0;border:0;color:#6f8b7d;background:transparent;cursor:pointer;pointer-events:none;opacity:0;visibility:hidden;transform:translateY(-7px);transition:transform .16s cubic-bezier(.2,.8,.2,1),opacity .12s ease,visibility 0s linear .16s}
+        .reveal-handle{display:grid;place-items:center;width:52px;margin:0 auto;height:24px;padding:0;border:0;color:#c3c7cf;background:transparent;cursor:pointer;pointer-events:none;opacity:0;visibility:hidden;transform:translateY(-7px);transition:transform .16s cubic-bezier(.2,.8,.2,1),opacity .12s ease,visibility 0s linear .16s}
         :host(.is-collapsed) .reveal-handle{pointer-events:auto;opacity:1;visibility:visible;transform:translateY(0);transition-delay:.04s,.04s,0s}
         .reveal-handle::before{content:"";width:30px;height:2px;border-radius:99px;background:currentColor}
-        .reveal-handle:hover{color:#2f795b}
-        .reveal-handle:focus-visible{outline:2px solid #3e8f6c;outline-offset:2px}
+        .reveal-handle:hover{color:#17181c}
+        .reveal-handle:focus-visible{outline:2px solid #2f795b;outline-offset:2px}
         .entries{display:flex;align-items:center;flex:0 0 auto;flex-wrap:nowrap;gap:4px;width:100%;min-width:0;max-width:calc(100vw - 34px);overflow-x:auto}
-        .entry{display:flex;align-items:center;gap:4px;flex:0 0 auto;min-height:23px;padding:2px 6px 2px 3px;border:1px solid #d8e5dc;border-radius:5px;color:#355347;background:#fff;font:600 11px/1.2 Inter,ui-sans-serif,sans-serif;cursor:pointer}
+        .entry{display:flex;align-items:center;gap:4px;flex:0 0 auto;min-height:23px;padding:2px 6px 2px 3px;border:1px solid #d7d9df;border-radius:5px;color:#33363d;background:#fff;font:600 11px/1.2 Inter,ui-sans-serif,sans-serif;cursor:pointer}
         .entry.icon-only{gap:0;padding-right:4px}.entry.icon-only .name{display:none}
-        .entry:hover{border-color:#93bda6;background:#f4faf6}.entry:focus-visible{outline:2px solid #3e8f6c;outline-offset:2px}
-        .mark{display:grid;place-items:center;width:17px;height:17px;overflow:hidden;border-radius:4px;color:#fff;background:#6c8b7b;font:700 10px/1 Arial,sans-serif}.mark img{width:100%;height:100%;object-fit:cover}
-        .google .mark{background:#4285f4}.baidu .mark{background:#2932e1}.google-scholar .mark{background:#5f6368;font-size:9px}.duckduckgo .mark{background:#de5833}.so .mark{background:#19a15f;font-size:9px}.sogou .mark{background:#ff5a34}.bing .mark{background:#1185e0}.yandex .mark{background:#ef3b3b}.google-ai .mark{background:#6b5ce7}.bilibili .mark{background:#00aeec}.xiaohongshu .mark{background:#ef4d62}.x .mark{background:#111}.youtube .mark{background:#f21f26}.zhihu .mark{background:#1777e6}.douyin .mark{background:#161823}.doubao .mark{background:#4f7cff}.deepseek .mark{background:#4d6bfe}.group .mark{color:#315f4d;background:#dfeee5}
-        .special-copy .mark{color:#fff;background:#6c8178}
+        .entry:hover{border-color:#c9ccd2;background:#f6f7f8}.entry:focus-visible{outline:2px solid #2f795b;outline-offset:2px}
+        .mark{display:grid;place-items:center;width:17px;height:17px;overflow:hidden;border-radius:4px;color:#fff;background:#6b7280;font:700 10px/1 Arial,sans-serif}.mark img{width:100%;height:100%;object-fit:cover}
+        .google .mark{background:#4285f4}.baidu .mark{background:#2932e1}.google-scholar .mark{background:#5f6368;font-size:9px}.duckduckgo .mark{background:#de5833}.so .mark{background:#19a15f;font-size:9px}.sogou .mark{background:#ff5a34}.bing .mark{background:#1185e0}.yandex .mark{background:#ef3b3b}.google-ai .mark{background:#6b5ce7}.bilibili .mark{background:#00aeec}.xiaohongshu .mark{background:#ef4d62}.x .mark{background:#111}.youtube .mark{background:#f21f26}.zhihu .mark{background:#1777e6}.douyin .mark{background:#161823}.doubao .mark{background:#4f7cff}.deepseek .mark{background:#4d6bfe}.group .mark{color:#4b5563;background:#f1f2f4}
+        .special-copy .mark{color:#fff;background:#6b7280}
         .special-notes .mark{color:#fff;background:#3e8f6c}
         .special-ask-ai .mark{color:#f5c56b;background:#19352c;font-size:9px}
         .name{max-width:94px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         @media (prefers-reduced-motion: reduce){.bar,.reveal-handle{transition:none}}
-        .pinned-group-list{position:fixed;z-index:2147483647;display:flex;flex-direction:column;align-items:stretch;gap:4px;min-width:160px;max-width:calc(100vw - 20px);max-height:calc(100vh - 20px);padding:4px;overflow-y:auto;border:1px solid rgba(255,255,255,.78);border-radius:7px;background:rgba(250,253,251,.98);box-shadow:0 12px 30px rgba(20,53,40,.18),0 2px 5px rgba(20,53,40,.08);backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);pointer-events:auto}
+        .pinned-group-list{position:fixed;z-index:2147483647;display:flex;flex-direction:column;align-items:stretch;gap:4px;min-width:160px;max-width:calc(100vw - 20px);max-height:calc(100vh - 20px);padding:4px;overflow-y:auto;border:1px solid rgba(17,24,39,.1);border-radius:7px;background:rgba(255,255,255,.98);box-shadow:0 12px 30px rgba(17,24,39,.16),0 2px 5px rgba(17,24,39,.06);backdrop-filter:blur(14px) saturate(1.1);-webkit-backdrop-filter:blur(14px) saturate(1.1);pointer-events:auto}
         .pinned-group-list[hidden]{display:none}.pinned-group-list .entry{width:100%;justify-content:flex-start}
+        /* 右键搜索源图标后的打开方式菜单（与选区浮层同一套外观）。 */
+        .qf-open-menu{position:fixed;z-index:2147483647;display:flex;flex-direction:column;min-width:118px;padding:4px;border:1px solid rgba(17,24,39,.1);border-radius:8px;background:rgba(255,255,255,.98);box-shadow:0 12px 30px rgba(17,24,39,.16),0 2px 5px rgba(17,24,39,.06);backdrop-filter:blur(14px) saturate(1.1);-webkit-backdrop-filter:blur(14px) saturate(1.1);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:auto}
+        .qf-open-menu-item{display:flex;align-items:center;width:100%;min-height:26px;padding:0 8px;border:0;border-radius:5px;color:#33363d;background:transparent;font:600 11px/1.2 Inter,ui-sans-serif,sans-serif;text-align:left;white-space:nowrap;cursor:pointer}
+        .qf-open-menu-item:hover{color:#17181c;background:#f1f2f4}
+        .qf-open-menu-item:focus-visible{outline:2px solid #2f795b;outline-offset:-2px}
       </style>
-      <section class="bar" aria-label="QuickFind 常驻搜索列表">
+      <section class="bar" aria-label="QuickFind 常驻搜索列表" data-i18n-aria-label="QuickFind 常驻搜索列表">
         <div class="bar-content">
-          <div class="pinned-query-row"><input class="pinned-query" type="text" aria-label="当前搜索文本" autocomplete="off" /><button class="pinned-open-mode" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"></path></svg></button></div>
+          <div class="pinned-query-row"><input class="pinned-query" type="text" aria-label="当前搜索文本" data-i18n-aria-label="当前搜索文本" autocomplete="off" /><button class="pinned-open-mode" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5"></path></svg></button></div>
           <div class="entries"></div>
         </div>
       </section>
       <div class="pinned-group-list" hidden></div>
-      <button class="reveal-handle" type="button" aria-label="展开常驻搜索栏" aria-expanded="false" title="展开常驻搜索栏"></button>
+      <button class="reveal-handle" type="button" aria-label="展开常驻搜索栏" data-i18n-aria-label="展开常驻搜索栏" aria-expanded="false" title="展开常驻搜索栏" data-i18n-title="展开常驻搜索栏"></button>
     `;
+    applyI18n(root);
     const bar = root.querySelector('.bar');
     const pinnedQuery = root.querySelector('.pinned-query');
     const pinnedOpenMode = root.querySelector('.pinned-open-mode');
@@ -3138,8 +3455,8 @@ export default defineContentScript({
     if (!button) return;
     const openInNewTab = getPinnedOpenInNewTab();
     const label = openInNewTab
-      ? '搜索结果将在新标签页打开；点击改为当前页面打开'
-      : '搜索结果将在当前页面打开；点击改为新标签页打开';
+      ? t('搜索结果将在新标签页打开；点击改为当前页面打开')
+      : t('搜索结果将在当前页面打开；点击改为新标签页打开');
     button.setAttribute('aria-pressed', String(openInNewTab));
     button.setAttribute('aria-label', label);
     button.title = label;
@@ -3203,6 +3520,9 @@ export default defineContentScript({
     if (inside(el.getBoundingClientRect())) return true;
     const groupList: Element | null = el.shadowRoot?.querySelector('.pinned-group-list') || null;
     if (groupList && !groupList.hasAttribute('hidden')) return inside(groupList.getBoundingClientRect());
+    // 右键菜单同样浮在宿主矩形之外，指针移到菜单上不该被当成「离开常驻栏」而收起。
+    const openMenu = el.shadowRoot?.querySelector('.qf-open-menu') || null;
+    if (openMenu) return inside(openMenu.getBoundingClientRect());
     return false;
   }
 
@@ -3343,26 +3663,102 @@ export default defineContentScript({
     pinnedQuery.value = text;
   }
 
-  function createPinnedButton(entry, site, allowIconOnly = true) {
+  /**
+   * 顶栏那排小图标的节点缓存。
+   *
+   * 为什么复用 <img> 而不是每次新建：任何一次结构重建（换配置、展开「更多」、页面变动
+   * 触发的重绘）都会 replaceChildren 掉整排按钮，新建的 <img> 要重新解码/重新上传纹理。
+   * 单看一枚 17px 的图标微不足道，但一排十几枚在同一次重建里全部换新，图标区会先白一帧
+   * ——用户看到的就是「顶栏小图标闪一下」。
+   *
+   * 键里带条目 id：同一个搜索源可以同时出现在直排区和分组飞层里，而同一个节点不能有两个
+   * 父节点（第二次 append 会把它从第一个按钮里移走）。所以同一次渲染里用过的节点不再复用，
+   * 撞上就退回新建，与旧实现一致。
+   */
+  const pinnedIconNodes = new Map<string, HTMLImageElement>();
+  /** 加载失败过的图标地址：后续渲染直接用工整的文字标记，不必反复建 <img> 触发失败。 */
+  const pinnedIconFailures = new Set<string>();
+
+  /** 把一枚搜索源的图标放进 .mark / .engine-mark 容器里。used 是本次渲染已占用的节点。 */
+  function fillIconMark(mark: HTMLElement, entry: any, used: Set<HTMLImageElement>) {
+    const url = String(entry.iconUrl || '');
+    // 分组入口的角标是界面文案（'组'），随语言变化；搜索源的 mark 是用户数据，原样显示。
+    const fallback = entry.isGroup ? t('组') : String(entry.mark || '?');
+    if (!url || pinnedIconFailures.has(url)) { mark.textContent = fallback; return; }
+    const key = `${entry.id}\u0001${url}`;
+    let image = pinnedIconNodes.get(key);
+    if (!image || used.has(image)) {
+      const created = document.createElement('img');
+      created.src = url;
+      created.alt = '';
+      // 解码放到下一个任务，避免重建时同步解码把这一帧顶掉。
+      created.decoding = 'async';
+      created.addEventListener('error', () => {
+        pinnedIconNodes.delete(key);
+        pinnedIconFailures.add(url);
+        const holder = created.parentElement;
+        created.remove();
+        if (holder && !holder.childElementCount) holder.textContent = fallback;
+      });
+      pinnedIconNodes.set(key, created);
+      // 缓存只服务于复用，条目总有上限；异常多的自定义图标不至于让它无限长。
+      if (pinnedIconNodes.size > 240) pinnedIconNodes.clear();
+      image = created;
+    }
+    used.add(image);
+    mark.append(image);
+  }
+
+  /**
+   * 左键点图标与右键菜单共用的一条打开路径。
+   *
+   * 目标标签页由调用方决定：左键用常驻栏的默认开关，右键菜单按用户那一次的选择。
+   * 其余行为（没有查询词时把焦点交给输入框、特殊功能、记历史）两边必须完全一致，
+   * 所以合并在这里，而不是让菜单另抄一份。
+   */
+  function activatePinnedEntry(entry, site, openInNewTab) {
+    const pageInput = findVisibleInput(site.selector);
+    const query = resolvePinnedSearchQuery(site);
+    // 三处都没有查询词时才把焦点交给输入框：让用户先打词再搜。
+    // 只要页面或地址里有词就走搜索——此前只读常驻框，空框在视频站上
+    // 表现为「点图标没反应」，而页面上明明有可搜的内容。
+    if (!query) {
+      // 优先常驻框。`a?.focus() || b?.focus()` 这个写法是错的：Element.focus() 返回
+      // undefined，`||` 会继续求值，焦点被无条件交给页面搜索框——用户点的明明是
+      // 扩展的图标，光标却跑到站点输入框里。focus() 不抛错就视为成功，显式 return。
+      const ownInput = getPinnedQueryInput();
+      if (ownInput) { ownInput.focus(); return; }
+      pageInput?.focus();
+      return;
+    }
+    if (entry.isSpecial) {
+      if (entry.action === 'copy') void copyTextToClipboard(query);
+      else if (entry.action === 'notes') saveTextToOutlineNotes(query);
+      else if (entry.action === 'ask-ai') askAiFromAction(query);
+      return;
+    }
+    rememberSearch(query);
+    const url = getSearchUrl(entry, query);
+    if (openInNewTab) openPinnedSearchInNewTab(url);
+    else window.location.assign(url);
+  }
+
+  function createPinnedButton(entry, site, allowIconOnly = true, usedIcons = new Set<HTMLImageElement>()) {
     const button = document.createElement('button');
     button.type = 'button';
     const iconOnly = allowIconOnly && !entry.isGroup && (entry.iconOnly === true || getPinnedConfig().iconOnly?.[entry.id] === true);
     button.className = 'entry ' + entry.className + (iconOnly ? ' icon-only' : '');
-    button.title = entry.isGroup ? '展开' + entry.name : entry.isSpecial ? getSpecialActionTitle(entry) : '使用' + entry.name + '搜索';
+    const displayName = entry.isGroup ? groupLabel({ id: entry.groupId, name: entry.name }) : entry.isSpecial ? actionLabel(entry) : sourceLabel(entry);
+    button.title = entry.isGroup ? t('展开{n}', { n: displayName }) : entry.isSpecial ? actionTooltip(entry) : t('使用{n}搜索', { n: displayName });
     if (entry.isGroup) {
       button.dataset.groupId = entry.groupId;
       button.setAttribute('aria-expanded', String(pinnedExpandedGroupId === entry.groupId));
     }
     const mark = document.createElement('span');
     mark.className = 'mark';
-    if (entry.iconUrl) {
-      const image = document.createElement('img');
-      image.src = entry.iconUrl; image.alt = '';
-      image.addEventListener('error', () => { image.remove(); mark.textContent = entry.mark || '?'; });
-      mark.append(image);
-    } else mark.textContent = entry.mark || '?';
+    fillIconMark(mark, entry, usedIcons);
     const name = document.createElement('span');
-    name.className = 'name'; name.textContent = entry.name;
+    name.className = 'name'; name.textContent = displayName;
     button.append(mark, name);
     button.addEventListener('click', () => {
       if (entry.isGroup) {
@@ -3372,30 +3768,19 @@ export default defineContentScript({
         positionPinnedBar(site);
         return;
       }
-      const pageInput = findVisibleInput(site.selector);
-      const query = resolvePinnedSearchQuery(site);
-      // 三处都没有查询词时才把焦点交给输入框：让用户先打词再搜。
-      // 只要页面或地址里有词就走搜索——此前只读常驻框，空框在视频站上
-      // 表现为「点图标没反应」，而页面上明明有可搜的内容。
-      if (!query) {
-        // 优先常驻框。`a?.focus() || b?.focus()` 这个写法是错的：Element.focus() 返回
-        // undefined，`||` 会继续求值，焦点被无条件交给页面搜索框——用户点的明明是
-        // 扩展的图标，光标却跑到站点输入框里。focus() 不抛错就视为成功，显式 return。
-        const ownInput = getPinnedQueryInput();
-        if (ownInput) { ownInput.focus(); return; }
-        pageInput?.focus();
-        return;
-      }
-      if (entry.isSpecial) {
-        if (entry.action === 'copy') void copyTextToClipboard(query);
-        else if (entry.action === 'notes') saveTextToOutlineNotes(query);
-        else if (entry.action === 'ask-ai') askAiFromAction(query);
-        return;
-      }
-      rememberSearch(query);
-      const url = getSearchUrl(entry, query);
-      if (getPinnedOpenInNewTab()) openPinnedSearchInNewTab(url);
-      else window.location.assign(url);
+      activatePinnedEntry(entry, site, getPinnedOpenInNewTab());
+    });
+    // 右键：按次挑「本标签打开 / 新建标签打开」。分组与特殊功能不是 URL 搜索，保留原生菜单。
+    button.addEventListener('contextmenu', (event) => {
+      if (entry.isGroup || entry.isSpecial) return;
+      // 没有可搜的词时「打开」没有意义，菜单出来也只会让用户多按一次：交给左键的聚焦路径。
+      if (!resolvePinnedSearchQuery(site)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      showOpenModeMenu(button.getRootNode(), { x: event.clientX, y: event.clientY }, [
+        { label: t('本标签打开'), run: () => activatePinnedEntry(entry, site, false) },
+        { label: t('新建标签打开'), run: () => activatePinnedEntry(entry, site, true) }
+      ]);
     });
     return button;
   }
@@ -3406,11 +3791,11 @@ export default defineContentScript({
     button.className = 'entry group';
     button.dataset.pinnedMore = 'true';
     button.setAttribute('aria-expanded', String(pinnedMoreExpanded));
-    button.title = pinnedMoreExpanded ? '收起更多搜索源' : '展开更多搜索源';
+    button.title = pinnedMoreExpanded ? t('收起更多搜索源') : t('展开更多搜索源');
     const mark = document.createElement('span');
     mark.className = 'mark'; mark.textContent = pinnedMoreExpanded ? '⌃' : '…';
     const name = document.createElement('span');
-    name.className = 'name'; name.textContent = pinnedMoreExpanded ? '收起' : '更多';
+    name.className = 'name'; name.textContent = pinnedMoreExpanded ? t('收起') : t('更多');
     button.append(mark, name);
     button.addEventListener('click', () => {
       pinnedExpandedGroupId = null;
@@ -3446,6 +3831,8 @@ export default defineContentScript({
       ].join('\u0001');
     };
     return [
+      // 语言影响名字与提示，必须进指纹，否则切换后常驻栏停在旧语言。
+      getLocale(),
       site?.id || '', site?.selector || '', site?.host || '', String(site?.selectorConfigured),
       String(getPinnedDefaultGroupCount()), String(moreExpanded), String(expandedGroupId || ''),
       directEntries.map((entry: any) => describe(entry, true)).join('\u0002'),
@@ -3470,7 +3857,11 @@ export default defineContentScript({
     const directEntries = allEntries.slice(0, getPinnedDefaultGroupCount());
     const hiddenEntries = allEntries.slice(directEntries.length);
     // 输入框取值与结构无关，但会随页面查询、草稿、清空状态变化，每次都要同步（含跳过重建这条路径）。
-    syncPinnedQuery(site);
+    //
+    // 收起态例外：这个框此刻既看不见也点不到，没有人的眼睛在等它。而同步一次要调
+    // findVisibleInput——querySelectorAll + 每个候选一次 getBoundingClientRect/getComputedStyle，
+    // 是这条 120ms 路径上最后剩下的一次强制布局。收起态跳过，展开时补同步（见 setPinnedBarCollapsed）。
+    if (!pinnedBarCollapsed) syncPinnedQuery(site);
     const groupEntries = pinnedMoreExpanded
       ? hiddenEntries
       : pinnedExpandedGroupId ? getPinnedGroupSources(pinnedExpandedGroupId) : [];
@@ -3480,25 +3871,48 @@ export default defineContentScript({
       return;
     }
     pinnedRenderSignature = signature;
+    // 结构要重建，高度必然要重量（内容和按钮数都换了）。
+    pinnedBarContentHeightDirty = true;
     // 紧随其后的 replaceChildren 会把持有焦点的按钮移出文档，浏览器随即在 .bar 上派发 focusout。
     // 那是重建的副产物、不是用户移开焦点，用时间窗标出来供 focusout 监听跳过。
     pinnedFocusoutSuppressUntil = Date.now() + PINNED_FOCUSOUT_GRACE_MS;
+    // 图标节点按「本次渲染已占用」去重，见 fillIconMark。
+    const usedIcons = new Set<HTMLImageElement>();
     entries.replaceChildren();
-    directEntries.forEach((entry) => entries.append(createPinnedButton(entry, site)));
+    directEntries.forEach((entry) => entries.append(createPinnedButton(entry, site, true, usedIcons)));
     if (hiddenEntries.length) entries.append(createPinnedMoreButton(site));
     groupList.replaceChildren();
-    groupEntries.forEach((entry) => groupList.append(createPinnedButton(entry, site, false)));
+    groupEntries.forEach((entry) => groupList.append(createPinnedButton(entry, site, false, usedIcons)));
     groupList.hidden = !groupList.childElementCount;
+    // 按钮数变了，宿主宽度也就变了：横向位置要重新量。放在重建之后立位，
+    // 让紧随其后的 refreshPinnedBarChrome / positionPinnedBar 各自只量一次。
+    pinnedBarHostWidthDirty = true;
     refreshPinnedBarChrome(root);
   }
 
+  /**
+   * `.bar` 的边框宽度。与下面模板里 `--pinned-bar-border-size` 的取值必须一致。
+   *
+   * 原先这里是 `getComputedStyle(bar).getPropertyValue('--pinned-bar-border-size')`：
+   * 每次渲染都为一个常量做一次样式解析，而样式解析同样会打断渲染流水线。
+   * 这是代码里写死的 1px，直接当常量用。
+   */
+  const PINNED_BAR_BORDER_SIZE = 1;
+
   function syncPinnedBarHeight(root = pinnedHost?.shadowRoot) {
+    // 只有内容结构或展开态变过才重量：.bar 的高度过渡读的就是这个变量，
+    // 而在「页面持续变动 → 每 120ms 挂载一次」的稳态下，内容根本没变，
+    // 每次读 scrollHeight 都是白付一次强制布局。
+    if (!pinnedBarContentHeightDirty) return;
+    // 宿主隐藏时整棵子树不参与布局，scrollHeight 恒为 0 —— 这时候量出来的数不能当真，
+    // 保留 dirty 让下次可见时再量。
+    if (pinnedHost?.hidden) return;
     const bar = root?.querySelector('.bar');
     const content = root?.querySelector('.bar-content');
     if (!bar || !content) return;
-    const borderSize = parseFloat(getComputedStyle(bar).getPropertyValue('--pinned-bar-border-size')) || 1;
-    const height = Math.ceil(content.scrollHeight + borderSize * 2);
-    bar.style.setProperty('--pinned-bar-height', `${height}px`);
+    pinnedBarContentHeight = Math.ceil(content.scrollHeight + PINNED_BAR_BORDER_SIZE * 2);
+    pinnedBarContentHeightDirty = false;
+    bar.style.setProperty('--pinned-bar-height', `${pinnedBarContentHeight}px`);
   }
 
   function clearPinnedCollapseTimer({ resetDeadline = true } = {}) {
@@ -3559,12 +3973,21 @@ export default defineContentScript({
   function setPinnedBarCollapsed(collapsed, site) {
     clearPinnedCollapseTimer();
     if (!pinnedHost) return;
+    const stateChanged = pinnedBarCollapsed !== collapsed;
     pinnedBarCollapsed = collapsed;
     if (collapsed) {
+      // 收起后菜单失去依附对象，留着它就成了悬在页面顶部的一块死链接。
+      // 只关常驻栏这一套里的菜单：收起是常驻栏的定时动作，浮层里正开着的菜单不由它负责。
+      closeOpenModeMenuIn(pinnedHost.shadowRoot);
       pinnedExpandedGroupId = null;
       pinnedMoreExpanded = false;
       pinnedPointerHeld = false;
       if (site) renderPinnedBar(site);
+    } else if (stateChanged && site) {
+      // 展开这一下必须补一次渲染：收起态跳过了输入框同步（见 renderPinnedBar），
+      // 而用户现在真的要看见这个框了。结构没变时指纹闸门会拦住重建，只做同步与 chrome 刷新。
+      pinnedBarContentHeightDirty = true;
+      renderPinnedBar(site);
     }
     pinnedHost.classList.toggle('is-collapsed', collapsed);
     const revealHandle = pinnedHost.shadowRoot?.querySelector('.reveal-handle');
@@ -3586,9 +4009,19 @@ export default defineContentScript({
   function setPinnedHostVisible(visible) {
     const el = pinnedHost;
     if (!el) return;
-    el.hidden = !visible;
+    // 只在状态真的翻转时才写：这段是高频路径（每次滚动、每次挂载都会经过）。
+    if (el.hidden === visible) {
+      el.hidden = !visible;
+      // hidden 的元素量不出宽度（offsetWidth 恒为 0），重新可见后必须重量。
+      if (visible) pinnedBarHostWidthDirty = true;
+    }
     if (visible) promoteToTopLayer(el);
-    else demoteFromTopLayer(el);
+    else {
+      // 宿主藏起来时菜单也跟着不可见。留在 DOM 里的那份（连同它那几条全局监听）会在宿主
+      // 下次可见时原样浮出来——一个停在旧坐标、指向旧站点的死菜单，所以在这里一并拆掉。
+      closeOpenModeMenuIn(el.shadowRoot);
+      demoteFromTopLayer(el);
+    }
   }
 
   function positionPinnedBar(site) {
@@ -3607,11 +4040,21 @@ export default defineContentScript({
     const barHost = pinnedHost || ensurePinnedHost();
     if (!barHost.isConnected) document.documentElement.append(barHost);
     setPinnedHostVisible(true);
-    barHost.classList.toggle('is-collapsed', pinnedBarCollapsed);
-    const panelWidth = Math.min(barHost.offsetWidth || 420, window.innerWidth - 20);
-    const left = Math.max(10, Math.min(window.innerWidth - panelWidth - 10, (window.innerWidth - panelWidth) / 2));
-    barHost.style.left = `${left}px`;
-    barHost.style.top = '0px';
+    // 展开态与收起态的 .bar 边框宽度不同（收起态是 0），量出来的宿主宽度差 2px。
+    // 类名真的翻转时把测量结果作废，位置才和「当场重新量一次」的旧行为一致。
+    const collapsedClass = barHost.classList.contains('is-collapsed');
+    if (collapsedClass !== Boolean(pinnedBarCollapsed)) {
+      barHost.classList.toggle('is-collapsed', pinnedBarCollapsed);
+      pinnedBarHostWidthDirty = true;
+    }
+    if (pinnedBarHostWidthDirty || !pinnedBarHostWidth) {
+      pinnedBarHostWidth = Math.min(barHost.offsetWidth || 420, window.innerWidth - 20);
+      pinnedBarHostWidthDirty = false;
+    }
+    const left = Math.max(10, Math.min(window.innerWidth - pinnedBarHostWidth - 10, (window.innerWidth - pinnedBarHostWidth) / 2));
+    const leftCss = `${left}px`;
+    if (barHost.style.left !== leftCss) barHost.style.left = leftCss;
+    if (barHost.style.top !== '0px') barHost.style.top = '0px';
     positionPinnedGroupList();
     return barHost;
   }
@@ -3650,6 +4093,9 @@ export default defineContentScript({
       }
     }
     const host = ensurePinnedHost();
+    // 换页时菜单必须作废：它的回调闭包攥着上一页的 site（站点解析结果、查询来源都在里面），
+    // 坐标也是旧的。放在 ensurePinnedHost 之后，root 一定存在。
+    if (isNewPage) closeOpenModeMenuIn(host.shadowRoot);
     host.classList.toggle('is-collapsed', pinnedBarCollapsed);
     host.shadowRoot?.querySelector('.reveal-handle')?.setAttribute('aria-expanded', String(!pinnedBarCollapsed));
     if (!host.isConnected) document.documentElement.append(host);
@@ -3669,7 +4115,10 @@ export default defineContentScript({
 
   function positionGroupEngineList() {
     if (!expandedGroupId || groupEngineList.hidden) return;
-    const groupButton = Array.from(shadow.querySelectorAll('.engine[data-group-id]')).find((button) => button.dataset.groupId === expandedGroupId);
+    const groupButton = Array.from(shadow.querySelectorAll('.engine[data-group-id]')).find((button) => button.dataset.groupId === expandedGroupId)
+      // 分组本身可能藏在「更多」菜单里：那一项随菜单一起收掉后，直排区没有它的按钮。
+      // 与常驻栏同一处理——挂到「更多」按钮旁边，而不是把刚打开的飞层又立刻藏掉。
+      || engineList.querySelector('.more-engine');
     if (!groupButton) { groupEngineList.hidden = true; return; }
     const buttonRect = groupButton.getBoundingClientRect();
     const panelRect = panel.getBoundingClientRect();
@@ -3683,41 +4132,81 @@ export default defineContentScript({
     groupEngineList.style.top = `${top - panelRect.top}px`;
   }
 
+  /**
+   * 「更多」展开的菜单定位。
+   *
+   * 摆法与常驻搜索栏的更多飞层一致：紧贴触发按钮右缘、与按钮同高；右侧放不下
+   * 就翻到左侧，两侧都放不下再夹回视口内。这样两处点开「更多」得到的是同一种
+   * 「从按钮旁边长出来的一张菜单」。
+   *
+   * 为什么用 absolute 而不是常驻栏那样的 fixed：选区面板自身是 position:fixed，
+   * 还带 transform / backdrop-filter，fixed 子节点会被它收成包含块，坐标系与视口
+   * 不一致。分组飞层一直用「视口坐标 - 面板坐标」换算，这里沿用同一条路径。
+   */
+  function positionHiddenEngineList() {
+    if (!expanded || hiddenEngineList.hidden) return;
+    const moreButton = engineList.querySelector('.more-engine');
+    if (!moreButton) { hiddenEngineList.hidden = true; return; }
+    const buttonRect = moreButton.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    const flyoutWidth = Math.min(hiddenEngineList.offsetWidth || 170, window.innerWidth - 20);
+    const flyoutHeight = Math.min(hiddenEngineList.offsetHeight || 36, window.innerHeight - 20);
+    let left = buttonRect.right + 6;
+    if (left + flyoutWidth > window.innerWidth - 10) left = buttonRect.left - flyoutWidth - 6;
+    left = Math.max(10, Math.min(window.innerWidth - flyoutWidth - 10, left));
+    const top = Math.max(10, Math.min(window.innerHeight - flyoutHeight - 10, buttonRect.top));
+    hiddenEngineList.style.left = `${left - panelRect.left}px`;
+    hiddenEngineList.style.top = `${top - panelRect.top}px`;
+  }
+
   function renderEngines() {
     engineList.replaceChildren();
     hiddenEngineList.replaceChildren();
     groupEngineList.replaceChildren();
     const available = getAvailableEngines();
+    // 与常驻栏共用同一份图标节点缓存（见 fillIconMark）：浮层在切换分组时也会整批重建，
+    // 图标同样不该重新解码、闪白。used 只管本次渲染的占用，两处各自一份。
+    const usedIcons = new Set<HTMLImageElement>();
     const createEngineButton = (engine, target, allowIconOnly = true) => {
       const button = document.createElement('button');
       button.type = 'button';
       const iconOnly = allowIconOnly && (engine.iconOnly === true || settings.iconOnly[engine.id] === true);
       button.className = `engine ${engine.className}${iconOnly ? ' icon-only' : ''}`;
       button.dataset.engine = engine.id;
-      button.title = engine.isSpecial ? getSpecialActionTitle(engine) : `使用${engine.name}搜索`;
+      const displayName = engine.isGroup ? groupLabel({ id: engine.groupId, name: engine.name }) : engine.isSpecial ? actionLabel(engine) : sourceLabel(engine);
+      button.title = engine.isGroup ? t('展开{n}', { n: displayName }) : engine.isSpecial ? actionTooltip(engine) : t('使用{n}搜索', { n: displayName });
       const name = document.createElement('span');
       name.className = 'engine-name';
-      name.textContent = engine.name;
+      name.textContent = displayName;
       if (engine.isGroup) {
-        button.classList.add('group-text-only');
         button.dataset.groupId = engine.groupId;
         button.setAttribute('aria-expanded', String(expandedGroupId === engine.groupId));
+        // 直排区里的分组是纯文字按钮（浮层既有样式）；但「更多」菜单要和常驻栏的
+        // 同一张菜单对齐，那里分组是「组」角标 + 名字的一行，所以补一枚角标。
+        if (target === hiddenEngineList) {
+          const mark = document.createElement('span');
+          mark.className = 'engine-mark';
+          mark.setAttribute('aria-hidden', 'true');
+          fillIconMark(mark, engine, usedIcons);
+          button.append(mark);
+        } else {
+          button.classList.add('group-text-only');
+        }
       } else {
         const mark = document.createElement('span');
         mark.className = 'engine-mark';
         mark.setAttribute('aria-hidden', 'true');
-        if (engine.iconUrl) { const image = document.createElement('img');
-        image.src = engine.iconUrl; image.alt = ''; image.addEventListener('error', () => { image.remove();
-        mark.textContent = engine.mark || '?'; }); mark.append(image); } else mark.textContent = engine.mark || '?';
+        fillIconMark(mark, engine, usedIcons);
         button.append(mark);
       }
       button.append(name);
       button.addEventListener('click', () => {
         if (engine.isGroup) {
+          // 与常驻栏一致：点分组就收掉「更多」菜单，换成该分组的飞层，
+          // 不在同一块地方叠两张卡。
+          expanded = false;
           expandedGroupId = expandedGroupId === engine.groupId ? null : engine.groupId;
-          if (target === hiddenEngineList) expanded = true;
           renderEngines();
-          if (anchorRect) positionPanel(anchorRect, { left: parseFloat(trigger.style.left) || 0 });
           positionGroupEngineList();
           return;
         }
@@ -3734,6 +4223,18 @@ export default defineContentScript({
         window.open(url, '_blank', 'noopener,noreferrer');
         hideAll();
       });
+      // 右键：按次挑「本标签打开 / 新建标签打开」。分组与特殊功能不是搜索，保持浏览器原生菜单。
+      button.addEventListener('contextmenu', (event) => {
+        if (engine.isGroup || engine.isSpecial || !selectedText) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const text = selectedText;
+        const url = getSearchUrl(engine, text);
+        showOpenModeMenu(button.getRootNode(), { x: event.clientX, y: event.clientY }, [
+          { label: t('本标签打开'), run: () => { rememberSearch(text); window.location.assign(url); hideAll(); } },
+          { label: t('新建标签打开'), run: () => { rememberSearch(text); window.open(url, '_blank', 'noopener,noreferrer'); hideAll(); } }
+        ]);
+      });
       target.append(button);
     };
     const visibleCount = settings.defaultGroupCount || DEFAULT_SETTINGS.defaultGroupCount;
@@ -3746,7 +4247,7 @@ export default defineContentScript({
     const moreButton = document.createElement('button');
     moreButton.type = 'button';
     moreButton.className = 'engine more-engine';
-    moreButton.title = expanded ? '收起更多搜索源' : '展开更多搜索源';
+    moreButton.title = expanded ? t('收起更多搜索源') : t('展开更多搜索源');
     moreButton.setAttribute('aria-label', moreButton.title);
     moreButton.innerHTML = expanded
       ? '<span class="engine-mark" aria-hidden="true">⌃</span>'
@@ -3754,21 +4255,27 @@ export default defineContentScript({
     moreButton.addEventListener('click', () => {
       expanded = !expanded;
       expandedGroupId = null;
+      // 菜单是浮在面板外的一张卡，不改变面板高度，所以不用重新定位面板；
+      // renderEngines 末尾会按新状态把菜单位置摆好。
       renderEngines();
-      if (anchorRect) positionPanel(anchorRect, { left: parseFloat(trigger.style.left) || 0 });
     });
     if (hidden.length) engineList.append(moreButton);
     hiddenEngineList.hidden = !expanded || !hidden.length;
+    positionHiddenEngineList();
   }
 
-  function showForSelection() {
-    // Selection changes fire continuously while the user is dragging. Wait for mouseup.
-    if (mouseButtonDown) return hideAll();
-    if (contextAnchor) return;
+  /**
+   * 读出当前页面上的选区。
+   *
+   * 优先级：输入框 / 文本域 → 页面的 contenteditable → 文档选区 → 页面影子根里的选区。
+   * 只读状态、不改 UI：展示（showForSelection）与「选区还在不在」的巡检
+   * （selectionLooksGone）共用同一套判据，两处各写一份迟早会走样。
+   */
+  function readLiveSelection(): any {
     const inputSelection = getInputSelection();
     const contentEditableSelection = inputSelection ? null : getContentEditableSelection();
-    const editableSelection = inputSelection || contentEditableSelection;
-    if (editableSelection && settings.editableTriggerMode === 'none') return hideAll();
+    const editableSelection: any = inputSelection || contentEditableSelection;
+    if (editableSelection && settings.editableTriggerMode === 'none') return null;
     const selection = inputSelection ? null : window.getSelection();
     // 页面自己被 shadow DOM 包住的选区：document 选区会退化成 collapsed（见 getShadowSelection）。
     // 只在「折叠但 toString 仍有文字」时才去遍历影子根——普通点击的 toString 为空，
@@ -3776,7 +4283,7 @@ export default defineContentScript({
     const shadowSelection = inputSelection || contentEditableSelection
       ? null
       : (selection && selection.isCollapsed && selection.toString().trim() ? getShadowSelection() : null);
-    if (!inputSelection && !shadowSelection && (!selection || selection.isCollapsed)) return hideAll();
+    if (!inputSelection && !shadowSelection && (!selection || selection.isCollapsed)) return null;
     // 浮层面板的搜索框是 textarea，能显示换行——选中的多段文字按原始分行进入，
     // 不再压成一行。单行的下游（常驻栏 input、弹窗 input、搜索 URL）各自折叠空白。
     const documentText = selection ? normalizeSelectionText(selection.toString(), true) : '';
@@ -3786,20 +4293,33 @@ export default defineContentScript({
     // 这里**不设长度上限**：此前有一段 `text.length > 5000 → hideAll()`，于是整页
     // Ctrl+A（长文页动辄上万字）时触发点静默消失，用户看到的就是「有些地方选不中」。
     // 任何阈值都只是把同一个缺陷挪到另一个长度上，所以直接取消。
-    if (!text) return hideAll();
-    if (!selectionPointerPending && selectionPointerText && selectionPointerText !== text) selectionPointer = null;
-    selectionPointerPending = false;
-    selectionPointerText = text;
+    if (!text) return null;
     const liveRange = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
     const range = inputSelection ? null : contentEditableSelection?.range || shadowSelection?.range || liveRange;
     const rect = inputSelection ? inputSelection.rect
       : contentEditableSelection?.rect || shadowSelection?.rect || (liveRange ? getSelectionRect(liveRange) : null);
-    if (!rect || (!rect.width && !rect.height)) return hideAll();
+    // 归属元素只用于「这段文字有没有真的画在屏幕上」的判定。
+    const element = inputSelection ? inputSelection.input : rangeOwnerElement(range) || editableSelection?.element || null;
+    return { text, rect, range, element, inputSelection, editableSelection };
+  }
+
+  function showForSelection() {
+    // Selection changes fire continuously while the user is dragging. Wait for mouseup.
+    if (mouseButtonDown) return hideAll();
+    if (contextAnchor) return;
+    const live = readLiveSelection();
+    // 有选区 ≠ 用户看得见选区：离屏元素上的「复制用选区」、滚出视口的段落、被隐藏的文字
+    // 都会走到这里。这类选区不显示触发点（判据见 rectIsVisibleOnScreen）。
+    if (!live || !liveSelectionIsOnScreen(live)) return hideAll();
+    const { text, rect, range }: any = live;
+    if (!selectionPointerPending && selectionPointerText && selectionPointerText !== text) selectionPointer = null;
+    selectionPointerPending = false;
+    selectionPointerText = text;
     selectedText = text;
     selectedRange = range ? range.cloneRange() : null;
-    selectedInput = editableSelection?.input || editableSelection?.element || null;
-    selectedInputStart = inputSelection ? selectedInput.selectionStart : 0;
-    selectedInputEnd = inputSelection ? selectedInput.selectionEnd : 0;
+    selectedInput = live.editableSelection?.input || live.editableSelection?.element || null;
+    selectedInputStart = live.inputSelection ? selectedInput.selectionStart : 0;
+    selectedInputEnd = live.inputSelection ? selectedInput.selectionEnd : 0;
     anchorRect = rect;
     contextAnchor = null;
     panelManuallyMoved = false;
@@ -3810,8 +4330,55 @@ export default defineContentScript({
     positionTrigger(rect);
     trigger.classList.add('visible');
     if (!panelOpen) panel.classList.remove('visible');
+    // 选区可能在**没有任何用户操作**的情况下失效：选中的节点被页面删掉、消息被重渲染、
+    // 祖先元素被 display:none —— Chromium 在这几种情况下不一定派发 selectionchange
+    // （实测：节点删除后 selection 已 collapsed，事件没有来），图标就会留在原地。
+    // 所以显示期间挂一支巡检，见 selectionLooksGone。
+    startSelectionWatch();
     // 选中文字后触发点就要能点，所以在这里就提升宿主，而不是等面板打开。
     promoteToTopLayer(host);
+  }
+
+  /**
+   * 触发点显示期间，「选区是不是已经没了」的巡检。
+   *
+   * 为什么必须轮询：选区失效未必伴随事件。页面把选中的节点整段删掉、把消息重渲染成新节点、
+   * 给祖先加 display:none，选区都会静默消失或退化成空，而 Chromium 在这几种情况下不一定
+   * 派发 selectionchange。用户看到的就是「明明没选中任何文字，图标却挂在那儿」。
+   *
+   * 成本口径：只在图标可见时跑（hideAll 立刻停），每 250ms 只比较文本、不读几何——
+   * 几何（滚动、缩放、被滚出视口）走 scroll / resize 那条路，那里本来就要读布局。
+   * 超长选区（整页 Ctrl+A）不做逐字比较：toString() 的复制成本随文档规模上涨，而这个
+   * 量级的选区最常见的失效形态（节点被删）已经在 collapsed 上体现出来了。
+   */
+  function selectionLooksGone() {
+    if (!selectedText || mouseButtonDown || panelOpen || contextAnchor) return false;
+    if (selectedInput && !selectedInput.isConnected) return true;
+    // 输入框 / 文本域的选区只有它自己有；元素失焦后浏览器不再画高亮，也就等于没有选区。
+    // 焦点在扩展自己的浮层里不算失焦：用户点开面板时输入框本来就会让出焦点，
+    // 关掉面板后图标还得留在原地等他再点。
+    if (selectedInput && typeof selectedInput.selectionStart === 'number') {
+      if (document.activeElement !== selectedInput && !host.contains(document.activeElement)) return true;
+      return selectedInput.selectionStart === selectedInput.selectionEnd;
+    }
+    // contenteditable 与文档选区的判据一致（它们的选区都体现在 window.getSelection() 上）。
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return true;
+    if (!selection.isCollapsed) {
+      if (selectedText.length > 5000) return false;
+      const text = normalizeSelectionText(selection.toString(), true);
+      return !text || text !== selectedText;
+    }
+    // document 选区退化成 collapsed 但 toString 仍有文字：页面影子根里还留着选区。
+    // 这里不判它（判它要遍历影子根，这份代价不该压在计时器上），交给 scroll / resize。
+    return !selection.toString().trim();
+  }
+
+  function startSelectionWatch() {
+    if (selectionWatchTimer) return;
+    selectionWatchTimer = window.setInterval(() => {
+      if (selectionLooksGone()) hideAll();
+    }, 250);
   }
 
   function scheduleSelectionDisplay() {
@@ -3833,6 +4400,7 @@ export default defineContentScript({
     resizeQueryInput();
     renderEngines();
     positionPanel();
+    positionHiddenEngineList();
     panel.classList.add('visible');
     requestAnimationFrame(() => {
       queryInput.focus({ preventScroll: true });
@@ -3908,7 +4476,7 @@ export default defineContentScript({
     resizeQueryInput();
     renderEngines();
     panel.classList.add('visible');
-    requestAnimationFrame(() => { positionPanel(); queryInput.focus({ preventScroll: true }); placeCaretAtEnd(queryInput); restoreSelectedRange(); });
+    requestAnimationFrame(() => { positionPanel(); positionHiddenEngineList(); queryInput.focus({ preventScroll: true }); placeCaretAtEnd(queryInput); restoreSelectedRange(); });
     contextMenuState = null;
   }
 
@@ -3939,6 +4507,7 @@ export default defineContentScript({
       panel.style.top = `${top}px`;
       panelManuallyMoved = true;
       positionGroupEngineList();
+      positionHiddenEngineList();
     });
   });
   function finishPanelDrag(event) {
@@ -4008,7 +4577,7 @@ export default defineContentScript({
     panel.classList.toggle('visible', panelOpen);
   });
   queryInput.addEventListener('input', () => { selectedText = queryInput.value;
-  resizeQueryInput(); if (panelOpen && anchorRect) requestAnimationFrame(() => { positionPanel(); positionGroupEngineList(); }); });
+  resizeQueryInput(); if (panelOpen && anchorRect) requestAnimationFrame(() => { positionPanel(); positionGroupEngineList(); positionHiddenEngineList(); }); });
   queryExpand.addEventListener('click', () => {
     setQueryRowExpanded(!queryRow.classList.contains('expanded'));
     resizeQueryInput();
@@ -4016,6 +4585,7 @@ export default defineContentScript({
     if (panelOpen && anchorRect) requestAnimationFrame(() => {
       positionPanel(anchorRect, { left: parseFloat(trigger.style.left) || 0 });
       positionGroupEngineList();
+      positionHiddenEngineList();
     });
   });
   document.addEventListener('input', (event) => {
@@ -4063,12 +4633,33 @@ export default defineContentScript({
   });
   document.addEventListener('mousedown', (event) => {
     mouseButtonDown = true;
-    if (!eventInsideOverlay(event)) hideAll();
+    // 「打开方式」菜单在常驻栏的 shadow root 里，不算 eventInsideOverlay：
+    // 若不排除它，按在菜单上的那一下会先 hideAll() 把菜单本身拆掉，click 永远到不了。
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    const pressInOpenMenu = Boolean(openModeMenu && path.includes(openModeMenu.element));
+    if (!eventInsideOverlay(event) && !pressInOpenMenu) hideAll();
   }, true);
   window.addEventListener('blur', () => { mouseButtonDown = false; });
   window.addEventListener('resize', () => {
-    refreshSelectionPosition(false);
+    // 视口宽度变了：常驻栏的横向位置、宿主的测量宽度都要重算。
+    pinnedBarHostWidthDirty = true;
+    scheduleRefreshSelectionPosition(false);
   });
+  /**
+   * 把「重算浮层/常驻栏位置」压到每帧一次。
+   *
+   * 为什么：滚动事件在一帧里就可能派发多次，而 window 上的 scroll 监听与 document 上的
+   * 捕获监听各会收到一次——一次滚动最多让 positionPinnedBar 跑两遍，每遍都要读一次布局
+   * 再写一次定位。位置只需要在「这一帧画之前」是新的，所以按帧合并：语义等价，次数减半以上。
+   * resize 走同一条路：连续拉伸窗口时同样只需要一帧一次。
+   */
+  function scheduleRefreshSelectionPosition(preserveHorizontal = true) {
+    if (refreshSelectionFrame) return;
+    refreshSelectionFrame = window.requestAnimationFrame(() => {
+      refreshSelectionFrame = 0;
+      refreshSelectionPosition(preserveHorizontal);
+    });
+  }
   function refreshSelectionPosition(preserveHorizontal = true) {
     positionPinnedBar(getPinnedSite());
     if (anchorRect && selectedText) {
@@ -4082,6 +4673,13 @@ export default defineContentScript({
         if (selection && !selection.isCollapsed) rect = getSelectionRect(selection.getRangeAt(0));
       }
       if (rect) {
+        // 选区滚出视口、祖先被隐藏、节点被删：触发点不该被 positionTrigger 夹在屏幕边缘
+        // 继续挂着——那同样是「没选中任何文字却有个图标」。面板开着时不收：用户正在里面输入，
+        // 页面随滚动变化不该打断他。
+        if (!panelOpen && !rangeHasVisibleRect(selectedRange) && !rectIsVisibleOnScreen(rect)) {
+          hideAll();
+          return;
+        }
         if (preserveHorizontal && anchorRect) rect = { ...rect, left: anchorRect.left, right: anchorRect.right, width: anchorRect.width };
         anchorRect = rect;
         if (contextAnchor && selectedRange) contextAnchor = { ...contextAnchor, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
@@ -4089,13 +4687,17 @@ export default defineContentScript({
         // the original mouse-up point, which is no longer in the same viewport spot.
         selectionPointer = null;
         const triggerPosition = positionTrigger(anchorRect);
-        if (panelOpen) { positionPanel(anchorRect, triggerPosition); positionGroupEngineList(); }
+        if (panelOpen) { positionPanel(anchorRect, triggerPosition); positionGroupEngineList(); positionHiddenEngineList(); }
         if (panelOpen) restoreSelectedRange();
+      } else if (!panelOpen) {
+        // 连几何都取不到：选区的容器已经不在文档里了（或整段被隐藏）。
+        hideAll();
+        return;
       }
     }
   }
-  window.addEventListener('scroll', refreshSelectionPosition, { passive: true });
-  document.addEventListener('scroll', refreshSelectionPosition, true);
+  window.addEventListener('scroll', () => scheduleRefreshSelectionPosition(true), { passive: true });
+  document.addEventListener('scroll', () => scheduleRefreshSelectionPosition(true), true);
 
   function tryPrefillDoubao() {
     if (!/doubao\.com$/i.test(location.hostname)) return;
