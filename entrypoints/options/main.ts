@@ -3,7 +3,7 @@
 import { SPECIAL_ACTIONS } from '@/shared/search-actions';
 import { createNoteDrag } from '@/shared/note-drag';
 import { SOURCE_CONFIG_VERSION, PINNED_SITE_CONFIG_VERSION as SHARED_PINNED_VERSION } from '@/shared/builtins';
-import { DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS as SHARED_DEFAULTS, DEFAULT_SOURCES, DEFAULT_GROUPS, LEGACY_CONFIG_KEYS, MAX_DEFAULT_GROUP_COUNT } from '@/shared/defaults';
+import { DEFAULT_PINNED_SEARCH, DEFAULT_SETTINGS as SHARED_DEFAULTS, LEGACY_CONFIG_KEYS, MAX_DEFAULT_GROUP_COUNT, freshInstallSeed } from '@/shared/defaults';
 import {
   createEmptyNotes as outlineCreateEmptyNotes,
   normalizeNotes as outlineNormalizeNotes,
@@ -26,6 +26,12 @@ import {
 import { decodeQueryText } from '@/shared/query-text';
 import { NOTES_STORAGE_KEY } from '@/shared/notes';
 import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/settings-store';
+import type { SearchSource } from '@/shared/settings';
+import { applyI18n, countText, getLocale, groupLabel, localeTag, normalizeLocale, setLocale, sourceLabel, t } from '@/shared/i18n';
+import { FREE_GROUP_LIMIT, FREE_SOURCE_LIMIT, PLANS, describeLicense, formatExpiryDate, groupQuota, normalizeLicenseRecord, parseActivationCode, recordFromServer, sourceQuota, toSyncRecord } from '@/shared/license';
+import type { LicenseRecord } from '@/shared/license';
+import { activateLicense as activateOnServer, clearSession, errorText, flushPendingReleases, queuePendingRelease, readSession, refreshLicense, releaseLicense, saveSession, verifyLicenseToken } from '@/shared/license-api';
+import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
 
 (function () {
   'use strict';
@@ -49,6 +55,23 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       },
       onChanged: { addListener() {} }
     };
+  }
+
+  // ── 已下线的模块 ─────────────────────────────────────────────────────
+  // 见 shared/features.ts：入口直接从 DOM 摘掉，而不是靠 CSS 藏起来。
+  // 相关逻辑保持原样——元素缺失后它们自然失效（各自都有空值判断），
+  // 开关改回 true 时这一页与右侧「随心问」就会原样回来。
+  if (!OUTLINE_NOTES_ENABLED) {
+    document.querySelector('.nav-item[data-panel="notes"]')?.remove();
+    document.querySelector('[data-panel-content="notes"]')?.remove();
+  }
+  // 右侧 dock 已下线：那个开关不再有对应物，留着只会让人以为还能打开。
+  // 它所在的「面板」块只剩这一行，一并摘掉——留着空标题与分隔线会看起来像坏了。
+  if (!PAGE_SIDEBAR_ENABLED) {
+    const dockRow = document.querySelector('#llm-dock-visible')?.closest('.row');
+    const dockBlock = dockRow?.closest('.setting-block');
+    dockRow?.remove();
+    if (dockBlock && !dockBlock.querySelector('.row, .field')) dockBlock.remove();
   }
 
   // 内置源目录、默认配置、补源规则、源的收敛都在 shared/，本文件不再各自维护一份。
@@ -83,7 +106,10 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   const DEFAULTS = { ...SHARED_DEFAULTS, sources: [], groups: [] };
 
   let settings;
-  let activePanel = 'selection';
+  // 会员记录单独持有：整份设置还没有类型（见 README「类型债务与迭代路线」），
+  // 新代码不再往那份隐式 any 上挂字段，自己拿一份已标注的。
+  let license: LicenseRecord | null = null;
+  let activePanel = 'common';
   // 搜索源与分组已是独立的一页，manager 的选中态不再按面板区分；
   // 拖拽与编辑的归属统一记在这个常量上。
   const MANAGER_PANEL = 'sources';
@@ -93,7 +119,8 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   let iconEditorSourceId = null;
   let pinnedSiteEditingId = null;
   const iconNodeCache = new Map();
-  const selectedSourceIds = new Set();
+  // 批量选中的条目 id：搜索源 id 与 `action:<id>` 混在一起——两者都能批移、批删。
+  const selectedItemIds = new Set();
   const selectedHistoryIndexes = new Set();
 
   const navItems = Array.from(document.querySelectorAll('.nav-item'));
@@ -120,25 +147,49 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   const formTitle = document.querySelector('#form-title');
   const submitLabel = document.querySelector('#submit-label');
   const cancelEdit = document.querySelector('#cancel-edit');
-  const addGroupButton = document.querySelector('#add-group');
-  const saveStates = { selection: document.querySelector('#selection-save-state'),
+  const sourceDialog = document.querySelector('#source-dialog');
+  const addSourceButton = document.querySelector<HTMLElement>('#add-source');
+  const closeSourceDialog = document.querySelector('#close-source-dialog');
+  const addGroupButton = document.querySelector<HTMLElement>('#add-group');
+  const aboutVersion = document.querySelector('#about-version');
+  const planCards = document.querySelector('#plan-cards');
+  const licenseStatus = document.querySelector('#license-status');
+  const licenseGroupQuota = document.querySelector('#license-group-quota');
+  const licenseSourceQuota = document.querySelector('#license-source-quota');
+  const licenseCodeInput = document.querySelector<HTMLInputElement>('#license-code');
+  const licenseEmailInput = document.querySelector<HTMLInputElement>('#license-email');
+  const licenseError = document.querySelector('#license-error');
+  const activateLicenseButton = document.querySelector('#activate-license');
+  const clearLicenseButton = document.querySelector('#clear-license');
+  const licenseClearRow = document.querySelector<HTMLElement>('#license-clear-row');
+  const saveStates = { common: document.querySelector('#selection-save-state'),
+  selection: document.querySelector('#selection-save-state'),
   pinned: document.querySelector('#pinned-save-state'), sources: document.querySelector('#sources-save-state'),
-  llm: document.querySelector('#llm-save-state'), history: document.querySelector('#history-save-state'), notes: document.querySelector('#notes-save-state') };
+  llm: document.querySelector('#llm-save-state'), history: document.querySelector('#history-save-state'), notes: document.querySelector('#notes-save-state'),
+  about: document.querySelector('#license-save-state') };
   const triggerInputs = Array.from(document.querySelectorAll('input[name="trigger-mode"]'));
   const editableTriggerInputs = Array.from(document.querySelectorAll('input[name="editable-trigger-mode"]'));
+  const languageInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="language"]'));
   const iconEditor = document.querySelector('#icon-editor');
   const iconUrlInput = document.querySelector('#icon-url');
   const iconFileInput = document.querySelector('#icon-file');
   const applyIconUrl = document.querySelector('#apply-icon-url');
   const closeIconEditor = document.querySelector('#close-icon-editor');
   const iconEditorError = document.querySelector('#icon-editor-error');
+  const iconEditorPreview = document.querySelector('#icon-editor-preview');
+  const iconEditorName = document.querySelector('#icon-editor-name');
+  const iconEditorNote = document.querySelector('#icon-editor-note');
+  const fetchIconButton = document.querySelector<HTMLButtonElement>('#fetch-icon');
+  const uploadIconButton = document.querySelector<HTMLButtonElement>('#upload-icon');
+  const restoreIconButton = document.querySelector<HTMLButtonElement>('#restore-icon');
   const pinnedSiteList = document.querySelector('#pinned-site-list');
   const pinnedSiteForm = document.querySelector('#pinned-site-form');
   const pinnedSiteNameInput = document.querySelector('#pinned-site-name');
   const pinnedSiteUrlInput = document.querySelector('#pinned-site-url');
   const pinnedSiteSelectorInput = document.querySelector('#pinned-site-selector');
   const pinnedSiteError = document.querySelector('#pinned-site-error');
-  const pinnedSiteSummary = document.querySelector('#pinned-site-summary');
+  const pinnedSitesRow = document.querySelector<HTMLElement>('#pinned-sites-row');
+  const pinnedSiteSummary = document.querySelector<HTMLElement>('#pinned-site-summary');
   const managePinnedSites = document.querySelector('#manage-pinned-sites');
   const pinnedSiteDialog = document.querySelector('#pinned-site-dialog');
   const closePinnedSiteDialog = document.querySelector('#close-pinned-site-dialog');
@@ -199,6 +250,20 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     if (!value.startsWith('action:')) return null;
     return SPECIAL_ACTIONS.find((action) => action.id === value.slice(7)) || null;
   }
+  /** 动作在存储里的设置：改名、停用、仅图标都在这张稀疏表里，缺键即默认。 */
+  function specialActionSettings(actionId) { return config().actions?.[actionId] || {}; }
+  /** 按钮显示名：用户改过就用改过的，否则用 shared/search-actions.ts 的默认名（随界面语言）。 */
+  function specialActionName(action) { return String(specialActionSettings(action.id).name || t(String(action.name))); }
+  /** 写动作设置只有一个出口：默认值不落盘（iconOnly 只留 true、enabled 只留 false、name 只在非空时留）。 */
+  function updateSpecialActionSettings(actionId, patch) {
+    if (!config().actions) config().actions = {};
+    const next = { ...specialActionSettings(actionId), ...patch };
+    if (next.iconOnly !== true) delete next.iconOnly;
+    if (next.enabled !== false) delete next.enabled;
+    if (!String(next.name || '').trim()) delete next.name;
+    if (Object.keys(next).length) config().actions[actionId] = next;
+    else delete config().actions[actionId];
+  }
 
   function normalizeSearchHistory(history) {
     if (!Array.isArray(history)) return [];
@@ -247,27 +312,31 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     customSites.forEach((site) => { if (!options.some((item) => item.id === site.id)) options.push({ ...site, managed: true }); });
     const selected = new Set(settings.pinned.sites || []);
     if (pinnedSiteSummary) {
-      const selectedNames = options.filter((site) => selected.has(site.id)).map((site) => site.name);
-      pinnedSiteSummary.textContent = selectedNames.length ? selectedNames.join('、') : '未选择';
+      const selectedNames = options.filter((site) => selected.has(site.id)).map((site) => sourceLabel(site));
+      // 站点名整体列出来会被截断成「Google、百度、谷歌学术、DuckDuckGo、360 搜索、搜…」，
+      // 行内只留数量，名单挂在 title 上（点「管理」也能看到全部）。
+      pinnedSiteSummary.textContent = selectedNames.length ? countText(selectedNames.length, '1 个站点', '{n} 个站点') : t('未选择');
+      pinnedSiteSummary.title = selectedNames.join(getLocale() === 'en' ? ', ' : '、');
     }
     pinnedSiteList.replaceChildren();
     options.forEach((site) => {
+      const siteName = sourceLabel(site);
       const label = document.createElement('label');
       label.className = 'site-option managed-site' + (site.custom ? ' custom-site' : '');
       if (site.url) label.title = site.url;
       const input = document.createElement('input');
-      input.type = 'checkbox'; input.dataset.siteId = site.id; input.checked = selected.has(site.id); input.setAttribute('aria-label', site.name);
+      input.type = 'checkbox'; input.dataset.siteId = site.id; input.checked = selected.has(site.id); input.setAttribute('aria-label', siteName);
       const name = document.createElement('span');
-      name.textContent = site.name + (site.source && !PINNED_SITES.some((item) => item.id === site.id) ? ' · 搜索源' : '');
+      name.textContent = siteName + (site.source && !PINNED_SITES.some((item) => item.id === site.id) ? t(' · 搜索源') : '');
       label.append(input, name);
       if (site.managed) {
         const edit = document.createElement('button');
-        edit.type = 'button'; edit.className = 'site-edit'; edit.title = '编辑站点'; edit.setAttribute('aria-label', '编辑' + site.name + '站点');
+        edit.type = 'button'; edit.className = 'site-edit'; edit.title = t('编辑站点'); edit.setAttribute('aria-label', t('编辑{n}站点', { n: siteName }));
         edit.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"></path></svg>';
         edit.addEventListener('click', (event) => { event.preventDefault(); startPinnedSiteEdit(site); });
         label.append(edit);
         const remove = document.createElement('button');
-        remove.type = 'button'; remove.className = 'site-remove'; remove.title = '删除站点'; remove.setAttribute('aria-label', '删除' + site.name + '站点');
+        remove.type = 'button'; remove.className = 'site-remove'; remove.title = t('删除站点'); remove.setAttribute('aria-label', t('删除{n}站点', { n: siteName }));
         remove.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>';
         remove.addEventListener('click', (event) => {
           event.preventDefault();
@@ -282,14 +351,27 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     });
   }
 
+  /**
+   * 「已启用」这一行只决定常驻栏在哪些站点出现。勾上「所有站点都显示」之后，
+   * 常驻栏在每个页面都会出现，站点名单不再影响任何东西——留着这行反而让人以为
+   * 还得在这里挑站点。所以两者互斥：全站显示时收起整行，关掉开关再放回来。
+   *
+   * 显隐用 hidden 属性而不是条件渲染：这一行的内容是同步渲染的摘要 + 一个弹窗入口，
+   * 拆掉重排既没必要，也会让「管理常驻站点」的焦点还原失效。
+   */
+  function syncPinnedSitesRow() {
+    if (!pinnedSitesRow) return;
+    pinnedSitesRow.hidden = pinnedAllSitesInput?.checked === true;
+  }
+
   function startPinnedSiteEdit(site) {
     if (!site || !pinnedSiteForm) return;
     pinnedSiteEditingId = site.id;
     pinnedSiteNameInput.value = site.name || '';
     pinnedSiteUrlInput.value = site.url || '';
     pinnedSiteSelectorInput.value = site.selector || '';
-    pinnedSiteFormTitle.textContent = '编辑常驻站点';
-    pinnedSiteSubmit.textContent = '保存修改';
+    pinnedSiteFormTitle.textContent = t('编辑常驻站点');
+    pinnedSiteSubmit.textContent = t('保存');
     cancelPinnedSiteEdit.hidden = false;
     pinnedSiteError.textContent = '';
     pinnedSiteNameInput.focus();
@@ -298,8 +380,8 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   function resetPinnedSiteForm() {
     pinnedSiteEditingId = null;
     pinnedSiteForm?.reset();
-    if (pinnedSiteFormTitle) pinnedSiteFormTitle.textContent = '添加常驻站点';
-    if (pinnedSiteSubmit) pinnedSiteSubmit.textContent = '添加站点';
+    if (pinnedSiteFormTitle) pinnedSiteFormTitle.textContent = t('添加常驻站点');
+    if (pinnedSiteSubmit) pinnedSiteSubmit.textContent = t('添加');
     if (cancelPinnedSiteEdit) cancelPinnedSiteEdit.hidden = true;
     if (pinnedSiteError) pinnedSiteError.textContent = '';
   }
@@ -310,12 +392,9 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   // 全新安装（存储里既没有 sources/groups，也没有旧版 engines/iconOnly 痕迹）直接落在默认
   // 配置上。已有配置一律走版本迁移：旧版安装的 engines/iconOnly/customEngines 只能靠
   // 「sources 为空时按开关重建内置源」那条回落路径读出来，所以默认值不能塞进 DEFAULTS，
-  // 否则会把旧安装的源开关冲掉。
+  // 否则会把旧安装的源开关冲掉。判据与弹窗共用 shared/defaults.ts 的 freshInstallSeed。
   function defaultConfigSeed(stored: any) {
-    const storedGroups: any[] = Array.isArray(stored.groups) ? stored.groups : [];
-    const hasConfiguredList = Array.isArray(stored.sources) && (stored.sources.length > 0 || storedGroups.some((group) => group?.id === 'default'));
-    const hasLegacyConfig = LEGACY_KEYS.some((key) => Object.prototype.hasOwnProperty.call(stored, key));
-    return hasConfiguredList || hasLegacyConfig ? {} : { sources: DEFAULT_SOURCES, groups: DEFAULT_GROUPS };
+    return freshInstallSeed(stored);
   }
 
   function normalizeSettings(stored) {
@@ -353,6 +432,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     };
     return { enabled: stored.enabled !== false, triggerMode: stored.triggerMode === 'hover' ? 'hover' : 'click',
     editableTriggerMode, defaultGroupCount: count, selectionTriggerDelay,
+    language: normalizeLocale(stored.language),
     llmDockVisible: stored.llmDockVisible !== false, general, pinned, llm, searchHistory: normalizeSearchHistory(stored.searchHistory) };
   }
 
@@ -367,8 +447,8 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     const status = saveStates[panel || activePanel];
     if (!status) return;
     status.classList.remove('is-error');
-    status.textContent = '已保存';
-    window.setTimeout(() => { if (status.textContent === '已保存') status.textContent = ''; }, 1200);
+    status.textContent = t('已保存');
+    window.setTimeout(() => { if (status.textContent === t('已保存')) status.textContent = ''; }, 1200);
   }
 
   /**
@@ -377,13 +457,13 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
    */
   function saveFailureReason(): string {
     const message = chrome.runtime?.lastError?.message || '';
-    if (/MAX_WRITE_OPERATIONS/i.test(message)) return '保存失败：写入过于频繁，稍后再试。';
+    if (/MAX_WRITE_OPERATIONS/i.test(message)) return t('保存失败：写入过于频繁，稍后再试。');
     // 单键上限是 8192 字节。实测浏览器返回 Resource::kQuotaBytesPerItem quota exceeded，
     // 两种配额错误都可能带 "quota" 字样，所以先排掉频率那个。
     if (/QUOTA_BYTES|kQuotaBytes|quota/i.test(message)) {
-      return '保存失败：换成浏览器同步后超出单键容量上限（8 KB）。占位最大的是自定义图标，可改用图标地址或精简搜索源。';
+      return t('保存失败：换成浏览器同步后超出单键容量上限（8 KB）。占位最大的是自定义图标，可改用图标地址或精简搜索源。');
     }
-    return '保存失败：' + (message || '浏览器未接受这次写入。');
+    return t('保存失败：{n}', { n: message || t('浏览器未接受这次写入。') });
   }
 
   function showSaveFailed(panel?: string): void {
@@ -413,17 +493,48 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       enabled: settings.enabled, triggerMode: settings.triggerMode, defaultGroupCount: settings.defaultGroupCount,
       editableTriggerMode: settings.editableTriggerMode,
       selectionTriggerDelay: settings.selectionTriggerDelay,
+      language: settings.language,
       llmDockVisible: settings.llmDockVisible,
       llm: settings.llm,
-      sources: settings.general.sources, groups: settings.general.groups, sourceConfigVersion: CONFIG_VERSION
+      sources: settings.general.sources, groups: settings.general.groups, specialActions: settings.general.actions, sourceConfigVersion: CONFIG_VERSION
     }, statusPanel);
   }
   function savePinned() { settings.pinned.siteConfigVersion = PINNED_SITE_CONFIG_VERSION; writeSync({ pinnedSearch: settings.pinned }, 'pinned'); }
   function saveCurrent() { saveGeneral(activePanel); }
+  /** 会员记录单独一个键：激活不改动 sources/groups，没必要把整份配置一起重写。 */
+  function saveLicense() { writeSync({ license: license ? toSyncRecord(license) : null }, 'about'); }
+
+  /**
+   * 语言切换的唯一生效点。
+   *
+   * 静态文案由 index.html 上的 `data-i18n*` 标记驱动，动态列表（分组标签、搜索源行、
+   * 特殊按钮、配额提示、历史、关于）必须整体重画——它们的文案是渲染时拼出来的，
+   * 只换 data-i18n 覆盖不到。弹窗标题与提交按钮由编辑态决定，所以单独补一次。
+   */
+  function applyInterfaceLanguage() {
+    const locale = setLocale(settings?.language);
+    document.documentElement.lang = locale;
+    document.title = t('QuickFind 设置');
+    applyI18n(document);
+    languageInputs.forEach((input) => { input.checked = input.value === locale; });
+    if (!settings) return;
+    renderManager();
+    if (activePanel === 'history') renderHistory();
+    else if (activePanel === 'notes') renderNotes();
+    else if (activePanel === 'about') renderAbout();
+    if (formTitle && submitLabel) {
+      formTitle.textContent = editing?.panel === MANAGER_PANEL ? t('编辑搜索源') : t('添加搜索源');
+      submitLabel.textContent = editing?.panel === MANAGER_PANEL ? t('保存') : t('添加');
+    }
+    if (pinnedSiteFormTitle && pinnedSiteSubmit) {
+      pinnedSiteFormTitle.textContent = pinnedSiteEditingId ? t('编辑常驻站点') : t('添加常驻站点');
+      pinnedSiteSubmit.textContent = pinnedSiteEditingId ? t('保存') : t('添加');
+    }
+  }
 
   function formatHistoryTimestamp(timestamp) {
     if (!Number.isFinite(timestamp) || Math.abs(timestamp) > 8640000000000000) return '';
-    return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp));
+    return new Intl.DateTimeFormat(localeTag(), { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp));
   }
 
   function saveHistory() {
@@ -500,7 +611,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
         saved = true;
       } catch { /* ignore */ }
       if (!saved) {
-        if (notesSaveState) notesSaveState.textContent = '保存失败';
+        if (notesSaveState) notesSaveState.textContent = t('保存失败');
         return;
       }
       showSaved('notes');
@@ -535,7 +646,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   function scheduleNotesSave() {
     window.clearTimeout(notesSaveTimer);
     notesSaveTimer = window.setTimeout(() => { notesSaveTimer = null; void persistNotes(); }, 350);
-    if (notesSaveState) notesSaveState.textContent = '保存中…';
+    if (notesSaveState) notesSaveState.textContent = t('保存中…');
   }
 
   function cloneNotesState(state = notesState) {
@@ -599,7 +710,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     hitRoot: () => document,
     overlayRoot: () => document.body,
     scrollContainer: () => document.scrollingElement as HTMLElement | null,
-    ghostText: (id) => String(noteById(id)?.text || '').trim() || '未命名项目',
+    ghostText: (id) => String(noteById(id)?.text || '').trim() || t('未命名项目'),
     canDropOn: (sourceId, targetId) => targetId !== sourceId && !isNoteDescendant(targetId, sourceId),
     onDrop: (sourceId, targetId, zone) => moveNote(sourceId, targetId, zone)
   });
@@ -616,7 +727,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     input.setSelectionRange(start, end, selection?.direction || 'none');
   }
   function renderNotes(focusId = null, focusSelection = null) {
-    if (!notesOutline || !notesLoaded) { if (notesOutline) notesOutline.textContent = '正在加载笔记…'; if (addNoteButton) addNoteButton.disabled = true; return; }
+    if (!notesOutline || !notesLoaded) { if (notesOutline) notesOutline.textContent = t('正在加载笔记…'); if (addNoteButton) addNoteButton.disabled = true; return; }
     if (addNoteButton) addNoteButton.disabled = false;
     const focusRestoreToken = ++notesFocusRestoreToken;
     // Rebuilding the list replaces the textarea, so carry its selection across the render.
@@ -632,17 +743,17 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     const visible = visibleNoteIds(query); notesOutline.classList.toggle('zoomed', visible.scopeRoot?.id !== 'root'); notesOutline.replaceChildren();
     if (notesSearchResult) {
       const matchCount = query ? outlineCountMatches(notesState, notesZoomRootId, query) : 0;
-      notesSearchResult.textContent = query ? ('找到 ' + matchCount + ' 项') : '';
+      notesSearchResult.textContent = query ? t('找到 {n} 项', { n: matchCount }) : '';
     }
     if (visible.scopeRoot && visible.scopeRoot.id !== 'root') {
       const heading = document.createElement('div');
       heading.className = 'notes-zoom-heading';
-      heading.textContent = visible.scopeRoot.text.trim() || '未命名项目';
+      heading.textContent = visible.scopeRoot.text.trim() || t('未命名项目');
       notesOutline.append(heading);
     }
     if (!visible.ids.length) {
       const empty = document.createElement('div'); empty.className = 'notes-empty';
-      empty.textContent = query ? '没有匹配的笔记' : (visible.scopeRoot?.id === 'root' ? '还没有笔记项目，点击“新建项目”开始。' : '这个项目还没有子项目，按 Enter 新建。'); notesOutline.append(empty);
+      empty.textContent = query ? t('没有匹配的笔记') : (visible.scopeRoot?.id === 'root' ? t('还没有笔记项目') : t('还没有子项目')); notesOutline.append(empty);
     } else visible.ids.forEach((id) => {
       const node = noteById(id); const row = document.createElement('div');
       row.className = 'note-row' + (node.completed ? ' completed' : '') + (query && node.text.toLocaleLowerCase().includes(query) ? ' search-match' : '');
@@ -651,19 +762,19 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       row.setAttribute('aria-expanded', node.children.length ? String(!node.collapsed) : 'false'); row.style.paddingLeft = (6 + noteDepth(id, visible.scopeRoot?.id || 'root') * 24) + 'px';
       const toggle = document.createElement('button'); toggle.type = 'button';
       toggle.className = 'note-toggle' + (node.collapsed ? ' collapsed' : '');
-      toggle.disabled = !node.children.length; toggle.setAttribute('aria-label', node.children.length ? (node.collapsed ? '展开项目' : '收起项目') : '没有子项目');
+      toggle.disabled = !node.children.length; toggle.setAttribute('aria-label', node.children.length ? (node.collapsed ? t('展开项目') : t('收起项目')) : t('没有子项目'));
       toggle.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 6 5-6"></path></svg>';
       toggle.addEventListener('click', () => { if (!node.children.length) return;
       const before = cloneNotesState(); node.collapsed = !node.collapsed; pushNotesHistory(before); node.updatedAt = Date.now(); scheduleNotesSave(); renderNotes(id); });
       const complete = document.createElement('button'); complete.type = 'button';
-      complete.className = 'note-complete'; complete.setAttribute('aria-label', node.completed ? '标记未完成' : '标记完成');
-      complete.title = node.completed ? '标记未完成' : '标记完成'; complete.innerHTML = node.completed ?
+      complete.className = 'note-complete'; complete.setAttribute('aria-label', node.completed ? t('标记未完成') : t('标记完成'));
+      complete.title = node.completed ? t('标记未完成') : t('标记完成'); complete.innerHTML = node.completed ?
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>' : '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle></svg>';
       complete.addEventListener('click', () => { const before = cloneNotesState();
       node.completed = !node.completed; node.updatedAt = Date.now(); pushNotesHistory(before); scheduleNotesSave(); renderNotes(id); });
-      const bullet = document.createElement('button'); bullet.type = 'button'; bullet.className = 'note-bullet'; bullet.setAttribute('aria-label', '专注此项目');
+      const bullet = document.createElement('button'); bullet.type = 'button'; bullet.className = 'note-bullet'; bullet.setAttribute('aria-label', t('专注此项目'));
       const input = document.createElement('textarea'); input.className = 'note-input';
-      input.rows = 1; input.value = node.text; input.setAttribute('aria-label', '大纲项目');
+      input.rows = 1; input.value = node.text; input.setAttribute('aria-label', t('大纲项目'));
       input.dataset.noteId = id; input.addEventListener('input', () => { beginNotesHistory(id);
       node.text = input.value; node.updatedAt = Date.now();
       resizeNoteInput(input); updateNotesBreadcrumb(id); scheduleNotesSave();
@@ -689,8 +800,8 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     if (!notesBreadcrumb) return;
     const zoomPath = notePath(notesZoomRootId);
     const path = notesZoomRootId !== 'root' ? zoomPath : notePath(id || notesActiveId);
-    notesBreadcrumb.textContent = path.length ? path.join(' / ') : '根目录';
-    if (notesHomeButton) notesHomeButton.textContent = notesZoomRootId === 'root' ? '根目录' : '返回上级';
+    notesBreadcrumb.textContent = path.length ? path.join(' / ') : '';
+    if (notesHomeButton) notesHomeButton.textContent = notesZoomRootId === 'root' ? t('根目录') : t('返回上级');
   }
   function zoomIntoNote(id) {
     const node = noteById(id); if (!node) return;
@@ -800,7 +911,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   function parseMarkdownNotes(text) { return outlineParseMarkdownNotes(text, noteId); }
   function importNotes(file) { if (!file) return; const reader = new FileReader();
   reader.onload = () => { try { const content = String(reader.result || '');
-  const parsed = /\.m(?:d|arkdown)$/i.test(file.name || '') ? parseMarkdownNotes(content) : JSON.parse(content); const normalized = normalizeNotes(parsed); if (Object.keys(normalized.nodes).length <= 1 && content.trim()) throw new Error(); const before = cloneNotesState(); notesState = normalized; notesUndoStack.push(before); if (notesUndoStack.length > NOTES_HISTORY_LIMIT) notesUndoStack.shift(); notesRedoStack = []; notesActiveId = null; notesZoomRootId = 'root'; updateNotesHistoryButtons(); scheduleNotesSave(); renderNotes(); } catch { window.alert('导入失败：请选择有效的 JSON 或 Markdown 大纲文件。'); } }; reader.readAsText(file); }
+  const parsed = /\.m(?:d|arkdown)$/i.test(file.name || '') ? parseMarkdownNotes(content) : JSON.parse(content); const normalized = normalizeNotes(parsed); if (Object.keys(normalized.nodes).length <= 1 && content.trim()) throw new Error(); const before = cloneNotesState(); notesState = normalized; notesUndoStack.push(before); if (notesUndoStack.length > NOTES_HISTORY_LIMIT) notesUndoStack.shift(); notesRedoStack = []; notesActiveId = null; notesZoomRootId = 'root'; updateNotesHistoryButtons(); scheduleNotesSave(); renderNotes(); } catch { window.alert(t('导入失败：请选择有效的 JSON 或 Markdown 大纲文件。')); } }; reader.readAsText(file); }
 
   function renderHistory() {
     if (!historyRecordList || !settings) return;
@@ -810,18 +921,18 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     });
     historyRecordList.replaceChildren();
     if (!history.length) {
-      historyRecordList.innerHTML = '<div class="history-empty">暂无搜索历史</div>';
+      historyRecordList.innerHTML = '<div class="history-empty">' + t('暂无搜索历史') + '</div>';
     } else {
       history.forEach((entry, index) => {
         const row = document.createElement('div');
         row.className = 'history-record';
         const select = document.createElement('label');
         select.className = 'check';
-        select.title = '选择历史记录';
+        select.title = t('选择历史记录');
         const input = document.createElement('input');
         input.type = 'checkbox';
         input.checked = selectedHistoryIndexes.has(index);
-        input.setAttribute('aria-label', '选择历史记录：' + entry.query);
+        input.setAttribute('aria-label', t('选择历史记录：{n}', { n: entry.query }));
         input.addEventListener('change', () => {
           if (input.checked) selectedHistoryIndexes.add(index);
           else selectedHistoryIndexes.delete(index);
@@ -841,20 +952,20 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
         const actions = document.createElement('div');
         actions.className = 'history-record-actions';
         actions.append(
-          iconButton('copy', '复制历史记录', () => copyHistoryEntry(entry, actions.firstElementChild)),
-          iconButton('remove', '删除历史记录', () => removeHistoryAt(index))
+          iconButton('copy', t('复制历史记录'), () => copyHistoryEntry(entry, actions.firstElementChild)),
+          iconButton('remove', t('删除历史记录'), () => removeHistoryAt(index))
         );
         row.append(select, query, time, actions);
         historyRecordList.append(row);
       });
     }
-    if (historySelectionCount) historySelectionCount.textContent = '已选 ' + selectedHistoryIndexes.size + ' 项';
+    if (historySelectionCount) historySelectionCount.textContent = selectedHistoryIndexes.size ? t('已选 {n} 项', { n: selectedHistoryIndexes.size }) : '';
     const allSelected = history.length > 0 && selectedHistoryIndexes.size === history.length;
     if (selectAllHistory) {
       selectAllHistory.disabled = history.length === 0;
       selectAllHistory.setAttribute('aria-pressed', String(allSelected));
-      selectAllHistory.setAttribute('aria-label', allSelected ? '取消全选历史记录' : '全选历史记录');
-      selectAllHistory.title = allSelected ? '取消全选历史记录' : '全选历史记录';
+      selectAllHistory.setAttribute('aria-label', allSelected ? t('取消全选历史记录') : t('全选历史记录'));
+      selectAllHistory.title = allSelected ? t('取消全选历史记录') : t('全选历史记录');
       selectAllHistory.innerHTML = allSelected
         ? '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"></rect><path d="m8 12 2.5 2.5L16 9"></path></svg>'
         : '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"></rect></svg>';
@@ -887,17 +998,17 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
         throw new Error('copy failed');
       }
       clearTimeout(button._copyFeedbackTimer);
-      const originalLabel = button.dataset.originalLabel || '复制历史记录';
+      const originalLabel = button.dataset.originalLabel || t('复制历史记录');
       button.dataset.originalLabel = originalLabel;
-      button.setAttribute('aria-label', '已复制'); button.title = '已复制';
+      button.setAttribute('aria-label', t('已复制')); button.title = t('已复制');
       button._copyFeedbackTimer = window.setTimeout(() => {
         button.setAttribute('aria-label', originalLabel); button.title = originalLabel;
       }, 1200);
     } catch {
-      button.setAttribute('aria-label', '复制失败'); button.title = '复制失败';
+      button.setAttribute('aria-label', t('复制失败')); button.title = t('复制失败');
       clearTimeout(button._copyFeedbackTimer);
       button._copyFeedbackTimer = window.setTimeout(() => {
-        button.setAttribute('aria-label', '复制历史记录'); button.title = '复制历史记录';
+        button.setAttribute('aria-label', t('复制历史记录')); button.title = t('复制历史记录');
       }, 1200);
     }
   }
@@ -927,7 +1038,6 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'icon-button'; button.title = title; button.setAttribute('aria-label', title);
     const icons = {
-      fetch: '<svg viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0-14.7-4.7L3 9"></path><path d="M3 4v5h5"></path><path d="M4 13a8.1 8.1 0 0 0 14.7 4.7L21 15"></path><path d="M21 20v-5h-5"></path></svg>',
       copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>',
       edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"></path></svg>',
       remove: '<svg viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2M19 6l-1 14H6L5 6"></path></svg>'
@@ -938,8 +1048,10 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   function makeLogo(source) {
     const logo = document.createElement('button');
     logo.type = 'button'; logo.className = 'source-logo source-logo-button ' + source.className;
-    logo.title = source.iconUrl ? '恢复原始图标' : '更改图标';
-    logo.setAttribute('aria-label', (source.iconUrl ? '恢复' : '更改') + source.name + '的图标');
+    // 图标的所有操作（获取网站图标 / 上传 / 链接 / 恢复默认）都收进了弹窗，
+    // 行上的图标只负责打开它——此前点已改过图标的那个会直接恢复，等于一个没有提示的破坏操作。
+    logo.title = t('更改图标');
+    logo.setAttribute('aria-label', t('更改{n}的图标', { n: sourceLabel(source) }));
     if (source.iconUrl) {
       const iconUrl = String(source.iconUrl);
       let cached = iconNodeCache.get(source.id);
@@ -961,14 +1073,14 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       if (!cached.failed) logo.append(cached.image);
     }
     if (!logo.childElementCount) logo.textContent = source.mark;
-    logo.addEventListener('click', () => source.iconUrl ? restoreSourceIcon(source) : openIconEditor(source));
+    logo.addEventListener('click', () => openIconEditor(source));
     return logo;
   }
 
   function addDragBehavior(row, item) {
     row.draggable = true;
     row.addEventListener('dragstart', (event) => {
-      const selected = item.type === 'source' ? selectedSourceIds : null;
+      const selected = item.type === 'source' ? selectedItemIds : null;
       const ids = selected?.has(item.id) ? Array.from(selected) : [item.id];
       draggedItem = { ...item, ids };
       row.classList.add('dragging'); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', ids.join(','));
@@ -993,36 +1105,38 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
 
   function createSourceRow(source) {
     const row = document.createElement('div');
+    const displayName = sourceLabel(source);
     row.className = 'source-row'; row.dataset.sourceId = source.id;
     addDragBehavior(row, { panel: MANAGER_PANEL, id: source.id, type: 'source' });
     const handle = document.createElement('span');
-    handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = '拖动排序，或拖到分组标签中移动'; handle.setAttribute('aria-hidden', 'true');
+    handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = t('拖动排序，或拖到分组标签中移动'); handle.setAttribute('aria-hidden', 'true');
     const select = document.createElement('label');
-    select.className = 'source-select'; select.title = '选择搜索源';
+    select.className = 'source-select'; select.title = t('选择搜索源');
     const selectInput = document.createElement('input');
-    selectInput.type = 'checkbox'; selectInput.checked = selectedSourceIds.has(source.id); selectInput.setAttribute('aria-label', '选择' + source.name);
-    selectInput.addEventListener('change', () => { if (selectInput.checked) selectedSourceIds.add(source.id); else selectedSourceIds.delete(source.id); renderBatchActions(); });
+    selectInput.type = 'checkbox'; selectInput.checked = selectedItemIds.has(source.id); selectInput.setAttribute('aria-label', t('选择{n}按钮', { n: displayName }));
+    selectInput.addEventListener('change', () => { if (selectInput.checked) selectedItemIds.add(source.id); else selectedItemIds.delete(source.id); renderBatchActions(); });
     select.append(selectInput);
     const meta = document.createElement('div');
     meta.className = 'source-meta';
     const sourceName = document.createElement('strong');
-    sourceName.textContent = source.name;
-    const sourceDetail = document.createElement('small');
-    sourceDetail.textContent = source.detail || source.url;
-    meta.append(sourceName, sourceDetail);
+    sourceName.textContent = displayName;
+    // URL 模板与说明放在 title 里，不在行内常驻：设置页只呈现「是什么」和「能改什么」，
+    // 说明性文字（怎么用、会发生什么）一律不占版面。见 MEMORY.md「界面文案」。
+    meta.title = t(String(source.detail || source.url || ''));
+    meta.append(sourceName);
     const actions = document.createElement('div');
     actions.className = 'source-actions';
-    actions.append(iconButton('fetch', '获取网站图标', () => fetchSourceIcon(source)), iconButton('edit', '编辑搜索源', () => startEdit(source)), iconButton('remove', '删除搜索源', () => removeSource(source.id)));
+    actions.append(iconButton('edit', t('编辑搜索源'), () => startEdit(source)), iconButton('remove', t('删除搜索源'), () => removeSource(source.id)));
     const iconOnly = document.createElement('label');
-    iconOnly.className = 'icon-only-setting'; iconOnly.title = '仅显示图标';
+    iconOnly.className = 'icon-only-setting'; iconOnly.title = t('仅显示图标');
     const iconOnlyInput = document.createElement('input');
-    iconOnlyInput.type = 'checkbox'; iconOnlyInput.checked = source.iconOnly; iconOnlyInput.setAttribute('aria-label', source.name + '仅显示图标');
+    iconOnlyInput.type = 'checkbox'; iconOnlyInput.checked = source.iconOnly; iconOnlyInput.setAttribute('aria-label', t('{n}仅显示图标', { n: displayName }));
     iconOnlyInput.addEventListener('change', (event) => { source.iconOnly = event.target.checked; saveCurrent(); });
     iconOnly.append(iconOnlyInput);
     const enabled = document.createElement('label');
-    enabled.className = 'check'; enabled.title = '启用搜索源';
+    enabled.className = 'check'; enabled.title = t('启用搜索源');
     const enabledInput = document.createElement('input');
-    enabledInput.type = 'checkbox'; enabledInput.checked = source.enabled; enabledInput.setAttribute('aria-label', source.name + '启用');
+    enabledInput.type = 'checkbox'; enabledInput.checked = source.enabled; enabledInput.setAttribute('aria-label', t('{n}启用', { n: displayName }));
     const enabledMark = document.createElement('span');
     enabledMark.className = 'checkmark';
     enabledInput.addEventListener('change', (event) => { source.enabled = event.target.checked; saveCurrent(); });
@@ -1031,54 +1145,85 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     return row;
   }
 
-  function createSpecialActionRow(action) {
+  function createSpecialActionRow(action: SearchSource) {
     const row = document.createElement('div');
     const token = specialActionToken(action.id);
+    const displayName = specialActionName(action);
     row.className = 'source-row special-action-row'; row.dataset.actionId = action.id;
     addDragBehavior(row, { panel: MANAGER_PANEL, id: token, type: 'action' });
     const handle = document.createElement('span');
-    handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = '拖动调整位置，或拖到分组标签中移动'; handle.setAttribute('aria-hidden', 'true');
+    handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = t('拖动调整位置，或拖到分组标签中移动'); handle.setAttribute('aria-hidden', 'true');
+    // 多选：与搜索源共用同一份选中集合，批移与批删都认 `action:<id>`。
+    const select = document.createElement('label');
+    select.className = 'source-select'; select.title = t('选择{n}按钮', { n: displayName });
+    const selectInput = document.createElement('input');
+    selectInput.type = 'checkbox'; selectInput.checked = selectedItemIds.has(token); selectInput.setAttribute('aria-label', t('选择{n}按钮', { n: displayName }));
+    selectInput.addEventListener('change', () => {
+      if (selectInput.checked) selectedItemIds.add(token); else selectedItemIds.delete(token);
+      renderBatchActions();
+    });
+    select.append(selectInput);
     const logo = document.createElement('span');
     logo.className = 'source-logo ' + action.className; logo.textContent = String(action.mark || '');
     const meta = document.createElement('div');
     meta.className = 'source-meta';
-    const name = document.createElement('strong'); name.textContent = action.name;
-    const detail = document.createElement('small'); detail.textContent = String(action.detail || '');
-    meta.append(name, detail);
+    const name = document.createElement('strong'); name.textContent = displayName;
+    meta.title = t(String(action.detail || action.specialTitle || ''));
+    meta.append(name);
+    // 与搜索源行对齐：改名、删除都在这一列。
     const actions = document.createElement('div');
     actions.className = 'source-actions';
-    actions.append(iconButton('remove', '从分组移除', () => removeSpecialAction(action.id)));
-    row.append(handle, logo, meta, actions);
+    actions.append(iconButton('edit', t('重命名按钮'), () => renameSpecialAction(action)), iconButton('remove', t('从分组移除'), () => removeSpecialAction(action.id)));
+    // 仅图标：存进 general.actions，由 shared/settings-store 收敛后交给浮层与常驻栏渲染。
+    const iconOnly = document.createElement('label');
+    iconOnly.className = 'icon-only-setting'; iconOnly.title = t('仅显示图标');
+    const iconOnlyInput = document.createElement('input');
+    iconOnlyInput.type = 'checkbox'; iconOnlyInput.checked = specialActionSettings(action.id).iconOnly === true;
+    iconOnlyInput.setAttribute('aria-label', t('{n}仅显示图标', { n: displayName }));
+    iconOnlyInput.addEventListener('change', () => setSpecialActionIconOnly(action.id, iconOnlyInput.checked));
+    iconOnly.append(iconOnlyInput);
+    // 启用列与搜索源同一位置：动作也可以整体停用，停用后三个入口都不再出现它。
+    const enabled = document.createElement('label');
+    enabled.className = 'check'; enabled.title = t('启用按钮');
+    const enabledInput = document.createElement('input');
+    enabledInput.type = 'checkbox'; enabledInput.checked = specialActionSettings(action.id).enabled !== false;
+    enabledInput.setAttribute('aria-label', t('{n}启用', { n: displayName }));
+    const enabledMark = document.createElement('span');
+    enabledMark.className = 'checkmark';
+    enabledInput.addEventListener('change', () => setSpecialActionEnabled(action.id, enabledInput.checked));
+    enabled.append(enabledInput, enabledMark);
+    row.append(handle, select, logo, meta, actions, iconOnly, enabled);
     return row;
   }
 
   function createGroupRow(group) {
     const token = 'group:' + group.id;
+    const displayName = groupLabel(group);
     const row = document.createElement('div');
     row.className = 'source-row derived-group-row'; row.dataset.groupId = group.id;
     addDragBehavior(row, { panel: MANAGER_PANEL, id: token, type: 'group' });
     const handle = document.createElement('span');
-    handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = '拖动排序'; handle.setAttribute('aria-hidden', 'true');
+    handle.className = 'drag-handle'; handle.textContent = '⠿'; handle.title = t('拖动排序'); handle.setAttribute('aria-hidden', 'true');
     const open = document.createElement('button');
-    open.type = 'button'; open.className = 'source-logo source-logo-button group'; open.title = '打开' + group.name; open.textContent = '组';
+    open.type = 'button'; open.className = 'source-logo source-logo-button group'; open.title = t('打开{n}', { n: displayName }); open.textContent = t('组');
     open.addEventListener('click', () => { managerGroupId = group.id; renderManager(); });
     const meta = document.createElement('button');
-    meta.type = 'button'; meta.className = 'source-meta group-meta-button'; meta.title = '打开' + group.name;
+    meta.type = 'button'; meta.className = 'source-meta group-meta-button'; meta.title = t('打开{n}', { n: displayName });
     const groupName = document.createElement('strong');
-    groupName.textContent = group.name;
+    groupName.textContent = displayName;
     const groupDetail = document.createElement('small');
-    groupDetail.textContent = group.items.length + ' 个搜索源';
+    groupDetail.textContent = countText(group.items.length, '1 个搜索源', '{n} 个搜索源');
     meta.append(groupName, groupDetail);
     meta.addEventListener('click', () => { managerGroupId = group.id; renderManager(); });
     const actions = document.createElement('div');
     actions.className = 'source-actions';
-    actions.append(iconButton('edit', '重命名分组', () => renameGroup(group)), iconButton('remove', '删除分组', () => removeGroup(group.id)));
+    actions.append(iconButton('edit', t('重命名分组'), () => renameGroup(group)), iconButton('remove', t('删除分组'), () => removeGroup(group.id)));
     const spacer = document.createElement('span');
     spacer.className = 'source-control-spacer';
     const visible = document.createElement('label');
-    visible.className = 'check'; visible.title = '在搜索列表中显示';
+    visible.className = 'check'; visible.title = t('在搜索列表中显示');
     const visibleInput = document.createElement('input');
-    visibleInput.type = 'checkbox'; visibleInput.checked = group.visible; visibleInput.setAttribute('aria-label', group.name + '在搜索列表中显示');
+    visibleInput.type = 'checkbox'; visibleInput.checked = group.visible; visibleInput.setAttribute('aria-label', t('{n}在搜索列表中显示', { n: displayName }));
     const visibleMark = document.createElement('span');
     visibleMark.className = 'checkmark';
     visibleInput.addEventListener('change', (event) => { group.visible = event.target.checked; saveCurrent(); });
@@ -1092,9 +1237,9 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     config().groups.forEach((group) => {
       const tab = document.createElement('button');
       tab.type = 'button'; tab.className = 'group-tab' + (group.id === managerGroupId ? ' active' : '');
-      tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(group.id === managerGroupId)); tab.textContent = group.name;
+      tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(group.id === managerGroupId)); tab.textContent = groupLabel(group);
       tab.draggable = group.id !== 'default';
-      tab.title = group.id === 'default' ? '默认组，可拖入搜索源或特殊功能按钮' : '打开' + group.name + '，可将搜索源或特殊功能按钮拖到此处，也可拖动标签调整分组顺序';
+      tab.title = group.id === 'default' ? t('默认组，可拖入搜索源或特殊功能按钮') : t('打开{n}，可将搜索源或特殊功能按钮拖到此处，也可拖动标签调整分组顺序', { n: groupLabel(group) });
       tab.addEventListener('click', () => { managerGroupId = group.id; resetForm(); renderManager(); });
       tab.addEventListener('dragstart', (event) => {
         if (group.id === 'default') return;
@@ -1153,10 +1298,9 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       const source = sourceById(item);
       if (source) sourceList.append(createSourceRow(source));
     });
-    if (!sourceList.childElementCount) sourceList.innerHTML = '<div class="empty">这个分组还没有搜索源</div>';
-    activeGroupMeta.textContent = group.id === 'default'
-      ? '默认组 · ' + group.items.length + ' 个项目（搜索源和自定义组可以一起排序）'
-      : group.name + ' · ' + group.items.length + ' 个搜索源';
+    if (!sourceList.childElementCount) sourceList.innerHTML = '<div class="empty">' + t('这个分组还没有搜索源') + '</div>';
+    // 只给数量：组名已经在选中的标签上，再写一句「搜索源和自定义组可以一起排序」是说明。
+    activeGroupMeta.textContent = countText(group.items.length, '1 项', '{n} 项');
   }
 
   function renderSpecialActions() {
@@ -1169,14 +1313,14 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       logo.className = 'source-logo ' + action.className; logo.textContent = String(action.mark || '');
       const meta = document.createElement('div');
       meta.className = 'special-action-meta';
-      const name = document.createElement('strong'); name.textContent = action.name;
-      const detail = document.createElement('small'); detail.textContent = String(action.detail || '');
-      meta.append(name, detail);
+      const name = document.createElement('strong'); name.textContent = specialActionName(action);
+      meta.title = t(String(action.detail || action.specialTitle || ''));
+      meta.append(name);
       const select = document.createElement('select');
-      select.setAttribute('aria-label', action.name + '按钮所在分组');
-      const none = document.createElement('option'); none.value = ''; none.textContent = '未添加'; select.append(none);
+      select.setAttribute('aria-label', t('{n}按钮所在分组', { n: specialActionName(action) }));
+      const none = document.createElement('option'); none.value = ''; none.textContent = t('未添加'); select.append(none);
       config().groups.forEach((group) => {
-        const option = document.createElement('option'); option.value = group.id; option.textContent = group.name; select.append(option);
+        const option = document.createElement('option'); option.value = group.id; option.textContent = groupLabel(group); select.append(option);
       });
       const token = specialActionToken(action.id);
       const currentGroup = config().groups.find((group) => group.items.includes(token));
@@ -1187,7 +1331,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     });
   }
 
-  function setSpecialActionGroup(actionId, groupId) {
+  function setSpecialActionGroup(actionId: string, groupId: string) {
     const token = specialActionToken(actionId);
     config().groups.forEach((group) => { group.items = group.items.filter((item) => item !== token); });
     if (groupId) groupById(groupId)?.items.push(token);
@@ -1195,8 +1339,32 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     renderManager();
   }
 
-  function removeSpecialAction(actionId) {
+  function removeSpecialAction(actionId: string) {
     setSpecialActionGroup(actionId, '');
+  }
+
+  /**
+   * 改名与分组重命名同一条路径：只有一个字段要填，用 prompt 比开一个弹窗轻。
+   * 清空则回到动作的默认名（不把空串写进存储）。
+   */
+  function renameSpecialAction(action) {
+    const next = window.prompt(t('按钮名称'), specialActionName(action));
+    if (next === null) return;
+    const name = next.trim().slice(0, 24);
+    updateSpecialActionSettings(action.id, { name });
+    saveCurrent(); renderManager();
+  }
+
+  /** 停用只影响三个入口的列表；按钮仍留在分组里，随时可以再打开。 */
+  function setSpecialActionEnabled(actionId: string, enabled: boolean) {
+    updateSpecialActionSettings(actionId, { enabled });
+    saveCurrent(); renderManager();
+  }
+
+  /** 仅图标只影响显示，不改条目归属；关掉时把键删掉，别在 sync 里留一堆 false。 */
+  function setSpecialActionIconOnly(actionId: string, iconOnly: boolean) {
+    updateSpecialActionSettings(actionId, { iconOnly });
+    saveCurrent();
   }
 
   function renderManager() {
@@ -1204,22 +1372,285 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     renderSpecialActions();
     renderPinnedSiteOptions();
     renderBatchActions();
+    renderQuotaButtons();
     if (pinnedDefaultGroupCountInput) pinnedDefaultGroupCountInput.value = settings.pinned.defaultGroupCount;
+  }
+
+  // ── 关于页：版本与会员 ────────────────────────────────────────────────
+  // 价格、有效期、分组上限都来自 shared/license.ts。这里的 DOM 只把那份声明画出来，
+  // 不另写一份文案——改价只改一处，页面与校验就不会对不上。
+
+  /** 一张套餐卡：名称、价格、两三条权益。当前生效的那张描边强调。 */
+  function createPlanCard(plan: { id: string; label: string; price: string; period: string; features: string[]; hint?: string; current: boolean }): HTMLDivElement {
+    const card = document.createElement('div');
+    card.className = 'plan-card' + (plan.current ? ' is-current' : '');
+    card.dataset.plan = plan.id;
+    if (plan.hint) card.title = t(plan.hint);
+    const head = document.createElement('div');
+    head.className = 'plan-card-head';
+    const name = document.createElement('span');
+    name.className = 'plan-name'; name.textContent = t(plan.label);
+    head.append(name);
+    if (plan.current) {
+      const tag = document.createElement('span');
+      tag.className = 'plan-tag'; tag.textContent = t('当前');
+      head.append(tag);
+    }
+    const price = document.createElement('div');
+    price.className = 'plan-price';
+    const amount = document.createElement('span');
+    amount.className = 'plan-amount'; amount.textContent = t(plan.price);
+    price.append(amount);
+    if (plan.period) {
+      const period = document.createElement('span');
+      period.className = 'plan-period'; period.textContent = t(plan.period);
+      price.append(period);
+    }
+    const features = document.createElement('ul');
+    features.className = 'plan-features';
+    plan.features.forEach((feature) => {
+      const item = document.createElement('li');
+      item.textContent = t(feature);
+      features.append(item);
+    });
+    card.append(head, price, features);
+    return card;
+  }
+
+  function renderPlanCards() {
+    if (!planCards) return;
+    const status = describeLicense(license);
+    const cards = [createPlanCard({
+      id: 'free',
+      label: t('免费版'),
+      price: t('0 元'),
+      period: '',
+      features: [t('最多 {n} 个搜索源分组', { n: FREE_GROUP_LIMIT }), t('最多启用 {n} 个搜索源', { n: FREE_SOURCE_LIMIT })],
+      hint: t('不激活也能用，超出上限的部分需要会员'),
+      current: !status.active,
+    })];
+    PLANS.forEach((plan) => cards.push(createPlanCard({
+      id: plan.id, label: plan.label, price: plan.price, period: plan.period,
+      features: plan.features, hint: plan.hint, current: status.active && status.plan === plan.id,
+    })));
+    planCards.replaceChildren(...cards);
+  }
+
+  /** 配额文案：会员显示「n 个（不限）」，免费显示「n / 上限」。 */
+  function quotaText(quota: { used: number; limit: number; unlimited: boolean }): string {
+    return quota.unlimited ? t('{n} 个（不限）', { n: quota.used }) : t('{n} / {limit}', { n: quota.used, limit: quota.limit });
+  }
+
+  /** 状态、配额、停用按钮、套餐卡四处都由这一份状态驱动，激活与清除后只调它。 */
+  // 只在设置读回之后才会被调到（导航、激活、存储变更三处都各自守着），
+  // 这里不再重复判一次 settings。
+  function renderLicenseState() {
+    if (!licenseStatus) return;
+    const status = describeLicense(license);
+    const expires = formatExpiryDate(status.expiresAt);
+    let text = t(status.label);
+    if (status.active && expires) text = t('{n} · {date} 到期', { n: text, date: expires });
+    if (status.expired && expires) text = t('{n} · {date}', { n: text, date: expires });
+    licenseStatus.textContent = text;
+    licenseStatus.classList.toggle('is-member', status.active);
+    licenseStatus.classList.toggle('is-expired', status.expired);
+    if (licenseGroupQuota) licenseGroupQuota.textContent = quotaText(groupQuota(config().groups, license));
+    if (licenseSourceQuota) licenseSourceQuota.textContent = quotaText(sourceQuota(config().sources, license));
+    if (licenseClearRow) licenseClearRow.hidden = !license;
+    renderPlanCards();
+    renderQuotaButtons();
+  }
+
+  /** 两个「+」的提示里带上各自配额：点之前就能看出还剩几个。 */
+  function renderQuotaButtons() {
+    renderGroupQuotaButton();
+    renderSourceQuotaButton();
+  }
+
+  function renderGroupQuotaButton() {
+    if (!addGroupButton) return;
+    const quota = groupQuota(config().groups, license);
+    addGroupButton.title = quota.unlimited
+      ? t('新建分组（会员不限数量）')
+      : quota.allowed
+        ? t('新建分组（免费版还可建 {n} 个）', { n: quota.remaining })
+        : t('免费版最多创建 {n} 个搜索源分组', { n: FREE_GROUP_LIMIT });
+    addGroupButton.classList.toggle('is-locked', !quota.allowed);
+  }
+
+  function renderSourceQuotaButton() {
+    if (!addSourceButton) return;
+    const quota = sourceQuota(config().sources, license);
+    addSourceButton.title = quota.unlimited
+      ? t('添加搜索源（会员不限数量）')
+      : quota.allowed
+        ? t('添加搜索源（免费版还可启用 {n} 个）', { n: quota.remaining })
+        : t('免费版最多启用 {n} 个搜索源（可先关掉一个）', { n: FREE_SOURCE_LIMIT });
+    addSourceButton.classList.toggle('is-locked', !quota.allowed);
+  }
+
+  function renderAbout() {
+    if (!settings) return;
+    const version = chrome.runtime?.getManifest?.().version;
+    if (aboutVersion) aboutVersion.textContent = version ? 'v' + version : t('开发预览');
+    renderLicenseState();
+    void maybeRefreshLicense();
+  }
+
+  /**
+   * 激活：本地只验「格式像不像」，真伪由服务端回答（`/v1/activate`）。
+   *
+   * 为什么要邮箱：码与购买时填写的邮箱绑定，服务端按邮箱 + 码核验，并把这条记录
+   * 绑到本机设备号上。没有邮箱这一步，「一码一邮箱」就退化成「码可以随便传」。
+   */
+  async function activateLicense() {
+    if (!settings) return;
+    const email = String(licenseEmailInput?.value || '').trim();
+    const raw = String(licenseCodeInput?.value || '').trim();
+    if (!email) {
+      if (licenseError) licenseError.textContent = t('请填写购买时使用的邮箱。');
+      return;
+    }
+    const check = parseActivationCode(raw);
+    if (!check.ok) {
+      if (licenseError) licenseError.textContent = t(check.error);
+      return;
+    }
+    // 请求在飞时再点一次会重复激活：第二次会把第一次刚拿到的续期令牌顶掉。
+    const button = activateLicenseButton;
+    if (button?.disabled) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = t('激活中…');
+    }
+    if (licenseError) licenseError.textContent = '';
+    try {
+      const result = await activateOnServer(email, raw);
+      if (!result.ok) {
+        if (licenseError) licenseError.textContent = t(errorText(result.error));
+        return;
+      }
+      const record = recordFromServer({
+        code: raw,
+        email: result.email,
+        plan: result.plan,
+        expires_at: result.expires_at,
+        license: result.license,
+        refresh: result.refresh,
+      });
+      if (!record) {
+        if (licenseError) licenseError.textContent = t('激活失败，请稍后再试。');
+        return;
+      }
+      license = record;
+      if (record.token && record.refreshToken) {
+        await saveSession({
+          code: record.code,
+          token: record.token,
+          tokenExp: record.tokenExp ?? 0,
+          refreshToken: record.refreshToken,
+          refreshExp: record.refreshExp ?? 0,
+        });
+      }
+      if (licenseCodeInput) licenseCodeInput.value = '';
+      saveLicense();
+      renderLicenseState();
+    } catch {
+      if (licenseError) licenseError.textContent = t('激活失败，请稍后再试。');
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = t('激活');
+      }
+    }
+  }
+
+  /** 许可证快到期就静默续期。失败不打扰用户：服务端仍以会员到期时间为准。 */
+  async function maybeRefreshLicense() {
+    if (!license) return;
+    // 令牌存在 local（每台设备各一份），sync 里那份是老版本遗留的兜底。
+    const session = await readSession();
+    const refreshToken = session?.refreshToken || license.refreshToken;
+    const tokenExp = session?.tokenExp || license.tokenExp || 0;
+    if (!refreshToken || tokenExp - Date.now() > 7 * 24 * 60 * 60 * 1000) return;
+    const result = await refreshLicense(refreshToken);
+    if (!result.ok) return;
+    // 续期回来的令牌先离线验一遍：验不过说明公钥与服务端不匹配（比如换过私钥），
+    // 这时候宁可保留旧记录，也不要把一张验不过的令牌落盘。
+    if (!(await verifyLicenseToken(result.license.token))) return;
+    const record = recordFromServer({
+      code: license.code,
+      email: result.email,
+      plan: result.plan,
+      expires_at: result.expires_at,
+      license: result.license,
+      refresh: result.refresh,
+    });
+    if (!record) return;
+    // 激活时间不跟着续期变，否则一年会员的「起算点」会往后漂。
+    license = { ...record, activatedAt: license.activatedAt };
+    if (record.token && record.refreshToken) {
+      await saveSession({
+        code: record.code,
+        token: record.token,
+        tokenExp: record.tokenExp ?? 0,
+        refreshToken: record.refreshToken,
+        refreshExp: record.refreshExp ?? 0,
+      });
+    }
+    saveLicense();
+    renderLicenseState();
+  }
+
+  /** sync 里只有身份信息，本机的设备凭证在 local：读回来并在内存里并成完整记录。 */
+  async function hydrateSession() {
+    const session = await readSession();
+    if (!session || !license || session.code !== license.code) return;
+    license = {
+      ...license,
+      token: session.token,
+      tokenExp: session.tokenExp,
+      refreshToken: session.refreshToken,
+      refreshExp: session.refreshExp,
+    };
+  }
+
+  /**
+   * 停用：先把设备位还给用户，再清本地。
+   * 网络失败也照样清——不能因为连不上服务器就把人卡在「清除不了」；发不出去的请求
+   * 记进待办，下次打开设置页补发，否则离线点一次就白丢一个名额。
+   */
+  async function clearLicense() {
+    if (!license) return;
+    const session = await readSession();
+    const refreshToken = session?.refreshToken || license.refreshToken;
+    license = null;
+    if (licenseError) licenseError.textContent = '';
+    saveLicense();
+    renderLicenseState();
+    await clearSession();
+    if (refreshToken) {
+      const released = await releaseLicense(refreshToken);
+      if (!released) await queuePendingRelease(refreshToken);
+    }
   }
 
   function renderBatchActions() {
     if (!batchActions || !settings) return;
-    const selected = selectedSourceIds;
+    const selected = selectedItemIds;
+    // 有效条目 = 搜索源 + 当前挂在某个分组里的特殊功能按钮。少了后半截，
+    // 选中动作后一渲染就会被当成「已失效」清掉，批量删除永远等不到点击。
     const valid = new Set(config().sources.map((source) => source.id));
+    config().groups.forEach((group) => group.items.forEach((item) => { if (specialActionByToken(item)) valid.add(item); }));
     Array.from(selected).forEach((id) => { if (!valid.has(id)) selected.delete(id); });
     batchActions.hidden = selected.size === 0;
-    if (batchCount) batchCount.textContent = '已选 ' + selected.size + ' 项';
+    if (batchCount) batchCount.textContent = t('已选 {n} 项', { n: selected.size });
     if (batchGroup) {
       const current = batchGroup.value;
       batchGroup.replaceChildren();
-      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '移动到分组'; batchGroup.append(placeholder);
+      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = t('移动到分组'); batchGroup.append(placeholder);
       config().groups.forEach((group) => {
-        const option = document.createElement('option'); option.value = group.id; option.textContent = group.name; batchGroup.append(option);
+        const option = document.createElement('option'); option.value = group.id; option.textContent = groupLabel(group); batchGroup.append(option);
       });
       batchGroup.value = current;
     }
@@ -1257,7 +1688,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     if (!target || !validIds.length) return;
     config().groups.forEach((group) => { group.items = group.items.filter((item) => !validIds.includes(item)); });
     validIds.forEach((id) => target.items.push(id));
-    validIds.forEach((id) => selectedSourceIds.delete(id));
+    validIds.forEach((id) => selectedItemIds.delete(id));
     saveCurrent(); renderManager();
   }
 
@@ -1265,8 +1696,20 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     moveItemsToGroup(sourceId, groupId);
   }
 
+  /** 配额用尽时的统一出口：说明原因，再把用户送到「关于」里激活。 */
+  function redirectToLicense(message: string) {
+    window.alert(message);
+    document.querySelector<HTMLElement>('.nav-item[data-panel="about"]')?.click();
+    licenseCodeInput?.focus();
+  }
+
   function addGroup() {
-    const name = window.prompt('分组名称', '新分组');
+    // 配额在命名之前判：先让人看到为什么建不了，而不是填完名字才被拒。
+    if (!groupQuota(config().groups, license).allowed) {
+      redirectToLicense(t('免费版最多创建 {n} 个搜索源分组。激活会员后不限数量，激活码在「关于」里。', { n: FREE_GROUP_LIMIT }));
+      return;
+    }
+    const name = window.prompt(t('分组名称'), t('新分组'));
     if (!name?.trim()) return;
     const id = 'group-' + Date.now();
     config().groups.push({ id, name: name.trim(), items: [], visible: true });
@@ -1274,7 +1717,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     managerGroupId = id; saveCurrent(); renderManager();
   }
   function renameGroup(group) {
-    const name = window.prompt('分组名称', group.name);
+    const name = window.prompt(t('分组名称'), groupLabel(group));
     if (!name?.trim()) return;
     group.name = name.trim(); saveCurrent(); renderManager();
   }
@@ -1293,16 +1736,37 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     config().groups.forEach((group) => { group.items = group.items.filter((item) => item !== id); });
     iconNodeCache.delete(id);
     if (editing?.id === id && editing.panel === activePanel) resetForm();
-    selectedSourceIds.delete(id);
+    selectedItemIds.delete(id);
     saveCurrent(); renderManager();
   }
+  /** 搜索源编辑改成弹窗：行内的铅笔与顶部「添加搜索源」都打开同一个对话框。 */
+  function openSourceDialog() {
+    if (typeof sourceDialog?.showModal === 'function') {
+      if (!sourceDialog.open) sourceDialog.showModal();
+    } else sourceDialog?.setAttribute('open', '');
+    nameInput?.focus();
+  }
+  function closeSourceDialogPanel() {
+    if (typeof sourceDialog?.close === 'function' && sourceDialog.open) sourceDialog.close();
+    else sourceDialog?.removeAttribute('open');
+  }
+  /** 只清表单与编辑态，不动弹窗本身（关闭动作由「关闭事件」统一收尾）。 */
+  function resetSourceFormFields() {
+    editing = null; form?.reset();
+    if (formTitle) formTitle.textContent = t('添加搜索源');
+    if (submitLabel) submitLabel.textContent = t('添加');
+    if (errorEl) errorEl.textContent = '';
+  }
   function startEdit(source) {
+    resetSourceFormFields();
     editing = { panel: MANAGER_PANEL, id: source.id };
     nameInput.value = source.name; markInput.value = source.mark; urlInput.value = source.url;
-    formTitle.textContent = '编辑搜索源'; submitLabel.textContent = '保存修改'; cancelEdit.hidden = false; nameInput.focus();
+    formTitle.textContent = t('编辑搜索源'); submitLabel.textContent = t('保存');
+    openSourceDialog();
   }
   function resetForm() {
-    editing = null; form.reset(); formTitle.textContent = '添加搜索源'; submitLabel.textContent = '添加搜索源'; cancelEdit.hidden = true; errorEl.textContent = '';
+    resetSourceFormFields();
+    closeSourceDialogPanel();
   }
   function getFaviconUrl(source) {
     try {
@@ -1310,45 +1774,93 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
       return 'https://www.google.com/s2/favicons?sz=64&domain_url=' + encodeURIComponent(parsed.origin);
     } catch { return ''; }
   }
-  function fetchSourceIcon(source) {
-    const iconUrl = getFaviconUrl(source);
-    if (!iconUrl) return;
-    iconNodeCache.delete(source.id);
-    source.iconUrl = iconUrl; saveCurrent(); renderSources();
+
+  /** 预览下方那行小字：图标现在从哪来。比「已设置」有用，决定用户下一步点哪个按钮。 */
+  function iconSourceNote(source) {
+    const iconUrl = String(source?.iconUrl || '');
+    if (!iconUrl) return t('默认图标');
+    if (iconUrl.startsWith('data:image/')) return t('本地图片');
+    if (iconUrl.includes('/s2/favicons')) return t('网站图标');
+    return t('自定义链接');
   }
-  function restoreSourceIcon(source) { iconNodeCache.delete(source.id); source.iconUrl = ''; saveCurrent(); renderSources(); }
-  function openIconEditor(source) {
-    iconEditorSourceId = source.id; iconUrlInput.value = ''; iconFileInput.value = ''; iconEditorError.textContent = '';
-    if (typeof iconEditor.showModal === 'function') iconEditor.showModal(); else iconEditor.setAttribute('open', '');
-    iconUrlInput.focus();
+
+  /** 弹窗里的预览与标题：每次换图标、每次打开都重画，它和列表共用同一份 iconUrl。 */
+  function renderIconEditorPreview() {
+    const source = sourceById(iconEditorSourceId);
+    if (!source || !iconEditorPreview) return;
+    iconEditorPreview.className = 'source-logo icon-editor-preview ' + String(source.className || '');
+    iconEditorPreview.replaceChildren();
+    if (source.iconUrl) {
+      const image = document.createElement('img');
+      image.alt = '';
+      image.decoding = 'async';
+      image.addEventListener('error', () => { iconEditorPreview.textContent = source.mark || '?'; });
+      image.src = String(source.iconUrl);
+      iconEditorPreview.append(image);
+    } else {
+      iconEditorPreview.textContent = source.mark || '?';
+    }
+    if (iconEditorName) iconEditorName.textContent = source.name;
+    if (iconEditorNote) iconEditorNote.textContent = iconSourceNote(source);
+    if (restoreIconButton) restoreIconButton.hidden = !source.iconUrl;
   }
-  function closeIconEditorPanel() {
-    iconEditorSourceId = null;
-    if (typeof iconEditor.close === 'function') iconEditor.close(); else iconEditor.removeAttribute('open');
-  }
-  function iconUrlFromInput(value) {
-    if (!value) throw new Error('请输入图标地址。');
-    const parsed = new URL(value);
-    if (!/^https?:$/.test(parsed.protocol)) throw new Error('图标地址需要使用 http 或 https。');
-    return parsed.href;
-  }
-  function setIconUrl(iconUrl) {
+
+  /**
+   * 换图标只有一个出口：所有入口（网站图标 / 上传 / 链接 / 恢复默认）都落到这里，
+   * 于是「存进 sync、刷新列表、刷新弹窗预览」不会出现只做了其中两步的路径。
+   * 与旧版不同，这里不关弹窗：用户要能立刻看见换完的样子，再决定要不要再换。
+   */
+  function applySourceIcon(iconUrl) {
     const source = sourceById(iconEditorSourceId);
     if (!source) return;
     iconNodeCache.delete(source.id);
-    source.iconUrl = iconUrl; saveCurrent(); renderSources(); closeIconEditorPanel();
+    source.iconUrl = iconUrl;
+    saveCurrent(); renderSources(); renderIconEditorPreview();
+  }
+
+  /** 弹窗里的错误提示只有一个出口，顺便把「元素可能不存在」的判断收在一处。 */
+  function setIconEditorError(message) { if (iconEditorError) iconEditorError.textContent = message; }
+
+  function fetchIconFromSite() {
+    const source = sourceById(iconEditorSourceId);
+    const iconUrl = source ? getFaviconUrl(source) : '';
+    if (!iconUrl) { setIconEditorError(t('这个搜索源的地址里没有可用的网站域名。')); return; }
+    setIconEditorError('');
+    applySourceIcon(iconUrl);
+  }
+
+  function openIconEditor(source) {
+    if (!iconEditor) return;
+    iconEditorSourceId = source.id;
+    if (iconUrlInput) iconUrlInput.value = '';
+    if (iconFileInput) iconFileInput.value = '';
+    setIconEditorError('');
+    renderIconEditorPreview();
+    if (typeof iconEditor.showModal === 'function') iconEditor.showModal(); else iconEditor.setAttribute('open', '');
+    iconUrlInput?.focus();
+  }
+  function closeIconEditorPanel() {
+    iconEditorSourceId = null;
+    if (!iconEditor) return;
+    if (typeof iconEditor.close === 'function') iconEditor.close(); else iconEditor.removeAttribute('open');
+  }
+  function iconUrlFromInput(value) {
+    if (!value) throw new Error(t('请输入图标地址。'));
+    const parsed = new URL(value);
+    if (!/^https?:$/.test(parsed.protocol)) throw new Error(t('图标地址需要使用 http 或 https。'));
+    return parsed.href;
   }
   function localFileToIconUrl(file) {
     return new Promise((resolve, reject) => {
-      if (!file) return reject(new Error('请选择图片。'));
-      if (file.size > 5 * 1024 * 1024) return reject(new Error('图片不能超过 5 MB。'));
+      if (!file) return reject(new Error(t('请选择图片。')));
+      if (file.size > 5 * 1024 * 1024) return reject(new Error(t('图片不能超过 5 MB。')));
       const reader = new FileReader();
-      reader.onerror = () => reject(new Error('无法读取图片。'));
+      reader.onerror = () => reject(new Error(t('无法读取图片。')));
       reader.onload = () => {
         const image = new Image();
-        image.onerror = () => reject(new Error('无法使用该图片。'));
+        image.onerror = () => reject(new Error(t('无法使用该图片。')));
         image.onload = () => {
-          if (!image.naturalWidth || !image.naturalHeight) return reject(new Error('图片尺寸无效。'));
+          if (!image.naturalWidth || !image.naturalHeight) return reject(new Error(t('图片尺寸无效。')));
           const size = 32, scale = Math.min(size / image.naturalWidth, size / image.naturalHeight);
           const width = Math.max(1, Math.round(image.naturalWidth * scale)), height = Math.max(1, Math.round(image.naturalHeight * scale));
           const canvas = document.createElement('canvas');
@@ -1376,18 +1888,25 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     });
     if (activePanel === 'history') renderHistory();
     else if (activePanel === 'notes') renderNotes();
-    else if (activePanel === 'sources' || activePanel === 'pinned') renderManager();
+    else if (activePanel === 'sources') renderManager();
+    else if (activePanel === 'about') renderAbout();
   }));
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     const name = nameInput.value.trim(), mark = markInput.value.trim().slice(0, 2), url = urlInput.value.trim();
     if (!name || !mark || !url) return;
-    if (!url.includes('{query}')) { errorEl.textContent = 'URL 中需要包含 {query} 占位符。'; return; }
+    if (!url.includes('{query}')) { errorEl.textContent = t('URL 中需要包含 {query} 占位符。'); return; }
     try {
       const parsed = new URL(url.replace(/\{query\}/gi, 'quickfind'));
       if (!/^https?:$/.test(parsed.protocol)) throw new Error();
-    } catch { errorEl.textContent = '请输入有效的 http 或 https 搜索 URL。'; return; }
+    } catch { errorEl.textContent = t('请输入有效的 http 或 https 搜索 URL。'); return; }
     const source = editing?.panel === MANAGER_PANEL ? sourceById(editing.id) : null;
+    if (!source && !sourceQuota(config().sources, license).allowed) {
+      // 弹窗是先打开的：配额可能在编辑期间被别人（另一台设备）占满，这里再判一次，
+      // 而不是关掉弹窗让用户以为存上了。
+      errorEl.textContent = t('免费版最多启用 {n} 个搜索源，先关掉一个再新增；激活会员后不限数量。', { n: FREE_SOURCE_LIMIT });
+      return;
+    }
     if (source) Object.assign(source, { name, mark, url, detail: url });
     else {
       const id = 'custom-' + Date.now();
@@ -1402,9 +1921,9 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     const url = pinnedSiteUrlInput.value.trim();
     const selector = pinnedSiteSelectorInput.value.trim();
     pinnedSiteError.textContent = '';
-    if (!url) { pinnedSiteError.textContent = '请至少填写站点 URL。'; return; }
+    if (!url) { pinnedSiteError.textContent = t('请至少填写站点 URL。'); return; }
     if (selector) {
-      try { document.querySelectorAll(selector); } catch { pinnedSiteError.textContent = 'CSS 选择器格式无效。'; return; }
+      try { document.querySelectorAll(selector); } catch { pinnedSiteError.textContent = t('CSS 选择器格式无效。'); return; }
     }
     if (!Array.isArray(settings.pinned.customSites)) settings.pinned.customSites = [];
     const knownSite = [...PINNED_SITES, ...getExistingSourceSites()].find((item) => item.id === pinnedSiteEditingId);
@@ -1436,7 +1955,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   pinnedSiteDialog?.addEventListener('cancel', resetPinnedSiteForm);
   cancelPinnedSiteEdit?.addEventListener('click', resetPinnedSiteForm);
   batchDelete?.addEventListener('click', () => {
-    const selected = selectedSourceIds;
+    const selected = selectedItemIds;
     if (!selected.size) return;
     const ids = new Set(selected);
     settings.general.sources = config().sources.filter((source) => !ids.has(source.id));
@@ -1455,7 +1974,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   });
   batchGroup?.addEventListener('change', () => {
     if (!batchGroup.value) return;
-    moveSourceToGroup(Array.from(selectedSourceIds), batchGroup.value);
+    moveSourceToGroup(Array.from(selectedItemIds), batchGroup.value);
     batchGroup.value = '';
   });
   deleteSelectedHistory?.addEventListener('click', () => {
@@ -1473,7 +1992,24 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     renderHistory();
   });
   cancelEdit.addEventListener('click', resetForm);
+  addSourceButton?.addEventListener('click', () => {
+    if (!sourceQuota(config().sources, license).allowed) {
+      redirectToLicense(t('免费版最多启用 {n} 个搜索源，先关掉一个再新增；激活会员后不限数量，激活码在「关于」里。', { n: FREE_SOURCE_LIMIT }));
+      return;
+    }
+    resetForm(); openSourceDialog();
+  });
+  closeSourceDialog?.addEventListener('click', resetForm);
+  // 点遮罩关闭：目标就是 dialog 本身时才算点在弹窗外。
+  sourceDialog?.addEventListener('click', (event) => { if (event.target === sourceDialog) resetForm(); });
+  sourceDialog?.addEventListener('close', resetSourceFormFields);
   addGroupButton.addEventListener('click', addGroup);
+  activateLicenseButton?.addEventListener('click', activateLicense);
+  clearLicenseButton?.addEventListener('click', clearLicense);
+  licenseEmailInput?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); licenseCodeInput?.focus(); } });
+  licenseEmailInput?.addEventListener('input', () => { if (licenseError) licenseError.textContent = ''; });
+  licenseCodeInput?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); activateLicense(); } });
+  licenseCodeInput?.addEventListener('input', () => { if (licenseError) licenseError.textContent = ''; });
   defaultGroupCountInput.addEventListener('change', () => {
     settings.defaultGroupCount = Math.max(1, Math.min(MAX_DEFAULT_GROUP_COUNT, Number(defaultGroupCountInput.value) || SHARED_DEFAULTS.defaultGroupCount));
     defaultGroupCountInput.value = settings.defaultGroupCount; saveGeneral('selection');
@@ -1488,6 +2024,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   });
   pinnedAllSitesInput?.addEventListener('change', () => {
     settings.pinned.allSites = pinnedAllSitesInput.checked;
+    syncPinnedSitesRow();
     savePinned();
   });
   selectionTriggerDelayInput?.addEventListener('change', () => {
@@ -1497,6 +2034,12 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   triggerInputs.forEach((input) => input.addEventListener('change', () => {
     if (!input.checked) return;
     settings.triggerMode = input.value; saveGeneral('selection');
+  }));
+  languageInputs.forEach((input) => input.addEventListener('change', () => {
+    if (!input.checked) return;
+    settings.language = normalizeLocale(input.value);
+    applyInterfaceLanguage();
+    saveGeneral('common');
   }));
   editableTriggerInputs.forEach((input) => input.addEventListener('change', () => {
     if (!input.checked) return;
@@ -1523,17 +2066,23 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     input.addEventListener('change', saveLlmConfig);
     if (input.tagName === 'TEXTAREA' || input.type === 'text' || input.type === 'url' || input.type === 'password') input.addEventListener('blur', saveLlmConfig);
   });
-  closeIconEditor.addEventListener('click', closeIconEditorPanel);
-  applyIconUrl.addEventListener('click', () => {
-    try { setIconUrl(iconUrlFromInput(iconUrlInput.value.trim())); }
-    catch (error) { iconEditorError.textContent = error.message || '无法使用该图标地址。'; }
+  closeIconEditor?.addEventListener('click', closeIconEditorPanel);
+  fetchIconButton?.addEventListener('click', fetchIconFromSite);
+  uploadIconButton?.addEventListener('click', () => iconFileInput?.click());
+  restoreIconButton?.addEventListener('click', () => { setIconEditorError(''); applySourceIcon(''); });
+  applyIconUrl?.addEventListener('click', () => {
+    try {
+      applySourceIcon(iconUrlFromInput(String(iconUrlInput?.value || '').trim()));
+      if (iconUrlInput) iconUrlInput.value = '';
+      setIconEditorError('');
+    } catch (error) { setIconEditorError(error.message || t('无法使用该图标地址。')); }
   });
-  iconEditor.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); applyIconUrl.click(); });
-  iconFileInput.addEventListener('change', async () => {
-    try { setIconUrl(await localFileToIconUrl(iconFileInput.files?.[0])); }
-    catch (error) { iconEditorError.textContent = error.message || '无法使用该图片。'; }
+  iconEditor?.querySelector('form')?.addEventListener('submit', (event) => { event.preventDefault(); applyIconUrl?.click(); });
+  iconFileInput?.addEventListener('change', async () => {
+    try { applySourceIcon(await localFileToIconUrl(iconFileInput.files?.[0])); iconFileInput.value = ''; setIconEditorError(''); }
+    catch (error) { setIconEditorError(error.message || t('无法使用该图片。')); }
   });
-  iconEditor.addEventListener('cancel', () => { iconEditorSourceId = null; });
+  iconEditor?.addEventListener('cancel', () => { iconEditorSourceId = null; });
 
   addNoteButton?.addEventListener('click', addNote);
   undoNotesButton?.addEventListener('click', undoNotes);
@@ -1557,18 +2106,41 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
   window.addEventListener('pagehide', () => { if (notesSaveTimer) { window.clearTimeout(notesSaveTimer); void persistNotes(); } });
 
   chrome.storage?.onChanged?.addListener((changes, area) => {
-    if (area !== 'sync' || !changes.searchHistory || !settings) return;
+    if (area !== 'sync' || !settings) return;
+    // 会员记录也可能在另一台设备上被激活：状态与分组配额要跟着刷新。
+    if (changes.license) {
+      license = normalizeLicenseRecord(changes.license.newValue);
+      renderGroupQuotaButton();
+      if (activePanel === 'about') renderLicenseState();
+    }
+    // 语言也可能在另一台设备/另一个标签页里改过：跟着切换，别停在旧语言。
+    if (changes.language) {
+      settings.language = normalizeLocale(changes.language.newValue);
+      applyInterfaceLanguage();
+    }
+    if (!changes.searchHistory) return;
     settings.searchHistory = normalizeSearchHistory(changes.searchHistory.newValue);
     selectedHistoryIndexes.clear();
     if (activePanel === 'history') renderHistory();
   });
 
+  // 收款码与联系码是私有素材（public/pay/ 不入库）：从源码构建时这两张图不存在，
+  // 浏览器会画出两个破图框。加载失败就把整块扫码区域摘掉，上面的微信号文字仍然有效。
+  document.querySelectorAll('.pay-codes img').forEach((img) => {
+    img.addEventListener('error', () => { img.closest('.pay-codes')?.remove(); }, { once: true });
+  });
+
   chrome.storage.sync.get(null, (stored) => {
     settings = normalizeSettings({ ...DEFAULTS, ...defaultConfigSeed(stored), ...stored });
+    license = normalizeLicenseRecord(stored.license);
+    void hydrateSession();
+    // 上次离线点了「清除激活码」的话，这里把没发出去的停用请求补上，把设备位还给用户。
+    void flushPendingReleases();
     defaultGroupCountInput.value = settings.defaultGroupCount;
     pinnedDefaultGroupCountInput.value = settings.pinned.defaultGroupCount;
     if (pinnedCollapseDelayInput) pinnedCollapseDelayInput.value = settings.pinned.collapseDelay;
     if (pinnedAllSitesInput) pinnedAllSitesInput.checked = settings.pinned.allSites === true;
+    syncPinnedSitesRow();
     if (selectionTriggerDelayInput) selectionTriggerDelayInput.value = settings.selectionTriggerDelay;
     if (llmEnabledInput) llmEnabledInput.checked = settings.llm.enabled !== false;
     if (llmDockVisibleInput) llmDockVisibleInput.checked = settings.llmDockVisible !== false;
@@ -1578,7 +2150,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
     if (llmSystemPromptInput) llmSystemPromptInput.value = settings.llm.systemPrompt;
     triggerInputs.forEach((input) => { input.checked = input.value === settings.triggerMode; });
     editableTriggerInputs.forEach((input) => { input.checked = input.value === settings.editableTriggerMode; });
-    renderManager();
+    applyInterfaceLanguage();
     const hasLegacy = LEGACY_KEYS.some((key) => Object.prototype.hasOwnProperty.call(stored, key));
     const hasDeprecatedPinnedContent = ['sources', 'groups', 'engines', 'iconOnly', 'engineOrder', 'customEngines'].some((key) => Object.prototype.hasOwnProperty.call(stored.pinnedSearch || {}, key));
     if (stored.sourceConfigVersion !== CONFIG_VERSION || !stored.pinnedSearch ||
@@ -1589,7 +2161,7 @@ import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/
         enabled: settings.enabled, triggerMode: settings.triggerMode,
         editableTriggerMode: settings.editableTriggerMode, defaultGroupCount: settings.defaultGroupCount, selectionTriggerDelay: settings.selectionTriggerDelay, llm: settings.llm,
         llmDockVisible: settings.llmDockVisible,
-        sources: settings.general.sources, groups: settings.general.groups, pinnedSearch: settings.pinned, sourceConfigVersion: CONFIG_VERSION
+        sources: settings.general.sources, groups: settings.general.groups, specialActions: settings.general.actions, pinnedSearch: settings.pinned, sourceConfigVersion: CONFIG_VERSION
       }, activePanel, () => { if (hasLegacy) chrome.storage.sync.remove(LEGACY_KEYS); });
     }
   });
