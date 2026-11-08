@@ -16,3 +16,12 @@ node_modules/
 .output/
 .wxt/
 stats.html
+
+# 私有素材与私有服务端：只留在本机，不进公开仓库。
+# public/pay/ 是收款码与联系码（含个人微信账号），license-server/ 是发卡服务端源码；
+# 选项页读不到图片时会自动隐藏整块扫码区域（见 options/main.ts）。
+license-server/
+public/pay/
+
+# Python 脚本的字节码缓存
+__pycache__/

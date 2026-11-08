@@ -57,11 +57,25 @@ jobs:
           npm i --no-save playwright
           npx playwright install --with-deps chromium
 
-      - name: 构建扩展
-        run: npm run build
+      # 下 Chromium 是这里最贵的一步（每次都重下 100MB+）。缓存起来，命中时只要几秒。
+      # key 里带 playwright 的大版本：升级后浏览器版本对不上，install 会自己补下新的，
+      # 缓存只是退化成未命中，不会用错浏览器。名里的 v1 留给将来手动失效。
+      - name: 缓存 Playwright 浏览器
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-chromium-${{ runner.os }}-v1
+
+      # 产物直接取 check 作业上传的那份：e2e 作业此前又 build 了一次，同一份产物建两遍
+      # 纯属重复步骤——只有构建脚本本身变了才需要第二次，而那时 check 早就先失败了。
+      - name: 取构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: chrome-mv3
+          path: .output/chrome-mv3
 
       # 用例默认无头（QF_HEADED 未设置）。产物目录由 helpers.cjs 从仓库根推导，
-      # 所以只需在仓库根执行。
+      # 所以只需在仓库根执行。用例彼此独立，run.mjs 按核数并发跑。
       - name: 端到端回归
         run: npm run test:e2e
 
