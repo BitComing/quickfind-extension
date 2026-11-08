@@ -18,6 +18,9 @@ jobs:
           cache: npm
 
       # npm ci 而不是 install：lockfile 已提交，用它保证可复现。
+      # 依赖装完会自动跑 postinstall（wxt prepare），生成 .wxt/tsconfig.json——
+      # tsconfig.json 正是 extends 它。少了这一步，tsc 会退回到默认选项（没有
+      # skipLibCheck / DOM lib），在干净的 CI 上凭空报出几十个错误。
       - name: 安装依赖
         run: npm ci
 

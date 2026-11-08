@@ -5,6 +5,7 @@
   "type": "module",
   "description": "选中文字后，在文字末端快速打开常用搜索引擎。",
   "scripts": {
+    "postinstall": "wxt prepare",
     "dev": "wxt",
     "dev:firefox": "wxt -b firefox",
     "build": "node build.mjs",
