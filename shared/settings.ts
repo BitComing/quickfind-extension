@@ -73,17 +73,35 @@ export interface HistoryEntry {
 /** 早期版本把历史直接存成字符串数组，两种形状都要能读。 */
 export type HistoryItem = string | HistoryEntry;
 
+/**
+ * 特殊功能按钮的显示与启用设置，键为动作 id（见 shared/search-actions.ts）。
+ *
+ * 动作本身是代码里的常量、不可增删，能配置的是「怎么显示、要不要出现」：
+ *   - iconOnly：分组里只画图标；
+ *   - name：用户改过的按钮名，缺省用动作自带的默认名；
+ *   - enabled：显式停用。与 iconOnly 不同，这里只有 false 才写进去。
+ *
+ * 存成稀疏表：缺键即默认值。键越少，sync 的 8 KB 单键上限越不容易被顶到。
+ */
+export type ActionSettings = Record<string, { iconOnly?: boolean; name?: string; enabled?: boolean }>;
+
 /** normalize 之后的设置，界面渲染以此为准。 */
 export interface QuickFindSettings {
   enabled: boolean;
   sources: SearchSource[];
   groups: SearchGroup[];
+  /** 特殊功能按钮的设置，缺键即默认。 */
+  actions: ActionSettings;
+  /** 界面语言，见 shared/i18n.ts。 */
+  language: 'zh-CN' | 'en';
   searchHistory: HistoryItem[];
 }
 
 /** 存储中的原始设置，所有字段都可能缺失或停留在旧版本形状。 */
 export interface StoredSettings {
   enabled?: boolean;
+  /** 界面语言：'zh-CN' | 'en'，缺省为中文。 */
+  language?: string;
   /** 内置源的启用状态，键为源 id。 */
   engines?: Record<string, boolean | undefined>;
   iconOnly?: Record<string, boolean | undefined>;
@@ -96,5 +114,7 @@ export interface StoredSettings {
   llmDockVisible?: boolean;
   sources?: SearchSource[];
   groups?: RawGroup[];
+  /** 特殊功能按钮的显示设置，键为动作 id。 */
+  specialActions?: ActionSettings;
   searchHistory?: HistoryItem[];
 }

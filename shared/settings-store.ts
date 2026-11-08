@@ -21,8 +21,9 @@
 
 import { BUILTIN_SOURCES, backfillBuiltinSources } from './builtins';
 import { DEFAULT_GROUP_NAME } from './defaults';
+import { normalizeLocale } from './i18n';
 import { SPECIAL_ACTIONS } from './search-actions';
-import type { QuickFindSettings, RawGroup, SearchGroup, SearchSource, StoredSettings } from './settings';
+import type { ActionSettings, QuickFindSettings, RawGroup, SearchGroup, SearchSource, StoredSettings } from './settings';
 
 const ACTION_PREFIX = 'action:';
 const GROUP_PREFIX = 'group:';
@@ -108,10 +109,32 @@ export function configuredSources(stored: StoredSettings, builtins: SearchSource
 }
 
 /**
+ * 特殊功能按钮的设置。只保留认识的动作 id，且只保留「与默认不同」的字段：
+ * iconOnly 只存 true、enabled 只存 false、name 只存非空且与默认名不同的值。
+ * 存进去的稀疏表越小，sync 的 8 KB 单键上限就越不容易被顶到。
+ */
+export function normalizeActionSettings(stored: StoredSettings): ActionSettings {
+  const raw = stored.specialActions;
+  if (!raw || typeof raw !== 'object') return {};
+  const settings: ActionSettings = {};
+  SPECIAL_ACTIONS.forEach((action) => {
+    const value = (raw as Record<string, unknown>)[String(action.id)];
+    if (!value || typeof value !== 'object') return;
+    const entry: { iconOnly?: boolean; name?: string; enabled?: boolean } = {};
+    if ((value as { iconOnly?: unknown }).iconOnly === true) entry.iconOnly = true;
+    if ((value as { enabled?: unknown }).enabled === false) entry.enabled = false;
+    const name = String((value as { name?: unknown }).name ?? '').trim().slice(0, 24);
+    if (name && name !== String(action.name)) entry.name = name;
+    if (Object.keys(entry).length) settings[String(action.id)] = entry;
+  });
+  return settings;
+}
+
+/**
  * 收敛 sources + groups。这是三个入口共用的那一步；额外字段（enabled、searchHistory、
  * pinned 等）由各入口自己补，它们不属于「搜索源与分组」这条规则。
  */
-export function normalizeSearchConfig(stored: StoredSettings, builtins: SearchSource[] = BUILTIN_SOURCES): { sources: SearchSource[]; groups: SearchGroup[] } {
+export function normalizeSearchConfig(stored: StoredSettings, builtins: SearchSource[] = BUILTIN_SOURCES): { sources: SearchSource[]; groups: SearchGroup[]; actions: ActionSettings } {
   const rawGroups: RawGroup[] = Array.isArray(stored.groups) ? stored.groups : [];
 
   // 去重按 id 取第一条：同一份存储里出现两条同 id 的源时，行为要可预测。
@@ -178,16 +201,18 @@ export function normalizeSearchConfig(stored: StoredSettings, builtins: SearchSo
     { id: 'default', name: String(rawDefault?.name || DEFAULT_GROUP_NAME), items: defaultItems, visible: rawDefault?.visible !== false },
     ...customGroups,
   ];
-  return { sources, groups };
+  return { sources, groups, actions: normalizeActionSettings(stored) };
 }
 
 /** 收敛成弹窗 / 内容脚本直接渲染的整份设置。 */
 export function normalizeSettings(stored: StoredSettings, builtins: SearchSource[] = BUILTIN_SOURCES): QuickFindSettings {
-  const { sources, groups } = normalizeSearchConfig(stored, builtins);
+  const { sources, groups, actions } = normalizeSearchConfig(stored, builtins);
   return {
     enabled: stored.enabled !== false,
     sources,
     groups,
+    actions,
+    language: normalizeLocale(stored.language),
     searchHistory: Array.isArray(stored.searchHistory) ? stored.searchHistory : [],
   };
 }
@@ -203,27 +228,37 @@ function groupEntry(group: SearchGroup): SearchSource {
   };
 }
 
-function actionEntry(token: string): SearchSource | null {
+function actionEntry(token: string, actions: ActionSettings | undefined): SearchSource | null {
   const action = SPECIAL_ACTIONS.find((item) => item.id === tokenId(token, ACTION_PREFIX));
-  return action ? { ...action, id: token } : null;
+  if (!action) return null;
+  // 仅图标、改名、停用都是动作自己的设置，和搜索源同名字段，渲染侧不必区分两者。
+  const settings = actions?.[String(action.id)];
+  const name = String(settings?.name || '').trim();
+  return {
+    ...action,
+    // 改过名之后，默认名仍留在 shared/search-actions.ts 里：重置配置时能回到它。
+    name: name || String(action.name),
+    iconOnly: settings?.iconOnly === true,
+    enabled: settings?.enabled !== false,
+  };
 }
 
 /**
  * 把一个分组的 `items` 解析成可以直接渲染的条目列表。
  *
  * - `group:<id>` 只出现在默认组里，且目标分组必须同时可见、被允许出现在默认组；
- * - `action:<id>` 与源不同，它不看 `enabled`（动作没有开关）；
+ * - `action:<id>` 与源一样受 `enabled` 约束（在选项页里可以停用），停用后三个入口都不画它；
  * - 默认组整体隐藏时返回空列表——调用方据此不渲染列表。
  */
-export function resolveGroupEntries(config: { sources: SearchSource[]; groups: SearchGroup[] }, groupId = 'default'): SearchSource[] {
+export function resolveGroupEntries(config: { sources: SearchSource[]; groups: SearchGroup[]; actions?: ActionSettings }, groupId = 'default'): SearchSource[] {
   const group = config.groups.find((item) => item.id === String(groupId));
   if (!group || group.visible === false) return [];
   const sourceMap = new Map(config.sources.map((source) => [source.id, source]));
   const entries: SearchSource[] = [];
   (group.items || []).forEach((token) => {
     if (isActionToken(token)) {
-      const entry = actionEntry(token);
-      if (entry) entries.push(entry);
+      const entry = actionEntry(token, config.actions);
+      if (entry && entry.enabled !== false) entries.push(entry);
       return;
     }
     if (isGroupToken(token)) {

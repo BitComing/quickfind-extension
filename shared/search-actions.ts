@@ -1,4 +1,5 @@
 import type { SearchSource } from './settings';
+import { OUTLINE_NOTES_ENABLED } from './features';
 
 /**
  * 特殊功能按钮：搜索列表里不跳转搜索、直接做一件事的条目。
@@ -22,16 +23,20 @@ export const SPECIAL_ACTIONS: SearchSource[] = [
     action: 'copy',
     isSpecial: true
   },
-  {
-    id: 'notes',
-    name: '笔记',
-    detail: '存到无限大纲笔记第一行',
-    specialTitle: '把内容存到笔记第一行',
-    mark: '记',
-    className: 'special-notes',
-    action: 'notes',
-    isSpecial: true
-  },
+  // 「笔记」随无限大纲笔记一起下线（见 shared/features.ts）：模块已隐藏，按钮留着只会
+  // 把内容写进一个再也看不到的地方。开关改回 true 时它自然回来。
+  ...(OUTLINE_NOTES_ENABLED
+    ? [{
+      id: 'notes',
+      name: '笔记',
+      detail: '存到无限大纲笔记第一行',
+      specialTitle: '把内容存到笔记第一行',
+      mark: '记',
+      className: 'special-notes',
+      action: 'notes',
+      isSpecial: true
+    }] as SearchSource[]
+    : []),
   {
     id: 'ask-ai',
     name: '问 ai',
