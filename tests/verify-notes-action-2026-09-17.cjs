@@ -8,7 +8,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
-const { resolvePlaywright, EXT, resolveChrome } = require('./helpers.cjs');
+const { resolvePlaywright, EXT, resolveChrome, featureEnabled, skipRetired } = require('./helpers.cjs');
+// 「笔记」按钮随无限大纲笔记一起下线：模块关着时本用例整体跳过，开关打开即恢复执行。
+if (!featureEnabled('OUTLINE_NOTES_ENABLED')) skipRetired('无限大纲笔记已下线');
 const { chromium } = resolvePlaywright();
 const CHROME = resolveChrome(chromium);
 const PANEL_HOST = '#quickfind-shadow-host';
@@ -220,11 +222,12 @@ async function dockState(page) {
     return {
       count: rows.length,
       names: rows.map((row) => row.querySelector('.special-action-meta strong').textContent),
-      noteDetail: notesRow ? notesRow.querySelector('.special-action-meta small').textContent : null,
+      // 说明文案不占行内版面（设置页不放解释性文字），挂在 title 上供悬停查看。
+      noteDetail: notesRow ? notesRow.querySelector('.special-action-meta')?.title ?? null : null,
       noteGroup: notesRow ? notesRow.querySelector('select').value : null,
       options: notesRow ? Array.from(notesRow.querySelectorAll('option')).map((option) => option.textContent) : [],
       listRow: Boolean(document.querySelector('#source-list .source-row[data-action-id="notes"]')),
-      listRowDetail: document.querySelector('#source-list .source-row[data-action-id="notes"] .source-meta small') ? document.querySelector('#source-list .source-row[data-action-id="notes"] .source-meta small').textContent : null
+      listRowDetail: document.querySelector('#source-list .source-row[data-action-id="notes"] .source-meta')?.title ?? null
     };
   });
   // 断言的是「复制/笔记两枚都在」，不是「只有两枚」——后续新增动作不应让这条用例变红。

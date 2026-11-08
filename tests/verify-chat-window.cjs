@@ -112,6 +112,45 @@ async function askAi(page, question) {
   await page.waitForTimeout(1200);
 }
 
+/**
+ * 从「窗口里的历史入口」重开某条会话。
+ *
+ * 侧栏已下线（shared/features.ts），历史入口只剩窗口标题栏上那一个；而空窗口点不了
+ * 引擎列表里的按钮（`selectedText` 为空时引擎点击直接返回），所以这里先正常问一句、
+ * 拿到一个真窗口，再从它的历史里点回目标会话。重开是新建窗口，之后把当入口的那个关掉，
+ * 屏幕上只剩重开的会话——后面的断言就只看它。
+ */
+async function reopenConversationFromHistory(page, title) {
+  const seed = '从历史里翻一段旧会话';
+  await askAi(page, seed);
+  const clicked = await page.evaluate((payload) => {
+    const root = document.querySelector(payload.selector).shadowRoot;
+    const host = Array.from(root.querySelectorAll('.llm-chat-dialog'))
+      .find((dialog) => (dialog.querySelector('.llm-chat-title')?.textContent || '').includes(payload.seed));
+    if (!host) return false;
+    host.querySelector('.llm-chat-history-btn').click();
+    const card = Array.from(host.querySelectorAll('.llm-chat-history .llm-history-card'))
+      .find((node) => (node.querySelector('.llm-card-title')?.textContent || '').includes(payload.title));
+    if (!card) return false;
+    card.click();
+    return true;
+  }, { selector: PANEL_HOST, title, seed });
+  await page.waitForTimeout(900);
+  // 关掉当入口的那个窗口。注意它点完卡片后**仍停在历史视图**（标题变成「历史对话」）：
+  // openLlmConversation 只在「复用已有窗口」时把来源窗口切回对话，新建窗口时不动来源。
+  await page.evaluate((payload) => {
+    const root = document.querySelector(payload.selector).shadowRoot;
+    Array.from(root.querySelectorAll('.llm-chat-dialog'))
+      .filter((dialog) => {
+        const title = dialog.querySelector('.llm-chat-title')?.textContent || '';
+        return title === '历史对话' || title.includes(payload.seed);
+      })
+      .forEach((dialog) => dialog.querySelector('.llm-chat-close').click());
+  }, { selector: PANEL_HOST, seed });
+  await page.waitForTimeout(400);
+  return clicked;
+}
+
 (async () => {
   const stub = await startLlmStub();
   const env = await launchWithExtension();
@@ -394,19 +433,9 @@ async function askAi(page, question) {
     const allGone = await readWindows(page);
     check('取消置顶后点空白，窗口全部收起', allGone.count === 0, JSON.stringify({ count: allGone.count }));
 
-    // 复原：从侧栏历史里重开**那条含 Markdown 回复的会话**，供 Markdown 与几何两段继续用。
+    // 复原：重开**那条含 Markdown 回复的会话**，供 Markdown 与几何两段继续用。
     // 不要用「再问一次」来复原：那会新建一段会话，Markdown 断言就落到短回复上了。
-    await page.locator(`${PANEL_HOST} .llm-rail`).dispatchEvent('click');
-    await page.waitForTimeout(450);
-    await page.evaluate((selector) => {
-      const root = document.querySelector(selector).shadowRoot;
-      const card = Array.from(root.querySelectorAll('.llm-history-list .llm-history-card'))
-        .find((node) => (node.querySelector('.llm-card-title')?.textContent || '').includes('第一个问题'));
-      card?.click();
-    }, PANEL_HOST);
-    await page.waitForTimeout(900);
-    await page.locator(`${PANEL_HOST} .llm-rail`).dispatchEvent('click');
-    await page.waitForTimeout(300);
+    await reopenConversationFromHistory(page, '第一个问题');
     console.log('');
 
     // ---------- 七. Markdown 渲染 ----------
@@ -435,21 +464,12 @@ async function askAi(page, question) {
     check('几何已写入本地存储', Boolean(survivedGeometry) && Object.keys(survivedGeometry).length > 0, JSON.stringify(survivedGeometry).slice(0, 160));
 
     // 刷新后用历史入口重开**同一个会话**，检查几何被还原。
-    // 侧栏历史按更新时间倒序，第一张未必是这个窗口的会话，所以按标题文本定位。
+    // 历史按更新时间倒序，第一张未必是这个窗口的会话，所以按标题文本定位。
     await page.reload();
     await page.waitForSelector(PANEL_HOST, { state: 'attached', timeout: 10000 });
     await page.waitForTimeout(1200);
-    await page.locator(`${PANEL_HOST} .llm-rail`).dispatchEvent('click');
-    await page.waitForTimeout(500);
     const reopenedTitle = pinnedBefore.title;
-    const clicked = await page.evaluate((payload) => {
-      const root = document.querySelector(payload.selector).shadowRoot;
-      const card = Array.from(root.querySelectorAll('.llm-history-list .llm-history-card'))
-        .find((node) => (node.querySelector('.llm-card-title')?.textContent || '').includes(payload.title));
-      if (!card) return false;
-      card.click();
-      return true;
-    }, { selector: PANEL_HOST, title: reopenedTitle });
+    const clicked = await reopenConversationFromHistory(page, reopenedTitle);
     check('在历史里找到刚才那个会话', clicked === true, String(reopenedTitle));
     await page.waitForTimeout(900);
     const restored = (await readWindows(page)).windows[0];

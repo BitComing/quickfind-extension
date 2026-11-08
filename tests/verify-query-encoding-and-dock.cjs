@@ -6,12 +6,13 @@
  *   解出来仍是 `%E4%B8%AD%E6%96%87`。常驻栏以「页面查询」为准显示这个值，用户看到的
  *   就是一串「符号 + 数字」而不是中文；这串编码还会经搜索历史扩散到之后每个没有查询的页面。
  *
- * 【二】LLM 右侧栏只能由用户点击打开。
- *   缺陷本体：滑杆与侧栏此前挂了 pointerenter / focus / focusin 的自动展开，鼠标扫过
- *   右边缘或页面把焦点落到滑杆上时，整个面板会自己滑出来——用户无法预期，也关不干净。
+ * 【二】网页右侧栏已下线（`shared/features.ts` 的 `PAGE_SIDEBAR_ENABLED`）。
+ *   侧栏曾是「滑杆 + 面板」，滑杆扫过或聚焦都会把面板拉出来，属于用户无法预期的自动展开。
+ *   现在整块 UI 不再生成：dock 里没有 `.llm-rail` / `.llm-sidebar`，没有对话窗口时整层隐藏。
+ *   用例同时守住「旧配置里 `llmDockVisible: true` 也看不见任何东西」——开关已不再决定它。
  *
- * 边界同时守住：数字与符号输入不被解码逻辑改动（C++、100%、纯数字），侧栏的收起路径
- * 与点击展开后保持显示的行为都在。
+ * 边界同时守住：数字与符号输入不被解码逻辑改动（C++、100%、纯数字），
+ * 页面加载后也不会自动弹任何面板。
  */
 
 const { createChecker, launchWithExtension } = require('./helpers.cjs');
@@ -45,20 +46,16 @@ const expandPinned = (page) => page.evaluate((selector) => {
   document.querySelector(selector)?.shadowRoot?.querySelector('.reveal-handle')?.click();
 }, HOST);
 
-/** 读侧栏的展开状态，全部取自真实 DOM 状态。 */
+/** 读右侧 dock 的状态：侧栏已下线，这里要能证明「滑杆与面板都不在 DOM 里」。 */
 const readDock = (page) => page.evaluate((selector) => {
   const root = document.querySelector(selector)?.shadowRoot;
   const dock = root?.querySelector('.llm-dock');
   if (!dock) return null;
   return {
-    open: dock.classList.contains('is-open'),
-    ariaHidden: root.querySelector('.llm-sidebar')?.getAttribute('aria-hidden'),
-    railExpanded: root.querySelector('.llm-rail')?.getAttribute('aria-expanded'),
+    hidden: dock.hidden,
+    hasRail: Boolean(root.querySelector('.llm-rail')),
+    hasSidebar: Boolean(root.querySelector('.llm-sidebar')),
   };
-}, DOCK_HOST);
-
-const clickRail = (page) => page.evaluate((selector) => {
-  document.querySelector(selector)?.shadowRoot?.querySelector('.llm-rail')?.click();
 }, DOCK_HOST);
 
 (async () => {
@@ -132,56 +129,36 @@ const clickRail = (page) => page.evaluate((selector) => {
     await historyPage.close();
     console.log('');
 
-    // ---------- 二. 侧栏只由点击打开 ----------
-    console.log('【二】LLM 右侧栏只由用户点击打开');
+    // ---------- 二. 网页右侧栏已下线 ----------
+    console.log('【二】网页右侧栏已下线（shared/features.ts 的 PAGE_SIDEBAR_ENABLED）');
 
+    // 关键前置：配置里那个旧开关仍然写着「开」。侧栏已不再由它决定，
+    // 所以这里顺带守住「旧配置开着也看不见任何东西」。
     const dock = await openAt();
     const initial = await readDock(dock);
-    check('页面加载后侧栏关闭', initial.open === false && initial.ariaHidden === 'true', JSON.stringify(initial));
+    check('dock 里没有滑杆与侧栏节点', initial.hasRail === false && initial.hasSidebar === false, JSON.stringify(initial));
+    check('没有对话窗口时 dock 整层隐藏', initial.hidden === true, JSON.stringify(initial));
 
     await dock.mouse.move(1090, 400);
     await dock.waitForTimeout(800);
     const hovered = await readDock(dock);
-    check('鼠标停到右边缘不自动展开（修复点）', hovered.open === false, JSON.stringify(hovered));
+    check('鼠标停到右边缘没有任何东西展开（修复点）', hovered.hidden === true && hovered.hasSidebar === false, JSON.stringify(hovered));
 
-    await dock.evaluate((selector) => {
-      document.querySelector(selector)?.shadowRoot?.querySelector('.llm-rail')?.focus();
-    }, DOCK_HOST);
+    await dock.mouse.click(1098, 400);
     await dock.waitForTimeout(500);
-    const focused = await readDock(dock);
-    check('滑杆被聚焦不自动展开（修复点）', focused.open === false, JSON.stringify(focused));
-
-    await clickRail(dock);
-    await dock.waitForTimeout(500);
-    const opened = await readDock(dock);
-    check('点击滑杆后展开', opened.open === true && opened.railExpanded === 'true', JSON.stringify(opened));
-
-    await dock.mouse.move(300, 300);
-    await dock.waitForTimeout(900);
-    const stayed = await readDock(dock);
-    check('点击展开后鼠标移开仍保持显示', stayed.open === true, JSON.stringify(stayed));
-
-    await clickRail(dock);
-    await dock.waitForTimeout(600);
-    const closed = await readDock(dock);
-    check('再次点击收起', closed.open === false && closed.ariaHidden === 'true', JSON.stringify(closed));
+    const clicked = await readDock(dock);
+    check('点右边缘也弹不出侧栏', clicked.hidden === true && clicked.hasRail === false, JSON.stringify(clicked));
 
     await dock.close();
     console.log('');
 
     // ---------- 三. 进入对话不自动展开 ----------
-    console.log('【三】进入对话不自动展开（仅有会话时也不自动弹）');
+    console.log('【三】页面加载后不会自动弹任何面板');
     const chat = await env.context.newPage();
     await chat.goto(baseUrl);
     await chat.waitForTimeout(1300);
     const beforeOpen = await readDock(chat);
-    check('进入页面对话层未打开、侧栏未展开', beforeOpen.open === false, JSON.stringify(beforeOpen));
-
-    // 打开侧栏后点一张历史卡片（若历史为空则跳过），确认进入对话不会把侧栏状态搞乱。
-    await clickRail(chat);
-    await chat.waitForTimeout(500);
-    const afterClick = await readDock(chat);
-    check('点击后侧栏展开、对话层仍是关闭的', afterClick.open === true, JSON.stringify(afterClick));
+    check('进入页面 dock 不可见、侧栏不存在', beforeOpen.hidden === true && beforeOpen.hasSidebar === false, JSON.stringify(beforeOpen));
     const layerHidden = await chat.evaluate((selector) => {
       const layer = document.querySelector(selector)?.shadowRoot?.querySelector('.llm-chat-layer');
       return layer ? layer.hidden : null;

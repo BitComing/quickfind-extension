@@ -44,7 +44,7 @@
  *    所以【4】改为两条契约：栏内无 `.collapse-button`；收起全程横向零位移、纵向无回弹。
  */
 
-const { createChecker, launchWithExtension } = require('./helpers.cjs');
+const { createChecker, launchWithExtension, waitExtensionReady } = require('./helpers.cjs');
 
 const PINNED_HOST = '#quickfind-pinned-search-host';
 const { check, summary } = createChecker();
@@ -77,6 +77,13 @@ const pageHtml = (mutating) => `<!doctype html><meta charset="utf-8"><title>qf p
 
 const config = (overrides = {}) => ({
   searchHistory: [{ query: '回归词', timestamp: Date.now() }],
+  // 分组形状显式给出，不依赖产品默认配置：这条用例要验「点分组展开的飞层几何」，
+  // 直排区里需要多个分组才能覆盖「飞层盖住相邻分组」那组代价断言。
+  groups: [
+    { id: 'default', name: '默认组', items: ['xiaohongshu', 'bing', 'zhihu', 'group:g-video', 'group:g-bili'], visible: true },
+    { id: 'g-video', name: '视频', items: ['douyin'], visible: true },
+    { id: 'g-bili', name: 'B站', items: ['bilibili'], visible: true },
+  ],
   pinnedSearch: Object.assign({
     sites: [], customSites: [], defaultGroupCount: 4, collapseDelay: 1000,
     openInNewTab: true, allSites: true, siteConfigVersion: 3,
@@ -173,7 +180,7 @@ function overlapRatio(a, b) {
     const mutatingUrl = await env.serve(pageHtml(true));
     const page = await env.context.newPage();
     await page.goto(mutatingUrl);
-    await page.waitForTimeout(1600);
+    await waitExtensionReady(page);
     await expandBar(page);
 
     // 按钮节点是否被替换：打标后观察标记是否还在。
@@ -236,12 +243,12 @@ function overlapRatio(a, b) {
     const url = await env.serve(pageHtml(true));
     for (const cfg of [
       { label: '动态页面', count: 20, patch: {} },
-      { label: '默认配置（经「更多」进入）', count: 4, patch: {} },
+      { label: '经「更多」进入', count: 4, patch: {} },
     ]) {
       await setConfig(config(Object.assign({ defaultGroupCount: cfg.count }, cfg.patch)));
       const p = await env.context.newPage();
       await p.goto(url);
-      await p.waitForTimeout(1600);
+      await waitExtensionReady(p);
       await expandBar(p);
       // 要展开的分组可能在直排区，也可能在「更多」拉出的飞层里（默认配置就是后者）。
       // 两种情况都是用户真实路径，都要覆盖：先找直排，找不到就点「更多」再到飞层里找。
@@ -288,7 +295,7 @@ function overlapRatio(a, b) {
     await setConfig(config({ defaultGroupCount: 20 }));
     const p3 = await env.context.newPage();
     await p3.goto(url);
-    await p3.waitForTimeout(1600);
+    await waitExtensionReady(p3);
     await expandBar(p3);
     const s3 = await barState(p3);
     const groupIdxList = s3.direct.map((d, i) => ({ d, i })).filter(({ d }) => d.groupId).map(({ i }) => i);
@@ -409,7 +416,7 @@ await expandBar(p3);
     {
       const p4 = await env.context.newPage();
       await p4.goto(url);
-      await p4.waitForTimeout(1500);
+      await waitExtensionReady(p4);
       await expandBar(p4);
 
       const layout = await p4.evaluate((host) => {

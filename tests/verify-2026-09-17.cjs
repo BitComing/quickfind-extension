@@ -1,5 +1,5 @@
 // 一次性验证脚本（用完即删）：
-//   1) 全新 profile 加载构建产物 → 打开选项页 → 读回 storage，与「改动前浏览器里那套配置」逐项比对
+//   1) 全新 profile 加载构建产物 → 打开选项页 → 读回 storage，与默认配置基准（fixtures/_sync-state.txt）逐项比对
 //   2) 常驻搜索栏：空框展开不抢焦点 / 有内容展开同样不聚焦
 const path = require('path');
 const fs = require('fs');
@@ -16,7 +16,7 @@ function check(label, ok, detail) {
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label}${detail === undefined ? '' : '  → ' + detail}`);
 }
 
-// 改动前那套浏览器配置（从 Edge 的扩展存储里回放出来的），只作比对基准。
+// 默认配置基准：由全新 profile 实测导出（scripts/gen-sync-fixture.cjs 生成），只作比对基准。
 const EXPECTED = fs.readFileSync(path.join(__dirname, 'fixtures', '_sync-state.txt'), 'utf8')
   .split('\n\n').filter((block) => block.startsWith('KEY')).reduce((acc, block) => {
     const key = block.match(/^KEY\(\d+\) "(.*)"$/m)[1];
@@ -135,7 +135,7 @@ async function collapsePinnedBar(page, { timeout = 4000 } = {}) {
 
   const differences = diff(canonical(EXPECTED), canonical(stored), '');
   if (differences.length === 0) {
-    console.log('  PASS  45 项默认配置与改动前完全一致');
+    console.log('  PASS  默认配置与基准完全一致');
   } else {
     failures += 1;
     console.log(`  FAIL  ${differences.length} 项与改动前不一致：`);
@@ -160,7 +160,9 @@ async function collapsePinnedBar(page, { timeout = 4000 } = {}) {
   }));
   check('网页选中文字触发方式 = 点击', ui.triggerMode === 'click', ui.triggerMode);
   check('编辑框选中文字触发方式 = 不显示', ui.editableTriggerMode === 'none', ui.editableTriggerMode);
-  check('「随心问」面板开关 = 关', ui.llmDockVisible === false, String(ui.llmDockVisible));
+  // 侧栏已下线（shared/features.ts）：选项页不再有「显示右侧随心问」这一行，
+  // 配置里的 llmDockVisible 只是历史字段。这里守住「界面上确实没有它」。
+  check('「随心问」面板开关已随侧栏下线移除', ui.llmDockVisible === null, String(ui.llmDockVisible));
   check('LLM 启用开关 = 关', ui.llmEnabled === false, String(ui.llmEnabled));
   check('常驻栏「所有站点」开关 = 开', ui.pinnedAllSites === true, String(ui.pinnedAllSites));
   check('常驻栏收起延时 = 250', ui.pinnedCollapseDelay === '250', ui.pinnedCollapseDelay);
@@ -223,7 +225,7 @@ async function collapsePinnedBar(page, { timeout = 4000 } = {}) {
   check('旧版 iconOnly 里开启的源保持只显示图标', sourceById.get('bing') && sourceById.get('bing').iconOnly === true, JSON.stringify(sourceById.get('bing')));
   check('旧版 engineOrder 的顺序保留', JSON.stringify((defaultGroup.items || []).slice(0, 3)) === JSON.stringify(['bing', 'google', 'zhihu']), JSON.stringify((defaultGroup.items || []).slice(0, 3)));
   check('旧版键已清理', migrated.engines === undefined && migrated.iconOnly === undefined, JSON.stringify({ engines: migrated.engines, iconOnly: migrated.iconOnly }));
-  check('没有把 4 个默认分组灌进旧版安装', !(migrated.groups || []).some((group) => ['其他', '视频', '社媒', 'ai'].includes(String(group.name))), JSON.stringify((migrated.groups || []).map((group) => group.name)));
+  check('没有把预设分组灌进旧版安装', !(migrated.groups || []).some((group) => ['其他', '视频', '社媒', 'ai'].includes(String(group.name))), JSON.stringify((migrated.groups || []).map((group) => group.name)));
 
   await context.close();
   server.close();

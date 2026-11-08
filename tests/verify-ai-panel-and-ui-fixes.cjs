@@ -141,15 +141,19 @@ const headerButtons = (page) => page.evaluate((selector) => {
 
     // ---------- 【2】历史会话删除 ----------
     console.log('【2】历史会话卡片有删除入口，两步确认');
-    // 侧栏历史列表与窗口内历史视图共用同一个卡片构建器，先在这里确认侧栏那份也带删除入口。
-    // 必须在删除之前看：删掉唯一的会话后侧栏就空了，卡片自然不存在。
-    const sidebarCards = await page.evaluate((selector) => {
+    // 侧栏已下线（shared/features.ts）：历史列表只剩窗口里那一份。卡片构建器仍是共用的，
+    // 下面这些断言照常在窗口那份上跑，这里额外守住「侧栏那套节点确实不在 DOM 里」。
+    const sidebarRetired = await page.evaluate((selector) => {
       const root = document.querySelector(selector).shadowRoot;
-      const cards = Array.from(root.querySelectorAll('.llm-history-list .llm-history-card'));
-      return { count: cards.length, hasDelete: cards.every((card) => Boolean(card.querySelector('.llm-card-delete'))), isDiv: cards.every((card) => card.tagName === 'DIV') };
+      return {
+        historyList: Boolean(root.querySelector('.llm-history-list')),
+        rail: Boolean(root.querySelector('.llm-rail')),
+        sidebar: Boolean(root.querySelector('.llm-sidebar')),
+      };
     }, PANEL_HOST);
-    check('侧栏历史卡片同样带删除按钮（共用构建器）',
-      sidebarCards.count >= 1 && sidebarCards.hasDelete === true && sidebarCards.isDiv === true, JSON.stringify(sidebarCards));
+    check('侧栏已下线：没有滑杆、面板与侧栏历史列表',
+      sidebarRetired.historyList === false && sidebarRetired.rail === false && sidebarRetired.sidebar === false,
+      JSON.stringify(sidebarRetired));
 
     // 先把历史视图打开（窗口内）。
     const historyOpen = await page.evaluate((selector) => {
@@ -203,11 +207,11 @@ const headerButtons = (page) => page.evaluate((selector) => {
       root.querySelector('.llm-chat-dialog .llm-chat-history .llm-history-card .llm-card-delete').click();
       return {
         dialogs: root.querySelectorAll('.llm-chat-dialog').length,
-        sidebarCards: root.querySelectorAll('.llm-history-list .llm-history-card').length,
+        cards: root.querySelectorAll('.llm-chat-dialog .llm-chat-history .llm-history-card').length,
       };
     }, PANEL_HOST);
     await page.waitForTimeout(500);
-    check('确认后该会话从列表消失', afterDelete.sidebarCards === before.count - 1, `${before.count} → ${afterDelete.sidebarCards}`);
+    check('确认后该会话从列表消失', afterDelete.dialogs === 0 && afterDelete.cards === 0, JSON.stringify(afterDelete));
     check('正开着这段会话的窗口一并关闭（否则再发一条又会写回来）',
       afterDelete.dialogs === 0, `dialogs=${afterDelete.dialogs}`);
 
@@ -215,12 +219,12 @@ const headerButtons = (page) => page.evaluate((selector) => {
       const root = document.querySelector(selector).shadowRoot;
       const layer = root.querySelector('.llm-chat-layer');
       return {
-        sidebarCards: root.querySelectorAll('.llm-history-list .llm-history-card').length,
+        cards: root.querySelectorAll('.llm-chat-dialog .llm-chat-history .llm-history-card').length,
         layerHidden: layer ? layer.hidden : null,
         dockHidden: root.querySelector('.llm-dock')?.hidden ?? null,
       };
     }, PANEL_HOST);
-    check('删除后侧栏历史同样清空（同一份数据）', afterDeleteSettled.sidebarCards === 0, JSON.stringify(afterDeleteSettled));
+    check('删除后窗口历史同样清空（同一份数据）', afterDeleteSettled.cards === 0, JSON.stringify(afterDeleteSettled));
     check('没有窗口后对话层与宿主一并收起', afterDeleteSettled.layerHidden === true && afterDeleteSettled.dockHidden === true, JSON.stringify(afterDeleteSettled));
 
     // 存储里也要真的少一条：刷新页面后不该又冒出来。

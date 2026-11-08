@@ -8,7 +8,9 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { resolvePlaywright, resolveChrome } = require('./helpers.cjs');
+const { resolvePlaywright, resolveChrome, featureEnabled, skipRetired } = require('./helpers.cjs');
+// 笔记的跨标签页同步挂在设置页的笔记面板上，该面板已下线：模块关着时整体跳过。
+if (!featureEnabled('OUTLINE_NOTES_ENABLED')) skipRetired('无限大纲笔记已下线');
 
 const { chromium } = resolvePlaywright();
 const CHROME = resolveChrome(chromium);

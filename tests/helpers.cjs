@@ -128,7 +128,21 @@ async function launchWithExtension(sources) {
   async function openOptionsPage() {
     const page = await context.newPage();
     await page.goto(`chrome-extension://${extId}/options.html`);
-    await page.waitForTimeout(1500);
+    // 等「默认配置真的落盘」而不是固定睡 1.5 秒。
+    //
+    // 为什么不能省掉这一步：选项页启动时会做一次迁移写入（seed / 版本升级），它比页面
+    // 加载晚完成；用例随后自己写 sources / groups，若迁移写入落在后面就会把用例的配置覆盖掉。
+    // 为什么不能只是等页面加载完：写入是异步的，加载完成不代表写完了。
+    // 判据取迁移写入的产物本身：sources、pinnedSearch、sourceConfigVersion 三者都在，
+    // 说明那一笔（或本来就已经是迁移后的形状）已经生效。600ms 起步、最长 10 秒兜底，
+    // 既不会因为机器快而多等，也不会因为慢而随机失败。
+    await page.waitForFunction(() => new Promise((resolve) => {
+      try {
+        chrome.storage.sync.get(['sources', 'pinnedSearch', 'sourceConfigVersion'], (all) => {
+          resolve(Boolean(all && Array.isArray(all.sources) && all.sources.length && all.pinnedSearch && all.sourceConfigVersion !== undefined));
+        });
+      } catch { resolve(false); }
+    }), null, { timeout: 10000, polling: 50 }).catch(() => { /* 超时仍然继续：让用例自己报它依赖的前置条件 */ });
     return page;
   }
 
@@ -166,4 +180,46 @@ async function collapsePinnedBar(page, hostSelector, { timeout = 5000 } = {}) {
   return false;
 }
 
-module.exports = { ROOT, EXT, resolvePlaywright, resolveChrome, createChecker, launchWithExtension, collapsePinnedBar };
+/**
+ * 等扩展在这个页面上真的就位，代替「goto 之后固定睡 1.4~1.6 秒」。
+ *
+ * 那段睡眠等的是内容脚本的异步启动：storage.get 回调 → 挂载宿主 → 按配置建常驻栏。
+ * 直接等产物出现，通常 200~400ms 就够，机器慢时也不会随机失败。
+ *
+ * pinned=false 用于常驻栏本来就不该出现的页面（allSites:false / sites:[]），
+ * 否则会白等到超时。
+ */
+async function waitExtensionReady(page, { pinned = true, timeout = 10000 } = {}) {
+  await page.waitForSelector('#quickfind-shadow-host', { state: 'attached', timeout });
+  if (!pinned) return;
+  await page.waitForFunction(() => {
+    const host = document.querySelector('#quickfind-pinned-search-host');
+    return Boolean(host && host.shadowRoot && host.shadowRoot.querySelector('.bar'));
+  }, null, { timeout }).catch(() => { /* 常驻栏没建出来时交给用例自己的前置条件断言 */ });
+}
+
+/**
+ * 读 `shared/features.ts` 里的模块开关。
+ *
+ * 下线模块的用例不必跟着删：它们在开头问一句「这个模块还开着吗」，关着就明确跳过，
+ * 开关改回 `true` 时原样继续跑。开关是编译期常量，所以直接读源码，不必起浏览器。
+ */
+function featureEnabled(name) {
+  const source = fs.readFileSync(path.join(ROOT, 'shared', 'features.ts'), 'utf8');
+  const match = new RegExp(`export const ${name}\\s*=\\s*(true|false)`).exec(source);
+  return match ? match[1] === 'true' : true;
+}
+
+/**
+ * 已下线模块的跳过出口。
+ *
+ * 退出码 0，但输出里有一行 `SKIP`，`run.mjs` 会把它汇总成「跳过」而不是「通过」——
+ * 两者的区别很重要：通过代表断言真的跑过。
+ */
+function skipRetired(reason) {
+  console.log(`  SKIP  ${reason}（见 shared/features.ts）`);
+  console.log('\n========== 跳过（模块已下线） ==========');
+  process.exit(0);
+}
+
+module.exports = { ROOT, EXT, resolvePlaywright, resolveChrome, createChecker, launchWithExtension, collapsePinnedBar, waitExtensionReady, featureEnabled, skipRetired };

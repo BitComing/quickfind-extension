@@ -23,7 +23,7 @@
  * 不依赖 git HEAD，也不依赖任何历史版本。
  */
 
-const { createChecker, launchWithExtension } = require('./helpers.cjs');
+const { createChecker, launchWithExtension, waitExtensionReady } = require('./helpers.cjs');
 
 const PANEL_HOST = '#quickfind-shadow-host';
 const PINNED_HOST = '#quickfind-pinned-search-host';
@@ -102,16 +102,28 @@ const state = (page) => page.evaluate(({ ph, nh }) => {
   };
 }, { ph: PANEL_HOST, nh: PINNED_HOST });
 
-/** 记录页面导航（整页跳转或新开标签）。 */
+/**
+ * 记录页面导航（整页跳转或新开标签）。
+ *
+ * 判据是「发生了没有」，所以一发生就返回：此前是固定 sleep waitMs，8 处调用白白多等
+ * 近 20 秒，而导航通常 200~600ms 就完成了。轮询 80ms 一次，最长仍按 waitMs 兜底。
+ */
 async function navWatch(env, page, action, waitMs = 2400) {
   const beforePages = env.context.pages().length;
   const beforeUrl = await page.evaluate(() => location.href);
   await action();
-  await page.waitForTimeout(waitMs);
+  const deadline = Date.now() + waitMs;
+  let navigated = false;
+  while (Date.now() < deadline) {
+    if (env.context.pages().length > beforePages) { navigated = true; break; }
+    let current = beforeUrl;
+    try { current = await page.evaluate(() => location.href); } catch { /* 导航中：读不到就当已跳转 */ navigated = true; break; }
+    if (current !== beforeUrl) { navigated = true; break; }
+    await page.waitForTimeout(80);
+  }
   let url = beforeUrl;
   try { url = await page.evaluate(() => location.href); } catch { /* 导航中 */ }
-  return { beforePages, afterPages: env.context.pages().length, beforeUrl, url,
-    navigated: env.context.pages().length > beforePages || url !== beforeUrl };
+  return { beforePages, afterPages: env.context.pages().length, beforeUrl, url, navigated };
 }
 
 (async () => {
@@ -132,7 +144,7 @@ async function navWatch(env, page, action, waitMs = 2400) {
     });
     const page = await env.context.newPage();
     await page.goto(url);
-    await page.waitForTimeout(1400);
+    await waitExtensionReady(page);
 
     // -- 常驻搜索栏 --
     await page.evaluate((h) => document.querySelector(h)?.shadowRoot?.querySelector('.reveal-handle')?.click(), PINNED_HOST);
@@ -270,7 +282,7 @@ async function navWatch(env, page, action, waitMs = 2400) {
     // 场景 A：页面搜索框里有词
     const page2 = await env.context.newPage();
     await page2.goto(url);
-    await page2.waitForTimeout(1400);
+    await waitExtensionReady(page2);
     await page2.evaluate(() => {
       const input = document.getElementById('site-q');
       input.value = '页面搜索框里的词';
@@ -304,7 +316,7 @@ async function navWatch(env, page, action, waitMs = 2400) {
     // 场景 B：URL 里有查询参数
     const page3 = await env.context.newPage();
     await page3.goto(`${url}?q=地址里的词`);
-    await page3.waitForTimeout(1400);
+    await waitExtensionReady(page3);
     await page3.evaluate((h) => document.querySelector(h)?.shadowRoot?.querySelector('.reveal-handle')?.click(), PINNED_HOST);
     await page3.waitForTimeout(450);
     const box3 = await page3.evaluate((h) => {
@@ -330,7 +342,7 @@ async function navWatch(env, page, action, waitMs = 2400) {
     // 场景 C：三处都没有内容时才把焦点交给输入框
     const page4 = await env.context.newPage();
     await page4.goto(url);
-    await page4.waitForTimeout(1400);
+    await waitExtensionReady(page4);
     await page4.evaluate((h) => document.querySelector(h)?.shadowRoot?.querySelector('.reveal-handle')?.click(), PINNED_HOST);
     await page4.waitForTimeout(450);
     await page4.evaluate((h) => {
@@ -369,7 +381,7 @@ async function navWatch(env, page, action, waitMs = 2400) {
     });
     const page5 = await env.context.newPage();
     await page5.goto(url);
-    await page5.waitForTimeout(1400);
+    await waitExtensionReady(page5);
     await page5.evaluate((h) => document.querySelector(h)?.shadowRoot?.querySelector('.reveal-handle')?.click(), PINNED_HOST);
     await page5.waitForTimeout(450);
     const icon5 = await rectOf(page5, PINNED_HOST, '.entries .entry');
@@ -383,12 +395,15 @@ async function navWatch(env, page, action, waitMs = 2400) {
     const activeAfterPinned = await optionsPage.evaluate(() => new Promise((resolve) => {
       chrome.tabs.query({ active: true, currentWindow: true }, (t) => resolve(t.map((x) => x.url || '')));
     }));
-    check('新标签被激活（用户能直接看到结果）', activeAfterPinned.some((u) => u.includes('google') || u.includes('baidu') || u.includes('bing')), JSON.stringify(activeAfterPinned));
+    // 默认第一个搜索源是小红书（见 shared/defaults.ts 的 DEFAULT_ENABLED_IDS），所以这里认小红书；
+    // 其余几个保留，用例换成别的默认源时不必再改。
+    const isSearchTab = (u) => ['xiaohongshu', 'google', 'baidu', 'bing'].some((host) => u.includes(host));
+    check('新标签被激活（用户能直接看到结果）', activeAfterPinned.some(isSearchTab), JSON.stringify(activeAfterPinned));
 
     // 弹窗入口：此前是 active:false，在后台打开，用户以为点了没反应
     const popup = await env.context.newPage();
     await popup.goto(`chrome-extension://${env.extId}/popup.html`);
-    await popup.waitForTimeout(1500);
+    await popup.waitForSelector('#query-input');
     await popup.evaluate(() => {
       const input = document.querySelector('#query-input');
       input.value = '弹窗新标签词';
@@ -401,7 +416,7 @@ async function navWatch(env, page, action, waitMs = 2400) {
     const activeAfterPopup = await optionsPage.evaluate(() => new Promise((resolve) => {
       chrome.tabs.query({ active: true, currentWindow: true }, (t) => resolve(t.map((x) => x.url || '')));
     }));
-    check('弹窗的新标签也被激活（修复点）', activeAfterPopup.some((u) => u.includes('google') || u.includes('baidu') || u.includes('bing')), JSON.stringify(activeAfterPopup));
+    check('弹窗的新标签也被激活（修复点）', activeAfterPopup.some(isSearchTab), JSON.stringify(activeAfterPopup));
     const popupUrls = env.context.pages().map((p) => p.url());
     check('弹窗的搜索地址带着输入内容', popupUrls.some((u) => decodeDeep(u).includes('弹窗新标签词')), JSON.stringify(popupUrls.slice(-2).map((u) => decodeDeep(u).slice(0, 90))));
     console.log('');

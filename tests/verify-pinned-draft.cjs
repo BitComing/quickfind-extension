@@ -185,11 +185,12 @@ async function selectParagraph(page, id) {
     check('派发前草稿在位', (await queryValue(onQuery)) === '要搜索的词', JSON.stringify(await queryValue(onQuery)));
     await onQuery.evaluate((selector) => {
       const root = document.querySelector(selector).shadowRoot;
-      const button = Array.from(root.querySelectorAll('.entries .entry')).find((item) => (item.title || '').includes('使用谷歌'));
+      const button = Array.from(root.querySelectorAll('.entries .entry')).find((item) => (item.title || '').includes('使用小红书'));
       button?.click();
     }, HOST);
     await onQuery.waitForTimeout(1500);
-    const navigated = requests.find((url) => url.includes('google'));
+    // 默认第一个搜索源是小红书（见 shared/defaults.ts 的 DEFAULT_ENABLED_IDS）。
+    const navigated = requests.find((url) => url.includes('xiaohongshu'));
     check('确实导航到搜索地址', Boolean(navigated), JSON.stringify(requests.slice(0, 2)));
     check('搜索地址里带着框里的内容', Boolean(navigated && navigated.includes(encodeURIComponent('要搜索的词'))), JSON.stringify(navigated));
     console.log('');

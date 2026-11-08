@@ -10,7 +10,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
-const { resolvePlaywright, EXT, resolveChrome } = require('./helpers.cjs');
+const { resolvePlaywright, EXT, resolveChrome, featureEnabled, skipRetired } = require('./helpers.cjs');
+// 无限大纲笔记已下线：模块关着时本用例整体跳过，开关打开即恢复执行。
+if (!featureEnabled('OUTLINE_NOTES_ENABLED')) skipRetired('无限大纲笔记已下线');
 const { chromium } = resolvePlaywright();
 const CHROME = resolveChrome(chromium);
 const PANEL_HOST = '#quickfind-shadow-host';
