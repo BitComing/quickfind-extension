@@ -96,19 +96,18 @@ const CJK = /[\u4e00-\u9fa5]/;
     check('历史页没有残留中文', !CJK.test(await visibleText()), (await visibleText()).slice(0, 200));
 
     await openPanel('about');
+    // 付费功能已下线（`shared/license.ts` 的 PAID_FEATURES_ENABLED），「关于」页只剩版本：
+    // 这里改为核对那一栏确实跟着语言翻过来，并顺手确认切语言不会让付费区块冒出来。
     const about = await page.evaluate(() => {
       const panel = document.querySelector('[data-panel-content="about"]');
-      // 收款人姓名与微信号是数据不是文案：它们照原样显示，不应该被当成漏译。
-      const dataLines = new Set(Array.from(panel?.querySelectorAll('.pay-code-note') || []).map((node) => node.textContent.trim()));
-      const text = (panel?.innerText || '').split('\n').filter((line) => !dataLines.has(line.trim())).join('\n');
       return {
-        text,
-        status: document.querySelector('#license-status')?.textContent?.trim() || '',
-        plans: Array.from(document.querySelectorAll('.plan-name')).map((node) => node.textContent.trim()),
+        text: panel?.innerText || '',
+        headings: Array.from(panel?.querySelectorAll('.setting-block h3') || []).filter((node) => node.offsetParent !== null).map((node) => node.textContent.trim()),
+        paidHidden: Array.from(panel?.querySelectorAll('[data-paid]') || []).every((node) => getComputedStyle(node).display === 'none'),
       };
     });
-    check('关于页套餐名翻译', about.plans.join(',') === 'Free,Yearly,Lifetime', JSON.stringify(about.plans));
-    check('未激活状态翻译', about.status === 'Not activated', about.status);
+    check('关于页只剩版本一栏', about.headings.join(',') === 'Version', JSON.stringify(about.headings));
+    check('关于页付费区块仍然隐藏', about.paidHidden === true, String(about.paidHidden));
     check('关于页没有残留中文', !CJK.test(about.text), about.text.slice(0, 300));
 
     // ── 4. 切回中文同样即时生效 ─────────────────────────────────────

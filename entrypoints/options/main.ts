@@ -28,7 +28,7 @@ import { NOTES_STORAGE_KEY } from '@/shared/notes';
 import { cleanSource, configuredSources, normalizeSearchConfig } from '@/shared/settings-store';
 import type { SearchSource } from '@/shared/settings';
 import { applyI18n, countText, getLocale, groupLabel, localeTag, normalizeLocale, setLocale, sourceLabel, t } from '@/shared/i18n';
-import { FREE_GROUP_LIMIT, FREE_SOURCE_LIMIT, PLANS, describeLicense, formatExpiryDate, groupQuota, normalizeLicenseRecord, parseActivationCode, recordFromServer, sourceQuota, toSyncRecord } from '@/shared/license';
+import { FREE_GROUP_LIMIT, FREE_SOURCE_LIMIT, PAID_FEATURES_ENABLED, PLANS, describeLicense, formatExpiryDate, groupQuota, normalizeLicenseRecord, parseActivationCode, recordFromServer, sourceQuota, toSyncRecord } from '@/shared/license';
 import type { LicenseRecord } from '@/shared/license';
 import { activateLicense as activateOnServer, clearSession, errorText, flushPendingReleases, queuePendingRelease, readSession, refreshLicense, releaseLicense, saveSession, verifyLicenseToken } from '@/shared/license-api';
 import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
@@ -1445,6 +1445,9 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
   // 只在设置读回之后才会被调到（导航、激活、存储变更三处都各自守着），
   // 这里不再重复判一次 settings。
   function renderLicenseState() {
+    // 付费功能关掉时，这一整块 DOM 是 hidden 的：算出来的文案没人看，还会顺手发出
+    // 续期请求，直接跳过。
+    if (!PAID_FEATURES_ENABLED) return;
     if (!licenseStatus) return;
     const status = describeLicense(license);
     const expires = formatExpiryDate(status.expiresAt);
@@ -1469,6 +1472,12 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
 
   function renderGroupQuotaButton() {
     if (!addGroupButton) return;
+    // 全部免费时没有「还剩几个」这回事：提示就是按钮本身的功能，锁定态也不会出现。
+    if (!PAID_FEATURES_ENABLED) {
+      addGroupButton.title = t('新建分组');
+      addGroupButton.classList.remove('is-locked');
+      return;
+    }
     const quota = groupQuota(config().groups, license);
     addGroupButton.title = quota.unlimited
       ? t('新建分组（会员不限数量）')
@@ -1480,6 +1489,11 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
 
   function renderSourceQuotaButton() {
     if (!addSourceButton) return;
+    if (!PAID_FEATURES_ENABLED) {
+      addSourceButton.title = t('添加搜索源');
+      addSourceButton.classList.remove('is-locked');
+      return;
+    }
     const quota = sourceQuota(config().sources, license);
     addSourceButton.title = quota.unlimited
       ? t('添加搜索源（会员不限数量）')
@@ -1493,6 +1507,8 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
     if (!settings) return;
     const version = chrome.runtime?.getManifest?.().version;
     if (aboutVersion) aboutVersion.textContent = version ? 'v' + version : t('开发预览');
+    // 付费功能关掉后「关于」只剩版本号：状态、配额、套餐卡都不存在，续期请求也不必发。
+    if (!PAID_FEATURES_ENABLED) return;
     renderLicenseState();
     void maybeRefreshLicense();
   }
@@ -1567,6 +1583,7 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
 
   /** 许可证快到期就静默续期。失败不打扰用户：服务端仍以会员到期时间为准。 */
   async function maybeRefreshLicense() {
+    if (!PAID_FEATURES_ENABLED) return;
     if (!license) return;
     // 令牌存在 local（每台设备各一份），sync 里那份是老版本遗留的兜底。
     const session = await readSession();
@@ -2124,17 +2141,23 @@ import { OUTLINE_NOTES_ENABLED, PAGE_SIDEBAR_ENABLED } from '@/shared/features';
     if (activePanel === 'history') renderHistory();
   });
 
+  // 付费相关内容（套餐卡、激活码、购买说明）按 shared/license.ts 的开关整块收放。
+  // 只在 HTML 上留 `data-paid` 作标记，具体显示与否由这里决定，所以以后改回付费版
+  // 只需要把那个常量置 true，不用回来动 DOM。
+  document.querySelectorAll<HTMLElement>('[data-paid]').forEach((node) => { node.hidden = !PAID_FEATURES_ENABLED; });
+
   // 收款码与联系码是私有素材（public/pay/ 不入库）：从源码构建时这两张图不存在，
   // 浏览器会画出两个破图框。加载失败就把整块扫码区域摘掉，上面的微信号文字仍然有效。
   // 图片在 DOM 解析时就已开始加载，脚本跑到这里时可能**已经**失败过（事件早于监听器），
   // 所以先按 complete + naturalWidth 判一次，再接 error 兜住「还在加载、稍后失败」。
-  (() => {
+  // 付费功能关掉时整块是 hidden 的，连这次判断都不必做。
+  if (PAID_FEATURES_ENABLED) {
     const dropPayCodes = () => document.querySelectorAll('.pay-codes').forEach((node) => node.remove());
     document.querySelectorAll<HTMLImageElement>('.pay-codes img').forEach((img) => {
       if (img.complete && img.naturalWidth === 0) { dropPayCodes(); return; }
       img.addEventListener('error', dropPayCodes, { once: true });
     });
-  })();
+  }
 
   chrome.storage.sync.get(null, (stored) => {
     settings = normalizeSettings({ ...DEFAULTS, ...defaultConfigSeed(stored), ...stored });

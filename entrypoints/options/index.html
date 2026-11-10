@@ -188,11 +188,14 @@
               </div>
             </div>
           </section>
-          <section class="setting-block">
+          <!-- 下面三块是付费相关内容：默认带 `hidden`，只有 shared/license.ts 的
+               PAID_FEATURES_ENABLED 为 true 时主脚本才会把它们显示出来。默认就写在
+               HTML 上，是为了「脚本还没跑」的那一瞬间也不会闪出价格与二维码。 -->
+          <section class="setting-block" data-paid="plans" hidden>
             <h3 data-i18n="付费会员">付费会员</h3>
             <div id="plan-cards" class="plan-cards"></div>
           </section>
-          <section class="setting-block">
+          <section class="setting-block" data-paid="license" hidden>
             <h3 data-i18n="激活码">激活码</h3>
             <div class="rows">
               <div class="row" title="当前会员状态与到期时间" data-i18n-title="当前会员状态与到期时间">
@@ -226,7 +229,7 @@
             </div>
             <p id="license-error" class="form-error" role="alert"></p>
           </section>
-          <section class="setting-block pay-block">
+          <section class="setting-block pay-block" data-paid="purchase" hidden>
             <h3 data-i18n="购买与激活">购买与激活</h3>
             <div class="pay-body">
               <ol class="pay-steps">

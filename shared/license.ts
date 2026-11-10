@@ -5,6 +5,9 @@
  * 最多 `FREE_SOURCE_LIMIT` 个**已启用**的搜索源；激活会员后两条都不限。
  * 价格、有效期、激活码格式都在这里声明一次，选项页「关于」与生成脚本都从这一份读。
  *
+ * 这两条上限、以及整个会员版面，都由下面的 `PAID_FEATURES_ENABLED` 统管：它现在是
+ * `false`，也就是**全部功能免费**——配额不设上限，「关于」页只留版本号。
+ *
  * ── 校验为什么在服务端，而许可证为什么在本地 ─────────────────────────
  * 旧版把「套餐 + 流水号 + 固定盐哈希」全放在码里，读到源码的人就能算出一模一样的
  * 签名——那不是防伪，只是防抄错。现在激活必须联网：邮箱 + 激活码 → 服务端查库 →
@@ -25,9 +28,21 @@
 import { DEFAULT_GROUPS } from './defaults';
 import type { SearchGroup } from './settings';
 
-/** 免费版最多创建几个搜索源分组。 */
+/**
+ * 会员（付费）功能总开关。
+ *
+ * `false` = 全部功能免费，界面上也不出现任何付费信息：
+ * 分组与搜索源的配额函数直接返回「不限」，「关于」页只渲染版本号，
+ * 套餐卡、激活码、购买说明三块整块 `hidden`（见 options/index.html 的 `data-paid`）。
+ *
+ * 这里只关「展示与限制」，不删代码：DOM、文案、激活与续期的逻辑原样留着，
+ * 把这一行改回 `true` 就恢复付费版面，其他文件一行都不用动。
+ */
+export const PAID_FEATURES_ENABLED: boolean = false;
+
+/** 免费版最多创建几个搜索源分组。`PAID_FEATURES_ENABLED` 为 false 时不起作用。 */
 export const FREE_GROUP_LIMIT = 2;
-/** 免费版最多保存几个搜索源。 */
+/** 免费版最多保存几个搜索源。`PAID_FEATURES_ENABLED` 为 false 时不起作用。 */
 export const FREE_SOURCE_LIMIT = 20;
 
 export type LicensePlan = 'yearly' | 'lifetime';
@@ -291,10 +306,13 @@ export interface GroupQuota {
   allowed: boolean;
 }
 
-/** 当前配额。`license` 传 null 即免费版。 */
+/**
+ * 当前配额。`license` 传 null 即免费版；`PAID_FEATURES_ENABLED` 关掉时永远是「不限」，
+ * 与有没有许可证无关——付费功能整个下线了，配额也就不该再拦人。
+ */
 export function groupQuota(groups: SearchGroup[] | null | undefined, license: LicenseRecord | null | undefined, now: number = Date.now()): GroupQuota {
   const used = countUserGroups(groups);
-  if (isMembershipActive(license, now)) {
+  if (!PAID_FEATURES_ENABLED || isMembershipActive(license, now)) {
     return { limit: Number.POSITIVE_INFINITY, used, remaining: Number.POSITIVE_INFINITY, unlimited: true, allowed: true };
   }
   return { limit: FREE_GROUP_LIMIT, used, remaining: Math.max(0, FREE_GROUP_LIMIT - used), unlimited: false, allowed: used < FREE_GROUP_LIMIT };
@@ -317,7 +335,7 @@ export interface SourceQuota {
 
 export function sourceQuota(sources: Array<{ enabled?: boolean }> | null | undefined, license: LicenseRecord | null | undefined, now: number = Date.now()): SourceQuota {
   const used = Array.isArray(sources) ? sources.filter((source) => source?.enabled !== false).length : 0;
-  if (isMembershipActive(license, now)) {
+  if (!PAID_FEATURES_ENABLED || isMembershipActive(license, now)) {
     return { limit: Number.POSITIVE_INFINITY, used, remaining: Number.POSITIVE_INFINITY, unlimited: true, allowed: true };
   }
   return { limit: FREE_SOURCE_LIMIT, used, remaining: Math.max(0, FREE_SOURCE_LIMIT - used), unlimited: false, allowed: used < FREE_SOURCE_LIMIT };
