@@ -274,12 +274,15 @@ export default defineContentScript({
         background: transparent;
         box-shadow: none;
         cursor: pointer;
+        /* 隐藏态彻底退出交互：opacity:0 的元素照样接收指针事件、照样能被 Tab 聚焦。
+           visibility 延迟到淡出结束再切，保留收起动画。 */
+        visibility: hidden;
         opacity: 0;
         transform: translateX(-4px) scale(.94);
-        transition: opacity .16s ease, transform .16s ease, background .16s ease, box-shadow .16s ease;
-        pointer-events: auto;
+        transition: opacity .16s ease, transform .16s ease, background .16s ease, box-shadow .16s ease, visibility 0s linear .16s;
+        pointer-events: none;
       }
-      .quickfind-trigger.visible { opacity: .9; transform: translateX(0) scale(1); }
+      .quickfind-trigger.visible { visibility: visible; opacity: .9; transform: translateX(0) scale(1); pointer-events: auto; transition-delay: 0s; }
       .quickfind-trigger.disabled { color:#a6b0aa; }
       .quickfind-trigger:hover { opacity: 1; color:#19352c; background:transparent; }
       .quickfind-trigger[aria-expanded="true"] { visibility:hidden; opacity:0; pointer-events:none; transform:translateX(-4px) scale(.94); }
@@ -2707,13 +2710,180 @@ export default defineContentScript({
     try { return element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }); } catch { return true; }
   }
 
-  /** 当前选区内屏幕上真的看得见吗（几何 + 元素可见性）。 */
+  /**
+   * 穿过影子边界向上找祖先。
+   *
+   * 页面把文字放进自定义元素的 shadow root 时，parentElement 会在影子根处断掉；
+   * 而「元素被 filter: opacity(0) 抹掉」「祖先 pointer-events:none」这类判定必须
+   * 一直看到 host 外面。只沿 parentElement 走会漏掉挂在 host 上的样式。
+   */
+  function composedAncestors(element: any) {
+    const chain: any[] = [];
+    let node = element;
+    while (node) {
+      chain.push(node);
+      if (node.parentElement) { node = node.parentElement; continue; }
+      const root = node.getRootNode?.();
+      node = root && root.host ? root.host : null;
+    }
+    return chain;
+  }
+
+  /** 颜色值是不是全透明。computed color / -webkit-text-fill-color 的常见写法都认。 */
+  function colorIsFullyTransparent(value: any) {
+    const text = String(value || '').trim().toLowerCase();
+    if (!text || text === 'transparent') return true;
+    const rgb = /^(?:rgba|hsla)\(([^)]*)\)$/.exec(text);
+    if (rgb) {
+      const parts = rgb[1].split(/[,/]/).map((part) => part.trim()).filter(Boolean);
+      if (parts.length === 4) return Number(parts[3]) === 0;
+    }
+    const slash = /\/\s*([\d.]+)\s*\)$/.exec(text);
+    return Boolean(slash && Number(slash[1]) === 0);
+  }
+
+  /**
+   * 选区所在的文字是否真的被画了出来。
+   *
+   * checkVisibility 覆盖 opacity / visibility / display，但不认识 filter: opacity(0)
+   * 和 color: transparent——这两类在页面动画（淡出、裁切、渐变字）里很常见：选区
+   * 对象还在、几何也正常，屏幕上却一个字都没有，触发点就会凭空挂在页面上。
+   *
+   * 透明字要放行「渐变文字」：背景裁到文字（background-clip:text）时，文字本身由
+   * 背景色绘制，color 透明是正常写法。有 text-shadow / text-stroke 时同理。
+   */
+  function elementIsVisiblyPainted(element: any) {
+    if (!element || !elementIsVisibleOnScreen(element)) return false;
+    let fillTransparent = false;
+    let shadowPaints = false;
+    let strokePaints = false;
+    let clipPaints = false;
+    try {
+      for (const node of composedAncestors(element)) {
+        const style = getComputedStyle(node);
+        if (style.opacity === '0') return false;
+        const filter = String(style.filter || '');
+        if (filter && filter !== 'none' && /opacity\(\s*0(?:\.0+)?%?\s*\)/.test(filter)) return false;
+        if (node === element) {
+          fillTransparent = colorIsFullyTransparent(style.color) && colorIsFullyTransparent(style.webkitTextFillColor);
+        }
+        if (style.textShadow && style.textShadow !== 'none') shadowPaints = true;
+        if ((parseFloat(style.webkitTextStrokeWidth) || 0) > 0) strokePaints = true;
+        if (/\btext\b/i.test(String(style.backgroundClip || '') + ' ' + String(style.webkitBackgroundClip || ''))) clipPaints = true;
+      }
+    } catch { /* 元素已脱离文档时按可见放行，交给上层判 isConnected */ }
+    if (!fillTransparent) return true;
+    return shadowPaints || strokePaints || clipPaints;
+  }
+
+  /**
+   * 命中点上的元素是不是选区自己的（含选区内部的子元素）。
+   *
+   * 影子根里的选区在 document.elementFromPoint 看来只会命中最外层 host，所以沿
+   * 影子边界把 host 也一并认作「自己」。反过来，普通 DOM 的祖先不算：选中的段落
+   * 若被 clip-path 裁掉，命中的会是 body，这时必须当成被盖住，不能因为 body 是
+   * 祖先就放行。
+   */
+  function hitBelongsToSelection(owner: any, hit: any, range: any) {
+    if (!hit || !owner) return true;
+    if (hit === owner || owner.contains(hit)) return true;
+    // 整页 Ctrl+A 这类跨元素选区：range 的起点和「屏幕上第一个可见矩形」往往不在
+    // 同一个元素里（起点在页首，可见矩形在页中）。命中元素只要和选区相交，就说明
+    // 它属于这段选区，而不是盖在上面的遮罩。
+    if (range) {
+      try {
+        if (range.intersectsNode(hit)) {
+          if (!hit.contains(owner)) return true;
+          // display:contents 的元素没有自己的盒子，命中会落到它的祖先上；这是唯一
+          // 需要把祖先当成命中的情形。
+          if (getComputedStyle(owner).display === 'contents') return true;
+        }
+      } catch { /* 影子根与文档不在同一棵树，命中测试改用下面的 host 判定 */ }
+    }
+    let root = owner.getRootNode?.();
+    while (root && root.host) {
+      if (hit === root.host) return true;
+      root = root.host.getRootNode?.();
+    }
+    return false;
+  }
+
+  /** 选区元素的祖先链上有没有 pointer-events:none（PDF 文本层、纯展示文字层）。 */
+  function selectionUsesPointerEventsNone(element: any) {
+    try {
+      for (const node of composedAncestors(element)) {
+        if (getComputedStyle(node).pointerEvents === 'none') return true;
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  /**
+   * 选区文字是否被别的元素盖住。
+   *
+   * 这是「选中后图标一直挂着」的另一个来源：页面在选区上方打开了模态框 / 全屏遮罩
+   * （或者选区被 clip-path 裁掉）。选区对象和几何都还在，但屏幕上看到的是遮罩，
+   * 触发点却因为宿主在 top layer 而浮在遮罩上面，看起来就是「没选中文字也有图标」。
+   *
+   * 用命中测试在选区矩形上取几个点：只要有一个点命中选区自己（或它内部），就从
+   * 「没被盖住」一侧放行。pointer-events:none 的文字层命中会掉到下层画布，不能拿
+   * 命中测试当遮罩判据，直接放行。
+   */
+  function selectionPaintHit(element: any, rect: any, range: any = null) {
+    if (!element || !rect || !rectIsVisibleOnScreen(rect)) return undefined;
+    // pointer-events:none 的文字层命中会掉到下层画布，不能拿命中测试当遮罩判据。
+    if (selectionUsesPointerEventsNone(element)) return element;
+    const points = [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75]];
+    let hits = 0;
+    for (const [fx, fy] of points) {
+      const x = rect.left + rect.width * fx;
+      const y = rect.top + rect.height * fy;
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) continue;
+      let hit = null;
+      try { hit = document.elementFromPoint(x, y); } catch { /* ignore */ }
+      if (!hit) continue;
+      hits += 1;
+      if (hitBelongsToSelection(element, hit, range)) return hit;
+    }
+    // null = 命中点全被别的元素占了（被盖住）；undefined = 页面吞掉了命中测试，
+    // 无法判断，按可见放行，交给几何 / checkVisibility 那几条判据。
+    return hits > 0 ? null : undefined;
+  }
+
+  /** 命中点上的元素才是真正被画出来的那一层；拿不到时退回选区所属元素。 */
+  function paintedSelectionElement(element: any, rect: any, range: any = null) {
+    const hit = selectionPaintHit(element, rect, range);
+    if (hit === null) return null;
+    return hit === undefined ? element : hit;
+  }
+
+  /** 选区里第一个落在视口内的矩形；长选区（Ctrl+A）用它做可见性与遮挡判定。 */
+  function firstVisibleRangeRect(range: any) {
+    if (!range) return null;
+    let rects: any;
+    try { rects = range.getClientRects(); } catch { return null; }
+    for (const rect of rects) if (rectIsVisibleOnScreen(rect)) return rect;
+    return null;
+  }
+
+  /** 当前选区内屏幕上真的看得见吗（几何 + 元素可见性 + 没被遮住）。 */
   function liveSelectionIsOnScreen(live: any) {
-    if (!live || !elementIsVisibleOnScreen(live.element)) return false;
+    if (!live) return false;
     // 输入框的选区只有一段几何，直接判它。
-    if (live.inputSelection) return rectIsVisibleOnScreen(live.rect);
+    if (live.inputSelection) {
+      if (!rectIsVisibleOnScreen(live.rect)) return false;
+      const painted = paintedSelectionElement(live.element, live.rect);
+      return Boolean(painted) && elementIsVisiblyPainted(painted);
+    }
     // 文档 / contenteditable / 影子根的选区可能跨很多行：只要有一行在视口里就算看得见。
-    return rangeHasVisibleRect(live.range) || rectIsVisibleOnScreen(live.rect);
+    // 优先检查触发点实际落点（最后一个矩形）；它滚出视口时再找任意一个可见矩形，
+    // 这样长选区被固定页头盖住第一行时不会误判，而整页 Ctrl+A 仍能找到屏内的部分。
+    const anchor = (live.rect && rectIsVisibleOnScreen(live.rect) ? live.rect : null) || firstVisibleRangeRect(live.range);
+    if (!anchor) return false;
+    // 跨元素选区（整页 Ctrl+A）的起点可能在页首一个看不见的节点里；真正该检查的
+    // 是视口里那个矩形命中的元素。
+    const painted = paintedSelectionElement(live.element, anchor, live.range);
+    return Boolean(painted) && elementIsVisiblyPainted(painted);
   }
 
   function positionTrigger(rect) {
@@ -4359,25 +4529,60 @@ export default defineContentScript({
     // 关掉面板后图标还得留在原地等他再点。
     if (selectedInput && typeof selectedInput.selectionStart === 'number') {
       if (document.activeElement !== selectedInput && !host.contains(document.activeElement)) return true;
-      return selectedInput.selectionStart === selectedInput.selectionEnd;
+      if (selectedInput.selectionStart === selectedInput.selectionEnd) return true;
+      let rect: any = null;
+      try { rect = selectedInput.getBoundingClientRect(); } catch { return true; }
+      if (!rectIsVisibleOnScreen(rect)) return true;
+      const painted = paintedSelectionElement(selectedInput, rect);
+      return !painted || !elementIsVisiblyPainted(painted);
     }
-    // contenteditable 与文档选区的判据一致（它们的选区都体现在 window.getSelection() 上）。
+    // contenteditable / 文档选区看 window.getSelection()；影子根选区在 document 上
+    // 是 collapsed，只能靠显示时缓存的 range 继续巡检。
     const selection = window.getSelection();
     if (!selection || !selection.rangeCount) return true;
+    let range: any = null;
     if (!selection.isCollapsed) {
-      if (selectedText.length > 5000) return false;
-      const text = normalizeSelectionText(selection.toString(), true);
-      return !text || text !== selectedText;
+      if (selectedText.length <= 5000) {
+        const text = normalizeSelectionText(selection.toString(), true);
+        if (!text || text !== selectedText) return true;
+      }
+      range = selection.getRangeAt(0);
+    } else {
+      // document 选区退化成 collapsed：普通文档 / contenteditable 的选区就是没了。
+      // 只有「影子根里还有选区」才允许用缓存 range 继续巡检，且缓存 range 必须仍有
+      // 文字——节点被删后它会被浏览器收回成空 range（startContainer 可能变成 body，
+      // isConnected 仍为 true），不能再拿它当「选区还在」的证据。
+      const cachedRoot = selectedRange?.startContainer?.getRootNode?.();
+      if (!selectedRange || !selectedRange.startContainer?.isConnected || cachedRoot === document) return true;
+      if (!selectedRange.toString().trim() || !selection.toString().trim()) return true;
+      range = selectedRange;
     }
-    // document 选区退化成 collapsed 但 toString 仍有文字：页面影子根里还留着选区。
-    // 这里不判它（判它要遍历影子根，这份代价不该压在计时器上），交给 scroll / resize。
-    return !selection.toString().trim();
+    const owner = rangeOwnerElement(range);
+    const anchor = (anchorRect && rectIsVisibleOnScreen(anchorRect) ? anchorRect : null) || firstVisibleRangeRect(range);
+    if (!anchor) return true;
+    const painted = paintedSelectionElement(owner, anchor, range);
+    return !painted || !elementIsVisiblyPainted(painted);
   }
 
   function startSelectionWatch() {
     if (selectionWatchTimer) return;
     selectionWatchTimer = window.setInterval(() => {
-      if (selectionLooksGone()) hideAll();
+      if (!selectionLooksGone()) return;
+      // 旧选区的巡检不能误伤「刚刚建立、正在等待延时展示」的新选区：改选时，旧的
+      // 250ms 巡检可能早于新一轮 showForSelection，hideAll 会把新一轮的展示定时器
+      // 一起清掉，表现就是「有时选中了却不出图标」。新选区本身可见时直接接上展示。
+      const live = readLiveSelection();
+      if (live && live.text !== selectedText) {
+        if (liveSelectionIsOnScreen(live)) {
+          showForSelection();
+          return;
+        }
+        // 新选区暂时不可见（可能正在滚动）：先收起旧图标，但别清掉新一轮的展示定时器。
+        trigger.classList.remove('visible');
+        demoteHostIfIdle();
+        return;
+      }
+      hideAll();
     }, 250);
   }
 
@@ -4675,8 +4880,18 @@ export default defineContentScript({
       if (rect) {
         // 选区滚出视口、祖先被隐藏、节点被删：触发点不该被 positionTrigger 夹在屏幕边缘
         // 继续挂着——那同样是「没选中任何文字却有个图标」。面板开着时不收：用户正在里面输入，
-        // 页面随滚动变化不该打断他。
+        // 页面随滚动变化不该打断他。淡出 / 被遮罩这两种没有滚动事件的失效由 250ms 的
+        // 选区巡检兜底（见 selectionLooksGone）。
         if (!panelOpen && !rangeHasVisibleRect(selectedRange) && !rectIsVisibleOnScreen(rect)) {
+          // 旧选区的滚动重定位不能清掉新选区的展示定时器：改选时 scrollIntoView
+          // 派发的 scroll 可能晚于新选区的 selectionchange、早于它的 rAF。这里只把
+          // 旧图标先收起来，让新一轮 showForSelection 自己决定显示还是收起。
+          const live = readLiveSelection();
+          if (live && live.text !== selectedText) {
+            trigger.classList.remove('visible');
+            demoteHostIfIdle();
+            return;
+          }
           hideAll();
           return;
         }

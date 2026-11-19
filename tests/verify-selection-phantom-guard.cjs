@@ -33,10 +33,22 @@ const PAGE = `<!doctype html><meta charset="utf-8"><title>qf phantom</title>
   #copyta{position:fixed;left:-9999px;top:0}
   .toolbar{margin:16px 0}
   .spacer{height:1200px}
+  #fadep{width:560px}
+  #ghosttext{width:560px;color:transparent}
+  #clipped{width:560px;clip-path:inset(50%)}
+  #dim{position:fixed;inset:0;background:#fff;z-index:99999;display:none}
+  #dim.on{display:block}
+  #grad{width:560px;font-weight:700;color:transparent;background:linear-gradient(90deg,#c33,#36c);-webkit-background-clip:text;background-clip:text}
+  #dlg{width:460px}
 </style>
 <body>
   <p id="text">这一段可见的正文，用来做真实拖选与节点删除的正反对照。</p>
   <div id="wrap"><p id="inner">这条消息会被页面脚本重渲染掉，选区随之静默失效。</p></div>
+  <p id="fadep">这一段用来测试选区容器淡出之后，触发图标会不会跟着消失。</p>
+  <div id="grad">这是一段渐变文字，选中之后图标仍然应该正常出现。</div>
+  <p id="ghosttext">这段文字是透明的，选中它不应该出现图标。</p>
+  <p id="clipped">这段文字被 clip-path 裁掉了，选中它不应该出现图标。</p>
+  <div id="dim"><p id="dimtext">遮罩上的文字，用户看不见下面的选区。</p></div>
   <div class="toolbar">
     <button id="copy-ta">复制（隐藏 textarea 手法）</button>
     <button id="copy-div">复制（离屏 div 手法）</button>
@@ -62,6 +74,7 @@ const PAGE = `<!doctype html><meta charset="utf-8"><title>qf phantom</title>
       try { document.execCommand('copy'); } catch {}
     });
   </script>
+  <dialog id="dlg"><p id="dlgtext">模态框里的可见文字，选中之后图标应该正常出现。</p></dialog>
 </body>`;
 
 /** 读触发图标状态：类名 + 不透明度（类名在但被样式压成透明，也是一种「看不见」）。 */
@@ -232,6 +245,59 @@ const selectRange = async (page, selector, length) => {
     const afterScroll = await readTrigger(page);
     check('选区滚出视口后图标收起',
       afterScroll !== null && afterScroll.visible === false, JSON.stringify(afterScroll));
+
+    // ---------- 【四】选区还在，但屏幕上已经看不见了 ----------
+    console.log('\n【四】选区还在但已经看不见（淡出 / 被遮罩）时，图标必须收起');
+    await reset(page);
+    await selectRange(page, '#fadep', 14);
+    const beforeFade = await readTrigger(page);
+    check('前置条件：选中的正文先出现图标', beforeFade.visible === true, JSON.stringify(beforeFade));
+    await page.evaluate(() => { document.getElementById('fadep').style.filter = 'opacity(0)'; });
+    await page.waitForTimeout(900);
+    const afterFilter = await readTrigger(page);
+    check('选区容器 filter:opacity(0) 后图标消失', afterFilter !== null && afterFilter.visible === false, JSON.stringify(afterFilter));
+    await page.evaluate(() => { document.getElementById('fadep').style.filter = ''; });
+
+    await reset(page);
+    await selectRange(page, '#fadep', 14);
+    await page.evaluate(() => { document.getElementById('fadep').style.opacity = '0'; });
+    await page.waitForTimeout(900);
+    const afterOpacity = await readTrigger(page);
+    check('选区容器 opacity:0 后图标消失', afterOpacity !== null && afterOpacity.visible === false, JSON.stringify(afterOpacity));
+    await page.evaluate(() => { document.getElementById('fadep').style.opacity = ''; });
+
+    await reset(page);
+    await selectRange(page, '#middle', 4);
+    await page.evaluate(() => { document.getElementById('dim').classList.add('on'); });
+    await page.waitForTimeout(900);
+    const afterDim = await readTrigger(page);
+    check('选区被全屏遮罩盖住后图标消失（此前会浮在遮罩上面）', afterDim !== null && afterDim.visible === false, JSON.stringify(afterDim));
+    await page.evaluate(() => { document.getElementById('dim').classList.remove('on'); });
+
+    await reset(page);
+    await selectRange(page, '#ghosttext', 12);
+    const ghostText = await readTrigger(page);
+    check('color:transparent 的透明文字不出现图标', ghostText !== null && ghostText.visible === false, JSON.stringify(ghostText));
+
+    await reset(page);
+    await selectRange(page, '#clipped', 12);
+    const clippedText = await readTrigger(page);
+    check('clip-path 裁掉的文字不出现图标', clippedText !== null && clippedText.visible === false, JSON.stringify(clippedText));
+
+    // ---------- 【五】可见选区不能被修过头 ----------
+    console.log('\n【五】可见选区照常出现（模态框 / 渐变文字）');
+    await reset(page);
+    await page.evaluate(() => document.getElementById('dlg').showModal());
+    await page.waitForTimeout(200);
+    await selectRange(page, '#dlgtext', 12);
+    const inDialog = await readTrigger(page);
+    check('模态框里的可见选区仍出现图标（遮罩不该误杀弹窗内容）', inDialog !== null && inDialog.visible === true, JSON.stringify(inDialog));
+    await page.evaluate(() => document.getElementById('dlg').close());
+
+    await reset(page);
+    await selectRange(page, '#grad', 10);
+    const gradientText = await readTrigger(page);
+    check('渐变文字（color:transparent + background-clip:text）仍出现图标', gradientText !== null && gradientText.visible === true, JSON.stringify(gradientText));
 
     // ---------- 【否定对照】没有选区时不出现 ----------
     console.log('\n【否定对照】');

@@ -228,6 +228,25 @@ const selectRange = async (page, selector, length) => {
     }
     console.log('');
 
+    // ---------- 【4】连续改选：旧选区的巡检不能清掉新选区的展示 ----------
+    console.log('【4】连续改选');
+    await clearSelection(page);
+    let reselectOk = true;
+    let reselectDetail = '';
+    for (let i = 0; i < 5; i += 1) {
+      await selectRange(page, '#plain', 10);
+      await page.waitForTimeout(120);
+      await selectRange(page, '#longp', 7000 + i * 10);
+      const state = await readTrigger(page);
+      if (!state || state.visible !== true) {
+        reselectOk = false;
+        reselectDetail = `第 ${i + 1} 次：${JSON.stringify(state)}`;
+        break;
+      }
+      await clearSelection(page);
+    }
+    check('连续改选后新选区的图标仍稳定出现（旧巡检不误清新展示）', reselectOk, reselectDetail);
+
     // ---------- 【对照】反向用例：断言不是恒真 ----------
     console.log('【对照】基线与边界');
     await clearSelection(page);

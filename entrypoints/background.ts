@@ -9,6 +9,7 @@ export default defineBackground(() => {
    */
   const LLM_TIMEOUT_MS = 60000;
   let popupCacheTimer: ReturnType<typeof setTimeout> | null = null;
+  let contextMenuQueue: Promise<void> = Promise.resolve();
 
   /** 把 fetch 的各类失败翻成用户能看懂的一句话。终止信号要单独说，否则会显示 "signal is aborted"。 */
   function describeLlmError(error: unknown): string {
@@ -35,15 +36,40 @@ export default defineBackground(() => {
     }, 50);
   }
 
-  function ensureContextMenu() {
-    chrome.contextMenus.remove(CONTEXT_MENU_ID, () => {
-      void chrome.runtime.lastError;
-      chrome.contextMenus.create({
-        id: CONTEXT_MENU_ID,
-        title: t('使用 QuickFind 搜索'),
-        contexts: ['all']
+  function removeContextMenu(): Promise<void> {
+    return new Promise((resolve) => {
+      chrome.contextMenus.remove(CONTEXT_MENU_ID, () => {
+        // 首次安装时菜单并不存在，这里的 "Cannot find menu item" 属于预期。
+        void chrome.runtime.lastError;
+        resolve();
       });
     });
+  }
+
+  function createContextMenu(title: string): Promise<void> {
+    return new Promise((resolve) => {
+      chrome.contextMenus.create({ id: CONTEXT_MENU_ID, title, contexts: ['all'] }, () => {
+        if (!chrome.runtime.lastError) {
+          resolve();
+          return;
+        }
+        // 重载扩展等场景下可能已有同 id 的菜单残留，改为更新文案。
+        chrome.contextMenus.update(CONTEXT_MENU_ID, { title }, () => {
+          void chrome.runtime.lastError;
+          resolve();
+        });
+      });
+    });
+  }
+
+  function ensureContextMenu() {
+    const title = t('使用 QuickFind 搜索');
+    // 安装、启动与语言变更可能连续触发；串行执行，避免两次 remove/create 交错后
+    // 用同一个 id 建两次菜单（Cannot create item with duplicate id）。
+    contextMenuQueue = contextMenuQueue
+      .then(() => removeContextMenu())
+      .then(() => createContextMenu(title))
+      .catch(() => {});
   }
 
   // 语言是右键菜单文案的一部分：启动时读一次，改动时重建菜单。
